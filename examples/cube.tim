@@ -1,0 +1,189 @@
+import sdl3 as sdl
+
+cstruct SDL_Event {
+    type as uint32,
+    timestamp as uint64
+}
+
+width = 800
+height = 600
+cx = width / 2
+cy = height / 2
+scale = 180
+
+sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
+    exitf("SDL_Init failed: %s\n", sdl.SDL_GetError())
+}
+defer sdl.SDL_Quit()
+
+window = sdl.SDL_CreateWindow("Tim SDL3 Cube", width, height, 0) or! {
+    exitf("SDL_CreateWindow failed: %s\n", sdl.SDL_GetError())
+}
+defer sdl.SDL_DestroyWindow(window)
+
+renderer = sdl.SDL_CreateRenderer(window, 0) or! {
+    exitf("SDL_CreateRenderer failed: %s\n", sdl.SDL_GetError())
+}
+defer sdl.SDL_DestroyRenderer(renderer)
+
+running := 1
+frame := 0
+max_frames = 36000
+
+arena {
+    // Use the same SDL_Event buffer sizing as the other SDL3 examples.
+    event = alloc(192) as SDL_Event
+
+    @ running ! inf {
+        frame_start = sdl.SDL_GetTicks()
+
+        has_event = sdl.SDL_PollEvent(event)
+        if has_event > 0 {
+            event_type = event.type
+            if event_type == 256 {
+                running <- 0 // SDL_EVENT_QUIT
+            }
+        }
+
+        // Also allow quitting with Esc or Q.
+        keyboard = sdl.SDL_GetKeyboardState(0)
+        esc_down = read_u8(keyboard, sdl.SDL_SCANCODE_ESCAPE)
+        q_down = read_u8(keyboard, sdl.SDL_SCANCODE_Q)
+        key_quit = esc_down > 0 or q_down > 0
+        if key_quit > 0 {
+            running <- 0
+        }
+
+        angle = frame * 0.02
+        c = cos(angle)
+        s = sin(angle)
+        c2 = cos(angle * 0.7)
+        s2 = sin(angle * 0.7)
+
+        // Vertex 0: (-1, -1, -1)
+        x0 = -1
+        y0 = -1
+        z0 = -1
+        rx0 = x0 * c - z0 * s
+        rz0a = x0 * s + z0 * c
+        ry0 = y0 * c2 - rz0a * s2
+        rz0b = y0 * s2 + rz0a * c2 + 4
+        sx0 = rx0 * scale / rz0b + cx
+        sy0 = ry0 * scale / rz0b + cy
+
+        // Vertex 1: (1, -1, -1)
+        x1 = 1
+        y1 = -1
+        z1 = -1
+        rx1 = x1 * c - z1 * s
+        rz1a = x1 * s + z1 * c
+        ry1 = y1 * c2 - rz1a * s2
+        rz1b = y1 * s2 + rz1a * c2 + 4
+        sx1 = rx1 * scale / rz1b + cx
+        sy1 = ry1 * scale / rz1b + cy
+
+        // Vertex 2: (1, 1, -1)
+        x2 = 1
+        y2 = 1
+        z2 = -1
+        rx2 = x2 * c - z2 * s
+        rz2a = x2 * s + z2 * c
+        ry2 = y2 * c2 - rz2a * s2
+        rz2b = y2 * s2 + rz2a * c2 + 4
+        sx2 = rx2 * scale / rz2b + cx
+        sy2 = ry2 * scale / rz2b + cy
+
+        // Vertex 3: (-1, 1, -1)
+        x3 = -1
+        y3 = 1
+        z3 = -1
+        rx3 = x3 * c - z3 * s
+        rz3a = x3 * s + z3 * c
+        ry3 = y3 * c2 - rz3a * s2
+        rz3b = y3 * s2 + rz3a * c2 + 4
+        sx3 = rx3 * scale / rz3b + cx
+        sy3 = ry3 * scale / rz3b + cy
+
+        // Vertex 4: (-1, -1, 1)
+        x4 = -1
+        y4 = -1
+        z4 = 1
+        rx4 = x4 * c - z4 * s
+        rz4a = x4 * s + z4 * c
+        ry4 = y4 * c2 - rz4a * s2
+        rz4b = y4 * s2 + rz4a * c2 + 4
+        sx4 = rx4 * scale / rz4b + cx
+        sy4 = ry4 * scale / rz4b + cy
+
+        // Vertex 5: (1, -1, 1)
+        x5 = 1
+        y5 = -1
+        z5 = 1
+        rx5 = x5 * c - z5 * s
+        rz5a = x5 * s + z5 * c
+        ry5 = y5 * c2 - rz5a * s2
+        rz5b = y5 * s2 + rz5a * c2 + 4
+        sx5 = rx5 * scale / rz5b + cx
+        sy5 = ry5 * scale / rz5b + cy
+
+        // Vertex 6: (1, 1, 1)
+        x6 = 1
+        y6 = 1
+        z6 = 1
+        rx6 = x6 * c - z6 * s
+        rz6a = x6 * s + z6 * c
+        ry6 = y6 * c2 - rz6a * s2
+        rz6b = y6 * s2 + rz6a * c2 + 4
+        sx6 = rx6 * scale / rz6b + cx
+        sy6 = ry6 * scale / rz6b + cy
+
+        // Vertex 7: (-1, 1, 1)
+        x7 = -1
+        y7 = 1
+        z7 = 1
+        rx7 = x7 * c - z7 * s
+        rz7a = x7 * s + z7 * c
+        ry7 = y7 * c2 - rz7a * s2
+        rz7b = y7 * s2 + rz7a * c2 + 4
+        sx7 = rx7 * scale / rz7b + cx
+        sy7 = ry7 * scale / rz7b + cy
+
+        // Clear to black
+        sdl.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
+        sdl.SDL_RenderClear(renderer)
+
+        // Draw cube edges in red
+        sdl.SDL_SetRenderDrawColor(renderer, 255, 0, 0, 255)
+
+        // Front face
+        sdl.SDL_RenderLine(renderer, sx0, sy0, sx1, sy1)
+        sdl.SDL_RenderLine(renderer, sx1, sy1, sx2, sy2)
+        sdl.SDL_RenderLine(renderer, sx2, sy2, sx3, sy3)
+        sdl.SDL_RenderLine(renderer, sx3, sy3, sx0, sy0)
+
+        // Back face
+        sdl.SDL_RenderLine(renderer, sx4, sy4, sx5, sy5)
+        sdl.SDL_RenderLine(renderer, sx5, sy5, sx6, sy6)
+        sdl.SDL_RenderLine(renderer, sx6, sy6, sx7, sy7)
+        sdl.SDL_RenderLine(renderer, sx7, sy7, sx4, sy4)
+
+        // Connections
+        sdl.SDL_RenderLine(renderer, sx0, sy0, sx4, sy4)
+        sdl.SDL_RenderLine(renderer, sx1, sy1, sx5, sy5)
+        sdl.SDL_RenderLine(renderer, sx2, sy2, sx6, sy6)
+        sdl.SDL_RenderLine(renderer, sx3, sy3, sx7, sy7)
+
+        sdl.SDL_RenderPresent(renderer)
+        frame_end = sdl.SDL_GetTicks()
+        frame_time = frame_end - frame_start
+        remaining = 16 - frame_time
+        if remaining > 0 {
+            sdl.SDL_Delay(remaining)
+        }
+
+        frame++
+        if frame >= max_frames {
+            running <- 0
+        }
+    }
+}

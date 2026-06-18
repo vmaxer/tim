@@ -1,0 +1,74 @@
+import sdl3 as sdl
+
+width = 620
+height = 387
+
+sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
+    exitf("SDL_Init failed\n")
+}
+defer sdl.SDL_Quit()
+
+window = sdl.SDL_CreateWindow("Hello World!", width, height, 0) or! {
+    exitf("Failed to create window\n")
+}
+defer sdl.SDL_DestroyWindow(window)
+
+renderer = sdl.SDL_CreateRenderer(window, 0) or! {
+    exitf("Failed to create renderer\n")
+}
+defer sdl.SDL_DestroyRenderer(renderer)
+
+file = sdl.SDL_IOFromFile("img/grumpy-cat.bmp", "rb") or! {
+    exitf("Error reading file\n")
+}
+
+bmp = sdl.SDL_LoadBMP_IO(file, 1) or! {
+    exitf("Error creating surface\n")
+}
+defer sdl.SDL_DestroySurface(bmp)
+
+tex = sdl.SDL_CreateTextureFromSurface(renderer, bmp) or! {
+    exitf("Error creating texture\n")
+}
+defer sdl.SDL_DestroyTexture(tex)
+
+printf("Starting main loop...\n")
+
+running := 1
+loop_count := 0
+max_frames = 300
+
+arena {
+    event = alloc(128)
+    
+    @ running ! inf {
+        has_event = sdl.SDL_PollEvent(event)
+        has_event {
+            | has_event > 0 => {
+                event_type = event[0]
+                event_type {
+                    | event_type == 256 => { running <- 0 }
+                    | event_type == 768 => { running <- 0 }
+                }
+            }
+        }
+        
+        sdl.SDL_RenderClear(renderer)
+        sdl.SDL_RenderTexture(renderer, tex, 0, 0)
+        sdl.SDL_RenderPresent(renderer)
+        sdl.SDL_Delay(16)
+        
+        loop_count++
+        
+        loop_count {
+            | loop_count % 60 == 0 => { printf("Frame: %d\n", loop_count) }
+            | loop_count >= max_frames => {
+                printf("Max frames reached\n")
+                running <- 0
+            }
+        }
+    }
+}
+
+printf("Exited after %d frames\n", loop_count)
+

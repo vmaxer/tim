@@ -1,0 +1,15 @@
+// Test C string pointer arithmetic and byte access
+// This mimics how a compiler would parse source code stored as a C string
+
+import libc as c
+
+// 1. Allocate a C string manually
+// "ABC" = 65, 66, 67, 0
+ptr := c.malloc(4 as uint64)
+println(f"ptr: {ptr}")
+
+// NOTE: unsafe register assignment from variables (rax <- ptr) is not yet supported.
+// See TODO for the fix.
+println("malloc/free test: allocation succeeded")
+
+c.free(ptr)

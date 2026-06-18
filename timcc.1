@@ -1,0 +1,162 @@
+.TH TIMCC 1 "2026-06-18" "timcc 1.0.0" "User Commands"
+.SH NAME
+timcc \- compile Tim source to native executables
+.SH SYNOPSIS
+.B timcc
+.RI [ options ]
+.RI [ file .tim ...]
+.br
+.B timcc
+.BR -c " " code
+.RI [ options ]
+.SH DESCRIPTION
+.B timcc
+is the reference compiler for the Tim programming language. It reads Tim
+source files and produces a native executable for the selected target
+platform without relying on external toolchains such as GCC or LLVM. When no
+input files or inline code are provided the compiler emits a dynamically
+linked "Hello, world" binary in the system temporary directory.
+.PP
+Arguments that do not end in
+.BR .tim
+are ignored during compilation. The first source file found is compiled and
+subsequent files are not processed.
+.SH OPTIONS
+The options use Go's flag syntax, so either
+.BR -flag=value
+or
+.B "-flag value"
+forms are accepted.
+.TP
+.BI -arch " " arch
+Set the target CPU architecture. Supported values are
+.BR amd64 ,
+.BR arm64
+and
+.BR riscv64 .
+Defaults to the host architecture.
+.TP
+.BI -os " " os
+Select the target operating system. The compiler currently generates
+executables for
+.BR linux
+and
+.BR darwin .
+Other values are rejected. Defaults to the host operating system.
+.TP
+.BI -target " " arch-os
+Specify the target platform in a single flag, for example
+.BR amd64-linux ,
+.BR arm64-darwin
+or
+.BR riscv64-linux .
+This overrides
+.BR -arch
+and
+.BR -os .
+
+.TP
+.BI -o " " file
+.TP
+.BI -output " " file
+Write the generated executable to
+.I file
+instead of the default. When no output file is given,
+.B timcc
+writes into the current directory using the input filename without the
+.BR .tim
+suffix. For inline code the default output path is printed and lives in the
+system temporary directory.
+.TP
+.BI -c " " code
+Compile the string
+.I code
+as if it were the contents of a temporary
+.B .tim
+file. Unless
+.BR -o
+or
+.BR -output
+is supplied the resulting executable is written to the system temporary
+directory and its filename is printed on standard output.
+.TP
+.B -v
+.TP
+.B --verbose
+Enable verbose mode. Compilation progress, generated section sizes and
+dependency handling details are written to standard error.
+.TP
+.B -u
+.TP
+.B --update-deps
+Update cached Git repositories used for imported Tim modules before
+compilation. Without this flag existing caches are reused as-is.
+.TP
+.B -V
+.TP
+.B --version
+Print version information and exit.
+.TP
+.B -h
+.TP
+.B --help
+Show a summary of the available options and exit.
+.SH OUTPUT
+On successful compilation and without verbose mode,
+.B timcc
+prints the path of the generated executable to standard output whenever the
+output filename was not explicitly provided.
+.SH ENVIRONMENT
+.TP
+.B XDG_CACHE_HOME
+If set, the directory used to cache imported Git repositories. The cache is
+stored in
+.I $XDG_CACHE_HOME/timcc
+.
+.TP
+.B HOME
+When
+.B XDG_CACHE_HOME
+is unset, cached repositories are stored in
+.I $HOME/.cache/timcc
+.
+.SH FILES
+.TP
+.I $XDG_CACHE_HOME/timcc
+.TQ
+.I $HOME/.cache/timcc
+Location of cached Git repositories used for module imports.
+.SH EXAMPLES
+Compile a program for the current platform:
+.PP
+.nf
+.RS
+$ timcc hello.tim
+$ ./hello
+.RE
+.fi
+.PP
+Compile inline code for macOS on arm64:
+.PP
+.nf
+.RS
+$ timcc -target arm64-darwin -c 'println("hi");exit(0)'
+.RE
+.fi
+.PP
+Refresh all cached dependencies before compiling:
+.PP
+.nf
+.RS
+$ timcc -u project.tim
+.RE
+.fi
+.SH EXIT STATUS
+.TP
+.B 0
+Compilation succeeded.
+.TP
+.B >0
+An error occurred.
+.SH SEE ALSO
+.BR go (1)

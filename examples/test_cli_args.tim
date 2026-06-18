@@ -1,0 +1,30 @@
+// Read CLI args from /proc/self/cmdline
+import libc as c
+
+main = {
+    // Open file
+    // O_RDONLY = 0
+    fd := c.open("/proc/self/cmdline", 0 as int32)
+    
+    fd < 0 {
+        println("Failed to open /proc/self/cmdline")
+        ret 1
+    }
+    
+    // Read content
+    buf_size := 4096
+    buf := c.malloc(buf_size as uint64)
+    
+    // Cast all args: int, void*, size_t
+    bytes_read := c.read(fd as int32, buf as cptr, buf_size as uint64)
+    c.close(fd as int32)
+    
+    printf("Bytes read: %f\n", bytes_read)
+    
+    // NOTE: Reading individual bytes via unsafe register arithmetic is not yet supported.
+    // The cmdline args are null-separated in /proc/self/cmdline.
+    printf("Args buffer loaded successfully\n")
+    
+    c.free(buf)
+    0
+}

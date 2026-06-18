@@ -1,0 +1,5 @@
+// sizeof is not yet implemented in Tim.
+// cstruct SDL_Event { type as uint32, timestamp as uint64 }
+// SDL_Event size is 16 bytes (4 + 4 padding + 8)
+println("SDL_Event size: 16 bytes (sizeof not yet implemented)")
+

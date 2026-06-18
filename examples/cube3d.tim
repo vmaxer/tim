@@ -1,0 +1,160 @@
+import sdl3 as sdl
+import gl as gl
+
+cstruct SDL_Event {
+    type as uint32,
+    timestamp as uint64
+}
+
+width = 800
+height = 600
+
+// Ask for a compatibility profile so immediate mode (glBegin/glEnd) works.
+sdl.SDL_GL_SetAttribute(sdl.SDL_GL_CONTEXT_MAJOR_VERSION, 2)
+sdl.SDL_GL_SetAttribute(sdl.SDL_GL_CONTEXT_MINOR_VERSION, 1)
+sdl.SDL_GL_SetAttribute(sdl.SDL_GL_CONTEXT_PROFILE_MASK, sdl.SDL_GL_CONTEXT_PROFILE_COMPATIBILITY)
+sdl.SDL_GL_SetAttribute(sdl.SDL_GL_DOUBLEBUFFER, 1)
+sdl.SDL_GL_SetAttribute(sdl.SDL_GL_DEPTH_SIZE, 24)
+
+init_ok = sdl.SDL_Init(sdl.SDL_INIT_VIDEO)
+if init_ok <= 0 {
+    println("SDL_Init failed")
+    exit(1)
+}
+defer sdl.SDL_Quit()
+
+window = sdl.SDL_CreateWindow("Tim SDL3 OpenGL Cube", width, height, sdl.SDL_WINDOW_OPENGL)
+if window == 0 {
+    println("SDL_CreateWindow failed")
+    exit(1)
+}
+defer sdl.SDL_DestroyWindow(window)
+
+glctx = sdl.SDL_GL_CreateContext(window)
+if glctx == 0 {
+    println("SDL_GL_CreateContext failed")
+    exit(1)
+}
+defer sdl.SDL_GL_DestroyContext(glctx)
+
+mk_ok = sdl.SDL_GL_MakeCurrent(window, glctx)
+if mk_ok <= 0 {
+    println("SDL_GL_MakeCurrent failed")
+    exit(1)
+}
+
+sdl.SDL_GL_SetSwapInterval(1)
+
+// GL constants (avoids dependency on GL headers for constants).
+GL_COLOR_BUFFER_BIT = 16384
+GL_DEPTH_BUFFER_BIT = 256
+GL_DEPTH_TEST = 2929
+GL_PROJECTION = 5889
+GL_MODELVIEW = 5888
+GL_QUADS = 7
+
+gl.glViewport(0, 0, width, height)
+gl.glEnable(GL_DEPTH_TEST)
+
+running := 1
+max_frames = 36000
+frame := 0
+angle := 0
+
+arena {
+    event = alloc(192) as SDL_Event
+
+    @ running ! inf {
+        has_event = sdl.SDL_PollEvent(event)
+        if has_event > 0 {
+            event_type = event.type
+            if event_type == 256 {
+                running <- 0 // SDL_EVENT_QUIT
+            }
+        }
+
+        // Also allow keyboard quit.
+        keyboard = sdl.SDL_GetKeyboardState(0)
+        esc_down = read_u8(keyboard, sdl.SDL_SCANCODE_ESCAPE)
+        q_down = read_u8(keyboard, sdl.SDL_SCANCODE_Q)
+        key_quit = esc_down > 0 or q_down > 0
+        if key_quit > 0 {
+            running <- 0
+        }
+
+        ticks = sdl.SDL_GetTicks()
+        angle <- angle + 0.8
+        aspect = width / height
+        znear = 0.1
+        zfar = 100
+        top = znear * 0.577350269 // tan(30 deg)
+        right = top * aspect
+
+        bg = 0.08 + 0.04 * sin(ticks * 0.002)
+        gl.glClearColor(bg as float, 0 as float, 0 as float, 1 as float)
+        gl.glClear(GL_COLOR_BUFFER_BIT + GL_DEPTH_BUFFER_BIT)
+
+        gl.glMatrixMode(GL_PROJECTION)
+        gl.glLoadIdentity()
+        gl.glFrustum((-right) as float, right as float, (-top) as float, top as float, znear as float, zfar as float)
+
+        gl.glMatrixMode(GL_MODELVIEW)
+        gl.glLoadIdentity()
+        gl.glTranslatef(0 as float, 0 as float, -5 as float)
+        gl.glRotatef(angle as float, 1 as float, 1 as float, 0 as float)
+
+        // Filled cube with per-face red intensity shading.
+        gl.glBegin(GL_QUADS)
+
+        // Front
+        gl.glColor3f(1 as float, 0 as float, 0 as float)
+        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
+        gl.glVertex3f(1 as float, -1 as float, 1 as float)
+        gl.glVertex3f(1 as float, 1 as float, 1 as float)
+        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
+
+        // Back
+        gl.glColor3f(0.35 as float, 0 as float, 0 as float)
+        gl.glVertex3f(1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
+        gl.glVertex3f(1 as float, 1 as float, -1 as float)
+
+        // Left
+        gl.glColor3f(0.65 as float, 0 as float, 0 as float)
+        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
+        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
+        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
+
+        // Right
+        gl.glColor3f(0.85 as float, 0 as float, 0 as float)
+        gl.glVertex3f(1 as float, -1 as float, 1 as float)
+        gl.glVertex3f(1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(1 as float, 1 as float, -1 as float)
+        gl.glVertex3f(1 as float, 1 as float, 1 as float)
+
+        // Top
+        gl.glColor3f(0.75 as float, 0 as float, 0 as float)
+        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
+        gl.glVertex3f(1 as float, 1 as float, 1 as float)
+        gl.glVertex3f(1 as float, 1 as float, -1 as float)
+        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
+
+        // Bottom
+        gl.glColor3f(0.5 as float, 0 as float, 0 as float)
+        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(1 as float, -1 as float, -1 as float)
+        gl.glVertex3f(1 as float, -1 as float, 1 as float)
+        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
+
+        gl.glEnd()
+
+        sdl.SDL_GL_SwapWindow(window)
+
+        frame++
+        if frame >= max_frames {
+            running <- 0
+        }
+    }
+}

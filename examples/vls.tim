@@ -1,0 +1,87 @@
+// vls - a tiny ls/eza-like directory listing tool written in Tim.
+//
+// Lists the entries in the current directory, one per line, with a single
+// suffix character indicating the file kind (mirroring ls -F):
+//   /   directory
+//   @   symbolic link
+//   |   FIFO / named pipe
+//   =   socket
+//
+// Hidden entries (names starting with '.') are skipped, like ls without
+// '-a'. Output is in the order returned by the filesystem - no sorting.
+//
+// Build:  ../timcc -o vls vls.tim
+// Run:    ./vls
+//
+// Implementation notes:
+//   * Uses libc opendir/readdir/closedir directly via the Tim C FFI.
+//   * On Linux, struct dirent has d_type at byte offset 18 and the
+//     null-terminated d_name array starting at byte offset 19. We extract
+//     d_type with the peek8 builtin and compute d_name as a raw pointer
+//     by adding 19 to the entry address.
+//   * Some filesystems return d_type == DT_UNKNOWN (0) for every entry;
+//     in that case we just print the name with no suffix instead of
+//     calling stat() for each file (keeping this example minimal).
+
+import libc as c
+
+DT_FIFO = 1
+DT_DIR  = 4
+DT_LNK  = 10
+DT_SOCK = 12
+
+D_TYPE_OFFSET = 18
+D_NAME_OFFSET = 19
+
+main = {
+    dir := c.opendir(".")
+    if dir == 0 {
+        c.printf("vls: cannot open current directory\n" as cstring)
+        ret 1
+    }
+
+    @ yes ! 1000000 {
+        entry := c.readdir(dir as cptr)
+        entry == 0 {
+            break
+        }
+
+        first := peek8(entry as cptr, D_NAME_OFFSET)
+        first == 46 {
+            continue
+        }
+
+        name_ptr := (entry as num) + D_NAME_OFFSET
+        c.printf("%s" as cstring, name_ptr as cptr)
+
+        dt := peek8(entry as cptr, D_TYPE_OFFSET)
+        if dt == DT_DIR {
+            c.printf("/\n" as cstring)
+        }
+        if dt == DT_LNK {
+            c.printf("@\n" as cstring)
+        }
+        if dt == DT_FIFO {
+            c.printf("|\n" as cstring)
+        }
+        if dt == DT_SOCK {
+            c.printf("=\n" as cstring)
+        }
+        if dt != DT_DIR {
+            if dt != DT_LNK {
+                if dt != DT_FIFO {
+                    if dt != DT_SOCK {
+                        c.printf("\n" as cstring)
+                    }
+                }
+            }
+        }
+    }
+
+    c.closedir(dir as cptr)
+    // Flush stdout so output is visible when piped or redirected to a file.
+    // c.printf buffers to libc's FILE* and would otherwise lose buffered
+    // output if the program exits via _start without an atexit handler.
+    c.fflush(0 as cptr)
+    0
+}
