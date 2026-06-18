@@ -166,7 +166,6 @@ const (
 	TOKEN_SYSCALL  // syscall (system call in unsafe blocks)
 	TOKEN_ARENA    // arena (arena memory blocks)
 	TOKEN_DEFER    // defer (deferred execution)
-	TOKEN_MAX      // (deprecated keyword) loop/recursion bound is now the '!' token
 	TOKEN_INF      // inf (infinity, for unlimited iterations or numeric infinity)
 	TOKEN_CSTRUCT  // cstruct (C-compatible struct definition)
 	TOKEN_PACKED   // packed (no padding modifier for cstruct)
@@ -292,19 +291,23 @@ func (l *Lexer) advance() {
 
 // LexerState represents a saved lexer state for lookahead
 type LexerState struct {
-	pos  int
-	line int
+	pos       int
+	line      int
+	column    int
+	lineStart int
 }
 
 // save returns the current lexer state
 func (l *Lexer) save() LexerState {
-	return LexerState{pos: l.pos, line: l.line}
+	return LexerState{pos: l.pos, line: l.line, column: l.column, lineStart: l.lineStart}
 }
 
 // restore restores a previously saved lexer state
 func (l *Lexer) restore(state LexerState) {
 	l.pos = state.pos
 	l.line = state.line
+	l.column = state.column
+	l.lineStart = state.lineStart
 }
 
 func (l *Lexer) NextToken() Token {

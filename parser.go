@@ -116,7 +116,7 @@ type Parser struct {
 	speculative     bool                    // True when in speculative parsing mode (suppress errors)
 	errors          *ErrorCollector         // Railway-oriented error collector
 	inMatchBlock    bool                    // True when parsing inside a match block (prevents nested match parsing)
-	inConditionLoop bool                    // True when parsing condition loop expression (prevents 'max' consumption)
+	inConditionLoop bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
 	scopes          []map[string]bool       // Stack of variable scopes for shadow detection
 	lambdaParams    []string                // Temporary storage for lambda parameters being parsed
 	pendingHoists   []Statement             // Synthesized top-level defs to inject before the current statement
@@ -736,7 +736,7 @@ func (p *Parser) parseAliasStmt() *AliasStmt {
 	validTargets := map[TokenType]bool{
 		TOKEN_AT: true, TOKEN_IN: true, TOKEN_RET: true, TOKEN_ERR: true,
 		TOKEN_UNSAFE: true, TOKEN_ARENA: true, TOKEN_DEFER: true,
-		TOKEN_MAX: true, TOKEN_INF: true, TOKEN_AND: true, TOKEN_OR: true,
+		TOKEN_INF: true, TOKEN_AND: true, TOKEN_OR: true,
 		TOKEN_NOT: true, TOKEN_XOR: true, TOKEN_AT_PLUSPLUS: true,
 		TOKEN_IF: true, TOKEN_ELIF: true, TOKEN_ELSE: true,
 	}
