@@ -202,5 +202,5 @@ defer sdl.SDL_DestroyTexture(tex)
 
 ## General info
 
-* Version: 1.0.2
+* Version: 1.0.3
 * License: The Unlicense

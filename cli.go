@@ -643,7 +643,7 @@ EXAMPLES:
 
 DOCUMENTATION:
     For language documentation, see LANGUAGESPEC.md
-    For help or bug reports: https://github.com/anthropics/tim/issues
+    For help or bug reports: https://github.com/zmaxer/tim/issues
 
 `)
 	return nil
