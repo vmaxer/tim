@@ -15,7 +15,7 @@ import (
 
 // A tiny compiler for x86_64, aarch64, and riscv64 for Linux, macOS, FreeBSD
 
-const versionString = "timcc 1.0.1"
+const versionString = "tim 1.0.1"
 
 // Architecture type
 type Arch int
@@ -1299,8 +1299,8 @@ func main() {
 	defaultOSStr := defaultPlatform.OS.String()
 
 	// NOTE: Go's flag package stops parsing at the first non-flag argument
-	// So flags must come BEFORE the filename: timcc --arch arm64 program.tim
-	// NOT: timcc program.tim --arch arm64
+	// So flags must come BEFORE the filename: tim --arch arm64 program.tim
+	// NOT: tim program.tim --arch arm64
 	var archFlag = flag.String("arch", defaultArchStr, "target architecture (amd64, arm64, riscv64)")
 	var osFlag = flag.String("os", defaultOSStr, "target OS (linux, darwin, freebsd)")
 	var targetFlag = flag.String("target", "", "target platform (e.g., arm64-macos, amd64-linux, riscv64-linux)")

@@ -27,7 +27,7 @@ var FunctionRepository = map[string]string{}
 
 // GetFunctionRepository returns the repository URL for a function
 // Checks environment variable TIM_FUNCTIONNAME first, then falls back to FunctionRepository map
-// Example: TIM_PRINTLN=github.com/example/timcc_alternative_core overrides the default
+// Example: TIM_PRINTLN=github.com/example/tim_alternative_core overrides the default
 func GetFunctionRepository(funcName string) (string, bool) {
 	// Check for environment variable override
 	// Convert function name to uppercase for env var: println -> PRINTLN
@@ -44,27 +44,27 @@ func GetFunctionRepository(funcName string) (string, bool) {
 	return repoURL, ok
 }
 
-// GetCachePath returns the cache directory for timcc dependencies
+// GetCachePath returns the cache directory for tim dependencies
 // Respects XDG_CACHE_HOME environment variable
-// Default: $XDG_CACHE_HOME/timcc or ~/.cache/timcc/
+// Default: $XDG_CACHE_HOME/tim or ~/.cache/tim/
 func GetCachePath() (string, error) {
 	// Check XDG_CACHE_HOME first
 	if xdgCache := os.Getenv("XDG_CACHE_HOME"); xdgCache != "" {
-		return filepath.Join(xdgCache, "timcc"), nil
+		return filepath.Join(xdgCache, "tim"), nil
 	}
 
-	// Fall back to ~/.cache/timcc
+	// Fall back to ~/.cache/tim
 	homeDir, err := os.UserHomeDir()
 	if err != nil {
 		return "", fmt.Errorf("failed to get user home directory: %w", err)
 	}
 
-	cachePath := filepath.Join(homeDir, ".cache", "timcc")
+	cachePath := filepath.Join(homeDir, ".cache", "tim")
 	return cachePath, nil
 }
 
 // GetRepoCachePath returns the local path for a cloned repository
-// Example: "github.com/example/timcc_mylib" -> "~/.cache/timcc/github.com/example/timcc_mylib"
+// Example: "github.com/example/tim_mylib" -> "~/.cache/tim/github.com/example/tim_mylib"
 func GetRepoCachePath(repoURL string) (string, error) {
 	cachePath, err := GetCachePath()
 	if err != nil {

@@ -9,15 +9,15 @@ import (
 	"strings"
 )
 
-// cli.go - User-friendly command-line interface for timcc
+// cli.go - User-friendly command-line interface for tim
 //
 // This file implements a Go-like CLI interface with subcommands:
-// - timcc (default: compile current directory or show help)
-// - timcc build <file> (compile to executable)
-// - timcc run <file> (compile and run immediately)
-// - timcc <file.tim> (shorthand for build)
+// - tim (default: compile current directory or show help)
+// - tim build <file> (compile to executable)
+// - tim run <file> (compile and run immediately)
+// - tim <file.tim> (shorthand for build)
 //
-// Also supports shebang execution: #!/usr/bin/timcc
+// Also supports shebang execution: #!/usr/bin/tim
 
 // isTimFile checks if a filename has a Tim extension (.tim)
 func isTimFile(filename string) bool {
@@ -73,13 +73,13 @@ func RunCLI(args []string, platform Platform, verbose, quiet bool, optTimeout fl
 	switch subcmd {
 	case "build":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: timcc build <file.tim> [-o output]")
+			return fmt.Errorf("usage: tim build <file.tim> [-o output]")
 		}
 		return cmdBuild(ctx, args[1:])
 
 	case "run":
 		if len(args) < 2 {
-			return fmt.Errorf("usage: timcc run <file.tim> [args...]")
+			return fmt.Errorf("usage: tim run <file.tim> [args...]")
 		}
 		return cmdRun(ctx, args[1:])
 
@@ -106,7 +106,7 @@ func RunCLI(args []string, platform Platform, verbose, quiet bool, optTimeout fl
 		}
 
 		// Unknown command
-		return fmt.Errorf("unknown command: %s\n\nRun 'timcc help' for usage information", subcmd)
+		return fmt.Errorf("unknown command: %s\n\nRun 'tim help' for usage information", subcmd)
 	}
 }
 
@@ -114,7 +114,7 @@ func RunCLI(args []string, platform Platform, verbose, quiet bool, optTimeout fl
 // Confidence that this function is working: 85%
 func cmdBuild(ctx *CommandContext, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timcc build <file.tim> [-o output]")
+		return fmt.Errorf("usage: tim build <file.tim> [-o output]")
 	}
 
 	// Collect input files (all non-flag arguments)
@@ -234,7 +234,7 @@ func cmdBuild(ctx *CommandContext, args []string) error {
 // cmdRun compiles a Tim source file to /dev/shm and executes it
 func cmdRun(ctx *CommandContext, args []string) error {
 	if len(args) == 0 {
-		return fmt.Errorf("usage: timcc run <file.tim> [args...]")
+		return fmt.Errorf("usage: tim run <file.tim> [args...]")
 	}
 
 	inputFile := args[0]
@@ -293,7 +293,7 @@ func cmdRun(ctx *CommandContext, args []string) error {
 	return nil
 }
 
-// cmdRunShebang handles shebang execution (#!/usr/bin/timcc)
+// cmdRunShebang handles shebang execution (#!/usr/bin/tim)
 func cmdRunShebang(ctx *CommandContext, scriptPath string, scriptArgs []string) error {
 	// In shebang mode, we compile and run immediately
 	// This is similar to cmdRun but optimized for shebang use
@@ -593,10 +593,10 @@ func cmdTest(ctx *CommandContext, args []string) error {
 
 // cmdHelp displays usage information
 func cmdHelp(ctx *CommandContext) error {
-	fmt.Printf(`timcc - The Tim Compiler (Version 1.5.0)
+	fmt.Printf(`tim - The Tim Compiler (Version 1.5.0)
 
 USAGE:
-    timcc <command> [arguments]
+    tim <command> [arguments]
 
 COMMANDS:
     build <file.tim>      Compile a Tim source file to an executable
@@ -606,8 +606,8 @@ COMMANDS:
     version               Show version information
 
 SHORTHAND:
-    timcc <file.tim>      Same as 'timcc build <file.tim>'
-    timcc                  Show this help message (or build if .tim files found)
+    tim <file.tim>      Same as 'tim build <file.tim>'
+    tim                  Show this help message (or build if .tim files found)
 
 FLAGS (can be used with any command):
     -o, --output <file>    Output executable filename (default: input name without .tim)
@@ -623,27 +623,27 @@ FLAGS (can be used with any command):
 
 EXAMPLES:
     # Compile a program
-    timcc build hello.tim
-    timcc build hello.tim -o hello
+    tim build hello.tim
+    tim build hello.tim -o hello
 
     # Compile and run immediately
-    timcc run hello.tim
-    timcc run server.tim --port 8080
+    tim run hello.tim
+    tim run server.tim --port 8080
 
     # Shorthand compilation
-    timcc hello.tim
+    tim hello.tim
 
     # Run tests
-    timcc test
-    timcc test ./tests
+    tim test
+    tim test ./tests
 
-    # Shebang execution (add #!/usr/bin/timcc to first line of .tim file)
+    # Shebang execution (add #!/usr/bin/tim to first line of .tim file)
     chmod +x script.tim
     ./script.tim arg1 arg2
 
 DOCUMENTATION:
     For language documentation, see LANGUAGESPEC.md
-    For help or bug reports: https://github.com/anthropics/timcc/issues
+    For help or bug reports: https://github.com/anthropics/tim/issues
 
 `)
 	return nil

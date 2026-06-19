@@ -1,5 +1,5 @@
 // Build and run with:
-// timcc build add.tim hello.tim -o hello && ./hello
+// tim build add.tim hello.tim -o hello && ./hello
 
 println("Hello, World!")
 

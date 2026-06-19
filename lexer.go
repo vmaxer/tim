@@ -251,7 +251,7 @@ type Lexer struct {
 func NewLexer(input string) *Lexer {
 	l := &Lexer{input: input, pos: 0, line: 1, column: 1, lineStart: 0}
 
-	// Skip shebang line if present (#!/usr/bin/timcc)
+	// Skip shebang line if present (#!/usr/bin/tim)
 	if len(input) >= 2 && input[0] == '#' && input[1] == '!' {
 		// Skip until newline
 		for l.pos < len(l.input) && l.input[l.pos] != '\n' {

@@ -1,6 +1,6 @@
 .PHONY: install test clean
 
-PROGRAM := timcc
+PROGRAM := tim
 SOURCES := $(wildcard *.go)
 
 GO ?= go

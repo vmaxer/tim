@@ -1,16 +1,16 @@
-.TH TIMCC 1 "2026-06-19" "timcc 1.0.1" "User Commands"
+.TH TIM 1 "2026-06-19" "tim 1.0.1" "User Commands"
 .SH NAME
-timcc \- compile Tim source to native executables
+tim \- compile Tim source to native executables
 .SH SYNOPSIS
-.B timcc
+.B tim
 .RI [ options ]
 .RI [ file .tim ...]
 .br
-.B timcc
+.B tim
 .BR -c " " code
 .RI [ options ]
 .SH DESCRIPTION
-.B timcc
+.B tim
 is the reference compiler for the Tim programming language. It reads Tim
 source files and produces a native executable for the selected target
 platform without relying on external toolchains such as GCC or LLVM. When no
@@ -62,7 +62,7 @@ and
 Write the generated executable to
 .I file
 instead of the default. When no output file is given,
-.B timcc
+.B tim
 writes into the current directory using the input filename without the
 .BR .tim
 suffix. For inline code the default output path is printed and lives in the
@@ -103,7 +103,7 @@ Print version information and exit.
 Show a summary of the available options and exit.
 .SH OUTPUT
 On successful compilation and without verbose mode,
-.B timcc
+.B tim
 prints the path of the generated executable to standard output whenever the
 output filename was not explicitly provided.
 .SH ENVIRONMENT
@@ -111,27 +111,27 @@ output filename was not explicitly provided.
 .B XDG_CACHE_HOME
 If set, the directory used to cache imported Git repositories. The cache is
 stored in
-.I $XDG_CACHE_HOME/timcc
+.I $XDG_CACHE_HOME/tim
 .
 .TP
 .B HOME
 When
 .B XDG_CACHE_HOME
 is unset, cached repositories are stored in
-.I $HOME/.cache/timcc
+.I $HOME/.cache/tim
 .
 .SH FILES
 .TP
-.I $XDG_CACHE_HOME/timcc
+.I $XDG_CACHE_HOME/tim
 .TQ
-.I $HOME/.cache/timcc
+.I $HOME/.cache/tim
 Location of cached Git repositories used for module imports.
 .SH EXAMPLES
 Compile a program for the current platform:
 .PP
 .nf
 .RS
-$ timcc hello.tim
+$ tim hello.tim
 $ ./hello
 .RE
 .fi
@@ -140,7 +140,7 @@ Compile inline code for macOS on arm64:
 .PP
 .nf
 .RS
-$ timcc -target arm64-darwin -c 'println("hi");exit(0)'
+$ tim -target arm64-darwin -c 'println("hi");exit(0)'
 .RE
 .fi
 .PP
@@ -148,7 +148,7 @@ Refresh all cached dependencies before compiling:
 .PP
 .nf
 .RS
-$ timcc -u project.tim
+$ tim -u project.tim
 .RE
 .fi
 .SH EXIT STATUS

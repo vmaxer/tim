@@ -346,11 +346,11 @@ import sdl3 as sdl
 import raylib as rl
 
 // Git repository import
-import github.com/example/timcc-math as math
-import github.com/example/timcc-math@v1.0.0 as math
-import github.com/example/timcc-math@latest as math
-import github.com/example/timcc-math@main as math
-import git@github.com:example/timcc-math.git as math
+import github.com/example/tim-math as math
+import github.com/example/tim-math@v1.0.0 as math
+import github.com/example/tim-math@latest as math
+import github.com/example/tim-math@main as math
+import git@github.com:example/tim-math.git as math
 
 // Directory import
 import . as local                    // Current directory
@@ -365,7 +365,7 @@ import SDL3.dll as sdl
 ### Import Behavior
 
 - **Libraries**: Searches for library files and headers, parses C headers for FFI
-- **Git Repos**: Clones to `~/.cache/timcc/` (respects `XDG_CACHE_HOME`), imports all top-level `.tim` files
+- **Git Repos**: Clones to `~/.cache/tim/` (respects `XDG_CACHE_HOME`), imports all top-level `.tim` files
 - **Directories**: Imports all top-level `.tim` files from the directory
 - **Version Specifiers**:
   - `@v1.0.0` - Specific tag

@@ -2318,7 +2318,7 @@ main ==> {
     is_special := age < 16 or age > 65
     printf("  age < 16 or age > 65 = %v\n", is_special)
 
-    // Chained conditions (timccgame-style)
+    // Chained conditions (timgame-style)
     printf("\nChained conditions:\n")
     moving := 0 or 0 or 1  // w key OR up key OR controller
     printf("  moving (0 or 0 or 1) = %v\n", moving)

@@ -35,7 +35,7 @@ println("Hello, Tim!")
 Compile and run:
 
 ```bash
-timcc hello.tim -o hello
+tim hello.tim -o hello
 ./hello
 ```
 

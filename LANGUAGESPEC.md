@@ -1356,16 +1356,16 @@ import "C:\\Windows\\System32\\user32.dll" as user32
 
 ```tim
 // HTTPS format (recommended)
-import "github.com/example/timcc-math" as math
+import "github.com/example/tim-math" as math
 
 // With version specifier
-import "github.com/example/timcc-math@v1.0.0" as math
-import "github.com/example/timcc-math@v2.1.3" as math
-import "github.com/example/timcc-math@latest" as math
-import "github.com/example/timcc-math@main" as math
+import "github.com/example/tim-math@v1.0.0" as math
+import "github.com/example/tim-math@v2.1.3" as math
+import "github.com/example/tim-math@latest" as math
+import "github.com/example/tim-math@main" as math
 
 // SSH format
-import "git@github.com:example/timcc-math.git" as math
+import "git@github.com:example/tim-math.git" as math
 
 // GitLab and other providers
 import "gitlab.com/user/project" as proj
@@ -1373,7 +1373,7 @@ import "bitbucket.org/user/repo" as repo
 ```
 
 **Git repository behavior:**
-- Clones to `~/.cache/timcc/` (respects `XDG_CACHE_HOME`)
+- Clones to `~/.cache/tim/` (respects `XDG_CACHE_HOME`)
 - Imports all top-level `.tim` files from the repository
 - Version specifiers:
   - `@v1.0.0` - Specific tag
@@ -1406,7 +1406,7 @@ import "C:\\Projects\\mylib" as mylib
 ```tim
 // Complete application setup
 import "sdl3" as sdl                           // System library
-import "github.com/example/timcc-math" as math  // Git repo
+import "github.com/example/tim-math" as math  // Git repo
 import "./game_logic" as game                  // Local directory
 
 main = {
@@ -1532,10 +1532,10 @@ init_graphics = () => {
 The compiler links with `-lc` by default. Additional libraries:
 
 ```bash
-timcc program.tim -o program -L/path/to/libs -lmylib
+tim program.tim -o program -L/path/to/libs -lmylib
 
 # SDL3 example
-timcc sdl_demo.tim -o sdl_demo $(pkg-config --libs sdl3)
+tim sdl_demo.tim -o sdl_demo $(pkg-config --libs sdl3)
 ```
 
 ## CStruct
@@ -2373,20 +2373,20 @@ validate = x -> x < 0 { ret error("bad") }  // Use "arg" instead
 
 ```bash
 # Compile to executable
-timcc program.tim -o program
+tim program.tim -o program
 
 # Compile with C library
-timcc program.tim -o program -lm
+tim program.tim -o program -lm
 
 # Specify target architecture
-timcc program.tim -o program -arch arm64
-timcc program.tim -o program -arch riscv64
+tim program.tim -o program -arch arm64
+tim program.tim -o program -arch riscv64
 
 # Hot reload mode (Unix)
-timcc --hot program.tim
+tim --hot program.tim
 
 # Show version
-timcc --version
+tim --version
 ```
 
 ### Supported Architectures

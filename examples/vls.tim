@@ -10,7 +10,7 @@
 // Hidden entries (names starting with '.') are skipped, like ls without
 // '-a'. Output is in the order returned by the filesystem - no sorting.
 //
-// Build:  ../timcc -o vls vls.tim
+// Build:  ../tim -o vls vls.tim
 // Run:    ./vls
 //
 // Implementation notes:

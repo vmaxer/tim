@@ -10,7 +10,7 @@ platforms="
 # darwin,arm64,,macos_aarch64_static,tar.gz
 # linux,riscv64,,linux_riscv64_static,tar.xz
 
-name=timcc
+name=tim
 version=$(grep -i version main.go | head -1 | cut -d' ' -f5 | cut -d'"' -f1)
 echo "Version $version"
 
@@ -35,9 +35,9 @@ compile_and_compress() {
 
   echo "Compressing $name-$version.$platform.$compression"
   mkdir "$name-$version-$platform"
-  cp timcc.1 "$name-$version-$platform/"
-  gzip "$name-$version-$platform/timcc.1"
-  cp "$name.$platform" "$name-$version-$platform/timcc"
+  cp tim.1 "$name-$version-$platform/"
+  gzip "$name-$version-$platform/tim.1"
+  cp "$name.$platform" "$name-$version-$platform/tim"
   cp LICENSE "$name-$version-$platform/"
 
   case "$compression" in
