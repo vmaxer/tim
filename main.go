@@ -15,7 +15,7 @@ import (
 
 // A tiny compiler for x86_64, aarch64, and riscv64 for Linux, macOS, FreeBSD
 
-const versionString = "timcc 1.0.0"
+const versionString = "timcc 1.0.1"
 
 // Architecture type
 type Arch int
