@@ -67,8 +67,12 @@ func (fc *TimCompiler) writeMachOARM64(outputPath string) error {
 	// Extract unique function names from callPatches
 	neededSet := make(map[string]bool)
 	for _, patch := range fc.eb.callPatches {
-		// patch.targetName is like "malloc$stub" or "printf$stub"
-		// Strip the "$stub" suffix to get the function name
+		// External C calls are emitted with a "$stub" suffix; calls without it
+		// target internal labels (Tim runtime helpers or module-level Tim
+		// functions like "lambda_3") and must not become dylib imports.
+		if !strings.HasSuffix(patch.targetName, "$stub") {
+			continue
+		}
 		funcName := strings.TrimSuffix(patch.targetName, "$stub")
 
 		// Skip internal Tim runtime functions (they're defined in the binary)

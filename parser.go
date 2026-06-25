@@ -173,8 +173,9 @@ func NewParser(input string) *Parser {
 		errors:    NewErrorCollector(10),
 		scopes:    []map[string]bool{make(map[string]bool)}, // Start with module scope
 	}
-	// Register built-in C namespace
+	// Register built-in C namespace (both `c` and `C` reach the C library)
 	p.cImports["c"] = true
+	p.cImports["C"] = true
 	p.errors.SetSourceCode(input)
 	p.nextToken()
 	p.nextToken()
@@ -194,8 +195,9 @@ func NewParserWithFilename(input, filename string) *Parser {
 		errors:    NewErrorCollector(10),
 		scopes:    []map[string]bool{make(map[string]bool)}, // Start with module scope
 	}
-	// Register built-in C namespace
+	// Register built-in C namespace (both `c` and `C` reach the C library)
 	p.cImports["c"] = true
+	p.cImports["C"] = true
 	p.errors.SetSourceCode(input)
 	p.nextToken()
 	p.nextToken()
@@ -4197,8 +4199,8 @@ func (p *Parser) parsePostfix() Expression {
 							}
 							p.nextToken() // move to ')'
 						}
-						// Check if this is a C FFI call (c.malloc, c.free, etc.)
-						isCFFI := ident.Name == "c"
+						// Check if this is a C FFI call (c.malloc, C.printf, etc.)
+						isCFFI := ident.Name == "c" || ident.Name == "C"
 						if isCFFI {
 							// For C FFI calls, use just the function name without the "c." prefix
 							expr = &CallExpr{Function: fieldName, Args: args, IsCFFI: true}

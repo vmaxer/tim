@@ -344,6 +344,23 @@ const (
 	CS_ADHOC               = 0x2 // Ad-hoc signed
 )
 
+// machoSigIdentifier is the identifier embedded in the ad-hoc CodeDirectory.
+// For ad-hoc signing any stable string works; dyld validates the page hashes,
+// not the name.
+const machoSigIdentifier = "a.out"
+
+// codeSignatureBlobSize returns the size, padded to 16 bytes, of the embedded
+// signature SuperBlob needed to cover codeLimit bytes of code.
+func codeSignatureBlobSize(identifier string, codeLimit uint64) uint32 {
+	nPages := uint32((codeLimit + CS_PAGE_SIZE - 1) / CS_PAGE_SIZE)
+	sbHeaderSize := uint32(binary.Size(SuperBlob{}))
+	indexSize := uint32(binary.Size(BlobIndex{}))
+	cdHeaderSize := uint32(binary.Size(CodeDirectory{}))
+	identSize := uint32(len(identifier) + 1) // null-terminated
+	size := sbHeaderSize + indexSize + cdHeaderSize + identSize + nPages*32
+	return (size + 15) &^ 15
+}
+
 // generateCodeSignature creates an ad-hoc code signature for a Mach-O binary
 // identifier: the executable name (e.g., "a.out")
 // binaryData: the complete binary data to sign
@@ -745,24 +762,23 @@ func (eb *ExecutableBuilder) WriteMachO() error {
 		importsStrtab.WriteByte(0)
 	}
 
-	// Calculate padding needed to align indirect symbol table to 8 bytes
-	// Padding comes after: symtab + strtab
-	alignmentPadding := uint32(0)
-	if len(indirectSymTab) > 0 {
-		currentOffset := symtabSize + strtabSize
-		alignmentPadding = (8 - (currentOffset % 8)) % 8
-	}
-
+	// The LINKEDIT tables are laid out symtab → indirect → strtab → signature.
+	// Nlist64 entries are 16 bytes so symtabSize is always 8-byte aligned and
+	// the indirect symbol table that follows needs no extra padding. All the
+	// file offsets below assume this tight packing, so no padding is inserted.
 	indirectSymTabSize := uint32(len(indirectSymTab) * 4)
 
 	// Chained fixups removed - using lazy binding instead
 	var chainedFixupsSize uint32
 
-	// Reserve space for code signature (will be filled by codesign tool)
-	// Ad-hoc signatures are typically ~400-1000 bytes, use 4KB to be safe
-	codeSignatureSize := uint32(4096)
+	// Reserve space for the ad-hoc code signature. The signature is the last
+	// thing in the file, so its starting offset does not depend on its own
+	// size and can be computed now. Size it to fit the per-page hashes so it
+	// scales with larger binaries instead of overflowing a fixed 4KB.
+	codeSignatureOffset := linkeditFileOffset + uint64(symtabSize) + uint64(indirectSymTabSize) + uint64(strtabSize)
+	codeSignatureSize := codeSignatureBlobSize(machoSigIdentifier, codeSignatureOffset)
 
-	linkeditSize := symtabSize + strtabSize + alignmentPadding + indirectSymTabSize + chainedFixupsSize + codeSignatureSize
+	linkeditSize := symtabSize + strtabSize + indirectSymTabSize + chainedFixupsSize + codeSignatureSize
 
 	// 1. LC_SEGMENT_64 for __PAGEZERO (required on macOS)
 	{
@@ -1082,9 +1098,8 @@ func (eb *ExecutableBuilder) WriteMachO() error {
 		ncmds++
 	}
 
-	// LC_CODE_SIGNATURE: Reserve space for codesign tool to fill
+	// LC_CODE_SIGNATURE: points at the ad-hoc signature appended to __LINKEDIT
 	{
-		codeSignatureOffset := linkeditFileOffset + uint64(symtabSize) + uint64(indirectSymTabSize) + uint64(strtabSize)
 		codeSignCmd := LinkEditDataCommand{
 			Cmd:      LC_CODE_SIGNATURE,
 			CmdSize:  uint32(binary.Size(LinkEditDataCommand{})),
@@ -1296,10 +1311,28 @@ func (eb *ExecutableBuilder) WriteMachO() error {
 		// Write string table
 		buf.Write(strtab.Bytes())
 
-		// Reserve space for code signature (zeros - ldid will fill it)
+		// Reserve space for the code signature; filled in below.
 		for range codeSignatureSize {
 			buf.WriteByte(0)
 		}
+	}
+
+	// Generate and embed the ad-hoc code signature. macOS (especially Apple
+	// Silicon) refuses to run binaries with a missing or invalid signature, so
+	// this must happen for every Mach-O we emit, not be left to an external
+	// codesign/ldid step. The signature covers everything before it.
+	{
+		image := buf.Bytes()
+		textSegFileSize := stubsFileOffset + stubsSize
+		execSegLimit := (textSegFileSize + pageSize - 1) &^ (pageSize - 1)
+		sig, err := generateCodeSignature(machoSigIdentifier, image[:codeSignatureOffset], 0, execSegLimit)
+		if err != nil {
+			return fmt.Errorf("failed to generate code signature: %w", err)
+		}
+		if uint32(len(sig)) > codeSignatureSize {
+			return fmt.Errorf("code signature (%d bytes) exceeds reserved space (%d bytes)", len(sig), codeSignatureSize)
+		}
+		copy(image[codeSignatureOffset:], sig)
 	}
 
 	eb.elf = buf

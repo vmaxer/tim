@@ -817,14 +817,21 @@ func (eb *ExecutableBuilder) patchARM64PLTCalls(textBytes []byte, ds *DynamicSec
 
 		// Get PLT offset for this function
 		pltOffset := ds.GetPLTOffset(funcName)
+		var targetAddr uint64
 		if pltOffset < 0 {
-			if VerboseMode {
-				fmt.Fprintf(os.Stderr, "Warning: No PLT entry for %s\n", funcName)
+			// Not an imported function; resolve to an internal label if known
+			// (e.g. a call to a module-level Tim function).
+			if labelOffset, ok := eb.labels[funcName]; ok {
+				targetAddr = textAddr + uint64(labelOffset)
+			} else {
+				if VerboseMode {
+					fmt.Fprintf(os.Stderr, "Warning: No PLT entry or label for %s\n", funcName)
+				}
+				continue
 			}
-			continue
+		} else {
+			targetAddr = pltBase + uint64(pltOffset)
 		}
-
-		targetAddr := pltBase + uint64(pltOffset)
 		currentAddr := textAddr + uint64(callPos)
 		offset := int64(targetAddr - currentAddr)
 

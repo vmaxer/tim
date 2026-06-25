@@ -928,6 +928,169 @@ func (a *ARM64Out) FcvtzsDoubleToInt64(dest, src string) error {
 	return nil
 }
 
+// FCVTNS (scalar, float to integer, round to nearest ties-to-even):
+// FCVTNS Xd, Dn.
+func (a *ARM64Out) FcvtnsDoubleToInt64(dest, src string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 GP register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 FP register: %s", src)
+	}
+	a.encodeInstr(uint32(0x9e600000) | (rn << 5) | rd)
+	return nil
+}
+
+// CLZ (count leading zeros): CLZ Xd, Xn.
+func (a *ARM64Out) Clz64(dest, src string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", src)
+	}
+	a.encodeInstr(uint32(0xdac01000) | (rn << 5) | rd)
+	return nil
+}
+
+// RBIT (reverse bits): RBIT Xd, Xn. Combined with CLZ this yields count-trailing-zeros.
+func (a *ARM64Out) Rbit64(dest, src string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", src)
+	}
+	a.encodeInstr(uint32(0xdac00000) | (rn << 5) | rd)
+	return nil
+}
+
+// MSUB (multiply-subtract): MSUB Xd, Xn, Xm, Xa  ->  Xd = Xa - Xn*Xm.
+func (a *ARM64Out) Msub64(dest, mul1, mul2, minuend string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[mul1]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", mul1)
+	}
+	rm, ok := arm64GPRegs[mul2]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", mul2)
+	}
+	ra, ok := arm64GPRegs[minuend]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", minuend)
+	}
+	a.encodeInstr(uint32(0x9b008000) | (rm << 16) | (ra << 10) | (rn << 5) | rd)
+	return nil
+}
+
+// AddReg64 (register add): ADD Xd, Xn, Xm.
+func (a *ARM64Out) AddReg64(dest, op1, op2 string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[op1]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", op1)
+	}
+	rm, ok := arm64GPRegs[op2]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", op2)
+	}
+	a.encodeInstr(uint32(0x8b000000) | (rm << 16) | (rn << 5) | rd)
+	return nil
+}
+
+// LslImm64 (logical shift left by immediate): LSL Xd, Xn, #shift (alias of UBFM).
+func (a *ARM64Out) LslImm64(dest, src string, shift uint32) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", src)
+	}
+	if shift > 63 {
+		return fmt.Errorf("LSL shift out of range: %d", shift)
+	}
+	immr := (64 - shift) & 63
+	imms := uint32(63) - shift
+	a.encodeInstr(uint32(0xd3400000) | (immr << 16) | (imms << 10) | (rn << 5) | rd)
+	return nil
+}
+
+// LdrbRegOffset (load byte, register offset): LDRB Wt, [Xn, Xm].
+func (a *ARM64Out) LdrbRegOffset(dest, base, index string) error {
+	rt, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[base]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", base)
+	}
+	rm, ok := arm64GPRegs[index]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", index)
+	}
+	a.encodeInstr(uint32(0x38606800) | (rm << 16) | (rn << 5) | rt)
+	return nil
+}
+
+// CntVec8b (population count per byte): CNT Vd.8B, Vn.8B (uses d-register names).
+func (a *ARM64Out) CntVec8b(dest, src string) error {
+	rd, ok := arm64FPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", src)
+	}
+	a.encodeInstr(uint32(0x0e205800) | (rn << 5) | rd)
+	return nil
+}
+
+// AddvBytes8b (sum across vector): ADDV Bd, Vn.8B (uses d-register names).
+func (a *ARM64Out) AddvBytes8b(dest, src string) error {
+	rd, ok := arm64FPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", src)
+	}
+	a.encodeInstr(uint32(0x0e31b800) | (rn << 5) | rd)
+	return nil
+}
+
+// FmovSingleToGP (move 32-bit lane of an FP register to a GP register):
+// FMOV Wd, Sn.
+func (a *ARM64Out) FmovSingleToGP(dest, src string) error {
+	rd, ok := arm64GPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 GP register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 FP register: %s", src)
+	}
+	a.encodeInstr(uint32(0x1e260000) | (rn << 5) | rd)
+	return nil
+}
+
 // FMOV (register, FP to GP): FMOV Xd, Dn (move double to GP register)
 func (a *ARM64Out) FmovDoubleToGP(dest, src string) error {
 	rd, ok := arm64GPRegs[dest]
