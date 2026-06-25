@@ -4707,6 +4707,141 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 	}
 }
 
+// listHelperPrologue emits the standard frame used by the list builtins:
+// saves x29/x30 and callee-saved x19-x22 in a 64-byte frame and sets x29=sp.
+func (acg *ARM64CodeGen) listHelperPrologue() {
+	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xbc, 0xa9}) // stp x29, x30, [sp, #-64]!
+	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x01, 0xa9}) // stp x19, x20, [sp, #16]
+	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x02, 0xa9}) // stp x21, x22, [sp, #32]
+	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x03, 0x00, 0x91}) // mov x29, sp
+}
+
+// listHelperEpilogue restores the frame saved by listHelperPrologue and returns.
+func (acg *ARM64CodeGen) listHelperEpilogue() {
+	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x42, 0xa9}) // ldp x21, x22, [sp, #32]
+	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x41, 0xa9}) // ldp x19, x20, [sp, #16]
+	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc4, 0xa8}) // ldp x29, x30, [sp], #64
+	acg.out.Return("x30")
+}
+
+// emitMallocAligned allocates count*8 + 8 bytes (a list of `count` elements
+// plus the length field), 16-byte aligned, with `count` already in x21.
+// Result pointer is left in x0.
+func (acg *ARM64CodeGen) emitListAlloc(countReg string) error {
+	if err := acg.out.LslImm64("x0", countReg, 3); err != nil { // count*8
+		return err
+	}
+	if err := acg.out.AddImm64("x0", "x0", 8); err != nil { // + length field
+		return err
+	}
+	if err := acg.out.AddImm64("x0", "x0", 15); err != nil { // round up to 16
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x3c, 0x00, 0x92}) // and x0, x0, #~15
+	return acg.eb.GenerateCallInstruction("malloc")
+}
+
+// emitListCopyLoop copies `countReg` float64 elements from src to dst (both
+// register names holding addresses), advancing past them. Uses x10 as counter.
+func (acg *ARM64CodeGen) emitListCopyLoop(countReg, src, dst string) error {
+	if err := acg.out.MovReg64("x10", countReg); err != nil {
+		return err
+	}
+	loopStart := acg.eb.text.Len()
+	if err := acg.out.CmpImm64("x10", 0); err != nil {
+		return err
+	}
+	doneJump := acg.eb.text.Len()
+	acg.out.BranchCond("eq", 0)
+	if err := acg.out.LdrImm64Double("d0", src, 0); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", dst, 0); err != nil {
+		return err
+	}
+	acg.out.AddImm64(src, src, 8)
+	acg.out.AddImm64(dst, dst, 8)
+	acg.out.SubImm64("x10", "x10", 1)
+	backPos := acg.eb.text.Len()
+	acg.out.Branch(0)
+	acg.patchJumpOffset(backPos, int32(loopStart-backPos))
+	donePos := acg.eb.text.Len()
+	acg.patchJumpOffset(doneJump, int32(donePos-doneJump))
+	return nil
+}
+
+// generateListBuiltinHelpers emits _tim_tail and _tim_append.
+func (acg *ARM64CodeGen) generateListBuiltinHelpers() error {
+	// _tim_tail(x0=list_ptr) -> x0=new_ptr : a copy of the list without elem 0.
+	acg.eb.MarkLabel("_tim_tail")
+	acg.listHelperPrologue()
+	acg.out.MovReg64("x19", "x0") // list ptr
+	if err := acg.out.LdrImm64Double("d0", "x19", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x20", "d0"); err != nil { // count
+		return err
+	}
+	acg.out.SubImm64("x21", "x20", 1) // new count = count - 1
+	if err := acg.emitListAlloc("x21"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x22", "x0") // new ptr
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x21"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x22", 0); err != nil { // store new length
+		return err
+	}
+	acg.out.AddImm64("x11", "x19", 16) // src = &elem1
+	acg.out.AddImm64("x12", "x22", 8)  // dst = &new elem0
+	if err := acg.emitListCopyLoop("x21", "x11", "x12"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x0", "x22")
+	acg.listHelperEpilogue()
+
+	// _tim_append(x0=list_ptr, d0=value) -> x0=new_ptr : list with value appended.
+	acg.eb.MarkLabel("_tim_append")
+	acg.listHelperPrologue()
+	if err := acg.out.StrImm64Double("d0", "sp", 48); err != nil { // stash value (survives malloc)
+		return err
+	}
+	acg.out.MovReg64("x19", "x0")
+	if err := acg.out.LdrImm64Double("d0", "x19", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x20", "d0"); err != nil { // count
+		return err
+	}
+	acg.out.AddImm64("x21", "x20", 1) // new count = count + 1
+	if err := acg.emitListAlloc("x21"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x22", "x0")
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x21"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x22", 0); err != nil { // store new length
+		return err
+	}
+	acg.out.AddImm64("x11", "x19", 8) // src = &elem0
+	acg.out.AddImm64("x12", "x22", 8) // dst = &new elem0
+	if err := acg.emitListCopyLoop("x20", "x11", "x12"); err != nil {
+		return err
+	}
+	// x12 now points at the appended slot; store the stashed value.
+	if err := acg.out.LdrImm64Double("d0", "sp", 48); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x12", 0); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x0", "x22")
+	acg.listHelperEpilogue()
+	return nil
+}
+
 // generateRuntimeHelpers generates ARM64 runtime helper functions
 func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	// Generate _tim_list_concat(left_ptr, right_ptr) -> new_ptr
@@ -4844,6 +4979,10 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x41, 0xa9}) // ldp x19, x20, [sp, #16]
 	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc4, 0xa8}) // ldp x29, x30, [sp], #64
 	acg.out.Return("x30")
+
+	if err := acg.generateListBuiltinHelpers(); err != nil {
+		return err
+	}
 
 	// Generate _tim_string_concat(left_ptr, right_ptr) -> new_ptr
 	// Arguments: x0 = left_ptr, x1 = right_ptr
