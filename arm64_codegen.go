@@ -36,6 +36,7 @@ type ARM64CodeGen struct {
 	globalMutable     map[string]bool              // module-global var name -> is mutable
 	cstructs          map[string]*CStructDecl      // cstruct name -> declaration (field layout)
 	varCStructType    map[string]string            // variable name -> cstruct type it points at
+	closurePtrOffset  int32                        // frame offset where the current lambda's closure pointer (x9) is saved
 }
 
 // ARM64LambdaFunc represents a lambda function for ARM64
@@ -43,10 +44,11 @@ type ARM64LambdaFunc struct {
 	Name        string
 	Params      []string
 	Body        Expression
-	BodyStart   int    // Position where lambda body code starts (for tail recursion)
-	FuncStart   int    // Position where function starts (including prologue, for recursion)
-	VarName     string // Variable name this lambda is assigned to (for recursion)
-	IsRecursive bool   // Whether this lambda calls itself recursively
+	BodyStart   int      // Position where lambda body code starts (for tail recursion)
+	FuncStart   int      // Position where function starts (including prologue, for recursion)
+	VarName     string   // Variable name this lambda is assigned to (for recursion)
+	IsRecursive bool     // Whether this lambda calls itself recursively
+	Captures    []string // Names captured by value from the enclosing scope (closure env order)
 }
 
 // ARM64LoopInfo tracks information about an active loop
@@ -85,6 +87,42 @@ func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConsta
 	}
 }
 
+// isCaptureName reports whether name is captured by the lambda currently being
+// compiled (used to resolve multi-level captures).
+func (acg *ARM64CodeGen) isCaptureName(name string) bool {
+	if acg.currentLambda == nil {
+		return false
+	}
+	return slices.Contains(acg.currentLambda.Captures, name)
+}
+
+// computeCaptures returns the enclosing-scope variables a lambda body references
+// that must be captured by value into its closure env: free variables (excluding
+// the lambda's own params) that are neither mutable module globals (shared via
+// x28) nor the lambda's self-reference, and that are resolvable in the current
+// scope (a stack variable, or itself a capture one level up). Sorted for
+// deterministic env layout.
+func (acg *ARM64CodeGen) computeCaptures(body Expression, params []string) []string {
+	free := make(map[string]bool)
+	collectCapturedVariables(body, params, free)
+	var caps []string
+	for name := range free {
+		if _, isGlobal := acg.globalSlots[name]; isGlobal {
+			continue
+		}
+		if name == acg.currentAssignName {
+			continue
+		}
+		if _, inScope := acg.stackVars[name]; inScope {
+			caps = append(caps, name)
+		} else if acg.isCaptureName(name) {
+			caps = append(caps, name)
+		}
+	}
+	slices.Sort(caps)
+	return caps
+}
+
 // collectGlobals identifies module-level variables that are captured by a lambda
 // and promotes them to globals stored in a heap array addressed via x28. This is
 // how closures over module state (the common case: top-level `state`, counters,
@@ -121,7 +159,11 @@ func (acg *ARM64CodeGen) collectGlobals(program *Program) {
 		}
 	}
 
-	// A module var that some lambda captures becomes a global slot.
+	// A module var that some lambda captures becomes a shared global slot
+	// (captured by reference). Module-level lambdas may be compiled before the
+	// vars they reference (statement ordering), so these can't be snapshotted by
+	// value at definition the way an enclosing lambda's parameters are — the
+	// global slot gives them a stable home reachable from any lambda body.
 	for _, stmt := range moduleStmts {
 		as, ok := stmt.(*AssignStmt)
 		if !ok || as.IsUpdate {
@@ -1039,6 +1081,15 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		// Load variable from stack into d0
 		stackOffset, exists := acg.stackVars[e.Name]
 		if !exists {
+			// Captured variable: read from the closure env at [closurePtr+8+idx*8].
+			if acg.currentLambda != nil {
+				if idx := slices.Index(acg.currentLambda.Captures, e.Name); idx >= 0 {
+					if err := acg.out.LdrImm64("x9", "x29", acg.closurePtrOffset); err != nil {
+						return err
+					}
+					return acg.out.LdrImm64Double("d0", "x9", int32(8+idx*8))
+				}
+			}
 			if VerboseMode {
 				fmt.Fprintf(os.Stderr, "Error: undefined variable '%s'\n", e.Name)
 			}
@@ -1780,28 +1831,59 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		acg.lambdaCounter++
 		funcName := fmt.Sprintf("lambda_%d", acg.lambdaCounter)
 
-		// Store lambda for later code generation
+		// A lambda value is a heap closure object [func_ptr, cap0, cap1, ...].
+		// Captures are the enclosing-scope variables the body references, taken
+		// by value at creation time. (Mutable module state is shared via x28 and
+		// is NOT captured here.)
+		caps := acg.computeCaptures(e.Body, e.Params)
+
 		acg.lambdaFuncs = append(acg.lambdaFuncs, ARM64LambdaFunc{
-			Name:    funcName,
-			Params:  e.Params,
-			Body:    e.Body,
-			VarName: acg.currentAssignName, // Store variable name for self-recursion
+			Name:     funcName,
+			Params:   e.Params,
+			Body:     e.Body,
+			VarName:  acg.currentAssignName, // Store variable name for self-recursion
+			Captures: caps,
 		})
 
-		// Return function pointer as float64 in d0
-		// Load function address into x0
-		offset := uint64(acg.eb.text.Len())
-		acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{
-			offset:     offset,
-			symbolName: funcName,
-		})
-		// ADRP x0, funcName@PAGE
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x90})
-		// ADD x0, x0, funcName@PAGEOFF
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x91})
+		// Allocate the closure object: 8 (func ptr) + 8*len(caps).
+		if err := acg.out.MovImm64("x0", uint64(8+len(caps)*8)); err != nil {
+			return err
+		}
+		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+			return err
+		}
+		acg.out.MovReg64("x10", "x0") // x10 = closure object pointer
 
-		// Convert pointer to float64: scvtf d0, x0
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+		// Store the function address at [obj]. ADRP/ADD target x0 (the relocation
+		// patcher expects Rd=0), then store into the object held in x10.
+		off := uint64(acg.eb.text.Len())
+		acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{offset: off, symbolName: funcName})
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x90}) // ADRP x0, funcName@PAGE
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x91}) // ADD x0, x0, funcName@PAGEOFF
+		acg.out.out.writer.WriteBytes([]byte{0x40, 0x01, 0x00, 0xf9}) // str x0, [x10]
+
+		// Stash the object pointer and store each captured value at [obj+8+i*8].
+		acg.out.SubImm64("sp", "sp", 16)
+		if err := acg.out.StrImm64("x10", "sp", 0); err != nil {
+			return err
+		}
+		for i, name := range caps {
+			if err := acg.compileExpression(&IdentExpr{Name: name}); err != nil {
+				return err
+			}
+			if err := acg.out.LdrImm64("x9", "sp", 0); err != nil {
+				return err
+			}
+			if err := acg.out.StrImm64Double("d0", "x9", int32(8+i*8)); err != nil {
+				return err
+			}
+		}
+		if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+			return err
+		}
+		acg.out.AddImm64("sp", "sp", 16)
+		// Closure pointer -> numeric double convention in d0.
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
 
 	case *UnaryExpr:
 		// Compile the operand first (result in d0)
@@ -2756,9 +2838,10 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 		if err := acg.eb.GenerateCallInstruction("_tim_str"); err != nil {
 			return err
 		}
-		// Result pointer in x0, convert to d0
-		// fmov d0, x0
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x67, 0x9e})
+		// Result is a string pointer in x0. Strings use the numeric pointer
+		// convention (scvtf to store, fcvtzs to recover) — matching string
+		// literals and _tim_string_concat — so convert with scvtf, not fmov.
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
 		return nil
 	case "eprint", "eprintln", "eprintf":
 		return acg.compileEprint(call)
@@ -2796,6 +2879,8 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 		return acg.compilePop(call)
 	case "is_nan":
 		return acg.compileIsNan(call)
+	case "error":
+		return acg.compileError(call)
 	case "_error_code_extract":
 		return acg.compileErrorCodeExtract(call)
 	case "string_concat":
@@ -3875,17 +3960,17 @@ func (acg *ARM64CodeGen) compileDirectCall(call *DirectCallExpr) error {
 		}
 	}
 
-	// Compile the callee expression (e.g., a lambda) to get function pointer
-	// Result in d0 (function pointer as float64)
+	// Compile the callee expression to get the closure object pointer.
+	// Result in d0 (closure pointer as float64).
 	if err := acg.compileExpression(call.Callee); err != nil {
 		return err
 	}
 
-	// Convert function pointer from float64 to integer in x0
+	// Convert closure pointer from float64 to integer in x0
 	// fcvtzs x0, d0
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
 
-	// Save function pointer to stack (x0 might get clobbered during arg evaluation)
+	// Save closure pointer to stack (x0 might get clobbered during arg evaluation)
 	acg.out.SubImm64("sp", "sp", 16)
 	if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
 		return err
@@ -3919,15 +4004,19 @@ func (acg *ARM64CodeGen) compileDirectCall(call *DirectCallExpr) error {
 		})
 		acg.out.AddImm64("sp", "sp", 16)
 	}
-	// Load function pointer from stack to x16 (temporary register)
-	if err := acg.out.LdrImm64("x16", "sp", 0); err != nil {
+	// Load closure pointer from stack into x9 (passed to the callee so it can
+	// read its captures), then load the function pointer from [closure].
+	if err := acg.out.LdrImm64("x9", "sp", 0); err != nil {
 		return err
 	}
 	if err := acg.out.AddImm64("sp", "sp", 16); err != nil {
 		return err
 	}
+	if err := acg.out.LdrImm64("x16", "x9", 0); err != nil { // x16 = [closure] = func ptr
+		return err
+	}
 
-	// Call the function pointer in x16: blr x16
+	// Call the function pointer in x16: blr x16 (x9 holds the closure pointer)
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x02, 0x3f, 0xd6})
 
 	// Result is in d0
@@ -5152,6 +5241,14 @@ func (acg *ARM64CodeGen) generateLambdaFunctions() error {
 		acg.stackSize = 0
 		acg.currentLambda = &lambda
 
+		// Reserve the first frame slot for the closure pointer (passed in x9 by
+		// the caller) so the body can read its captured values from [x9+8+i*8].
+		acg.stackSize += 8
+		acg.closurePtrOffset = int32(16 + acg.stackSize - 8)
+		if err := acg.out.StrImm64("x9", "x29", acg.closurePtrOffset); err != nil {
+			return err
+		}
+
 		// Add the lambda's own variable name to scope for self-recursion
 		// Mark it with a special offset so we know it's a function pointer
 		if lambda.VarName != "" {
@@ -5432,6 +5529,48 @@ func (acg *ARM64CodeGen) compilePop(call *CallExpr) error {
 		return err
 	}
 	return acg.out.ScvtfInt64ToDouble("d0", "x0")
+}
+
+// compileError compiles error("abc"): builds an error-NaN whose mantissa packs
+// the first three characters of the code string (matching the .error extractor
+// and the x86 backend). The string's char i lives at ptr+16+i*16.
+func (acg *ARM64CodeGen) compileError(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("error() requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil { // x0 = string ptr
+		return err
+	}
+	// x1 accumulates the packed code; chars go to bits 31:24, 23:16, 15:8.
+	for i, shift := range []uint32{24, 16, 8} {
+		if err := acg.out.LdrImm64Double("d1", "x0", int32(16+i*16)); err != nil {
+			return err
+		}
+		if err := acg.out.FcvtzsDoubleToInt64("x2", "d1"); err != nil {
+			return err
+		}
+		if err := acg.out.LslImm64("x2", "x2", shift); err != nil {
+			return err
+		}
+		if i == 0 {
+			if err := acg.out.MovReg64("x1", "x2"); err != nil {
+				return err
+			}
+		} else if err := acg.out.OrrReg64("x1", "x1", "x2"); err != nil {
+			return err
+		}
+	}
+	// OR in the quiet-NaN base and reinterpret the bits as the error value.
+	if err := acg.out.MovImm64("x0", 0x7FF8000000000000); err != nil {
+		return err
+	}
+	if err := acg.out.OrrReg64("x0", "x0", "x1"); err != nil {
+		return err
+	}
+	return acg.out.FmovGPToDouble("d0", "x0")
 }
 
 // compileIsNan compiles is_nan(x): 1.0 if x is NaN, else 0.0. fcmp of a value

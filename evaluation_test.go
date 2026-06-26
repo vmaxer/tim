@@ -42,26 +42,23 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "reproduce_global_capture_bug",
+			// A nested lambda captures both an enclosing parameter (x) and an
+			// immutable module value (state). `=` is immutable (GRAMMAR.md), so
+			// state cannot be reassigned; the closure is stable across calls.
 			code: `
 				state = 10
 				outer = (x) -> {
-					// This should capture 'state' by reference or use global address
 					inner = (y) -> state + x + y
 					inner
 				}
-			
+
 				f = outer(5)
-				// 10 + 5 + 3 = 18
+				// 10 + 5 + 3 = 18 on each call
 				res1 = f(3)
-				
-				state = 20  // Use regular assignment instead of mutable <-
-				// Note: This will create a new binding, not update captured variable
-				// So result will still be 18, not 28
 				res2 = f(3)
-				
+
 				println(f"{res1} {res2}")
 			`,
-			// Without mutable variables, both should be 18 (capturing original value)
 			expectedOutput: "18 18\n",
 			expectCompile:  true,
 		},
