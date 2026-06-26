@@ -623,17 +623,20 @@ func (eb *ExecutableBuilder) WriteMachO() error {
 	textSegContentEnd := stubsFileOffset + stubsSize
 	rodataFileOffset := (textSegContentEnd + pageSize - 1) &^ (pageSize - 1)
 
-	// Calculate padding needed to align GOT to 8 bytes
+	// Calculate padding needed to align GOT to 8 bytes. The GOT follows the full
+	// __data content (rodata + writable data), not just the rodata — otherwise the
+	// GOT's declared address overlaps the writable data region (e.g. _itoa_buffer),
+	// and writing that buffer would zero the bound import pointers.
 	gotPadding := uint64(0)
 	if eb.useDynamicLinking && numImports > 0 {
-		afterRodata := rodataFileOffset + rodataSize
-		gotPadding = (8 - (afterRodata % 8)) % 8
+		afterData := rodataFileOffset + combinedDataSize
+		gotPadding = (8 - (afterData % 8)) % 8
 	}
 
-	gotFileOffset := rodataFileOffset + rodataSize + gotPadding
+	gotFileOffset := rodataFileOffset + combinedDataSize + gotPadding
 
 	// Calculate LINKEDIT segment offset and size (after all data sections including GOT)
-	dataEndOffset := rodataFileOffset + rodataSize + gotPadding
+	dataEndOffset := rodataFileOffset + combinedDataSize + gotPadding
 	if eb.useDynamicLinking && numImports > 0 {
 		dataEndOffset += gotSize
 	}
@@ -810,7 +813,7 @@ func (eb *ExecutableBuilder) WriteMachO() error {
 		// Now we can calculate __DATA segment addresses (comes after __TEXT segment)
 		rodataAddr = textAddr + textSegVMSize
 		rodataSectAddr = rodataAddr
-		gotAddr = rodataAddr + rodataSize + gotPadding
+		gotAddr = rodataAddr + combinedDataSize + gotPadding
 
 		seg := SegmentCommand64{
 			Cmd:      LC_SEGMENT_64,

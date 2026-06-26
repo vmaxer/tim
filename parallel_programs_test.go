@@ -46,8 +46,7 @@ func TestParallelPrograms(t *testing.T) {
 				t.Fatalf("Compilation failed: %v", err)
 			}
 
-			cmd := exec.Command("timeout", "10s", exePath)
-			_, err := cmd.CombinedOutput()
+			_, err := runWithTimeout(exePath, 10)
 			if err != nil {
 				if _, ok := err.(*exec.ExitError); !ok {
 					t.Fatalf("Execution failed: %v", err)
@@ -86,8 +85,7 @@ func TestExistingParallelPrograms(t *testing.T) {
 				t.Fatalf("Compilation failed: %v", err)
 			}
 
-			cmd := exec.Command("timeout", "10s", exePath)
-			_, err := cmd.CombinedOutput()
+			_, err := runWithTimeout(exePath, 10)
 			if err != nil {
 				if _, ok := err.(*exec.ExitError); !ok {
 					t.Fatalf("Execution failed: %v", err)

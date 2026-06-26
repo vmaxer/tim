@@ -94,8 +94,7 @@ func TestExistingListPrograms(t *testing.T) {
 				t.Fatalf("Compilation failed: %v", err)
 			}
 
-			cmd := exec.Command("timeout", "5s", exePath)
-			output, err := cmd.CombinedOutput()
+			output, err := runWithTimeout(exePath, 5)
 			if err != nil {
 				if _, ok := err.(*exec.ExitError); !ok {
 					t.Fatalf("Execution failed: %v", err)

@@ -159,8 +159,7 @@ func TestExistingBasicPrograms(t *testing.T) {
 			}
 
 			// Run with timeout
-			cmd := exec.Command("timeout", "5s", exePath)
-			output, err := cmd.CombinedOutput()
+			output, err := runWithTimeout(exePath, 5)
 			if err != nil {
 				if exitErr, ok := err.(*exec.ExitError); ok {
 					_ = exitErr // Non-zero exit OK

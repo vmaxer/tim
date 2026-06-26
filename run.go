@@ -2,12 +2,14 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 // containsMainFunction checks if code contains a Main function definition
@@ -41,6 +43,15 @@ func needsMainWrapper(code string) bool {
 		}
 	}
 	return true
+}
+
+// runWithTimeout runs exePath with the given timeout and returns its combined
+// output. It replaces reliance on the external `timeout(1)` binary, which is
+// not present on macOS (it ships as `gtimeout` from coreutils, if at all).
+func runWithTimeout(exePath string, seconds int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, exePath).CombinedOutput()
 }
 
 // compileAndRun is a helper function that compiles and runs Tim code,

@@ -32,6 +32,10 @@ type ARM64CodeGen struct {
 	usesArenas        bool                         // Track if program uses any arena blocks
 	currentAssignName string                       // Name of variable being assigned (for lambda self-reference)
 	deferredExprs     [][]Expression               // Stack of deferred expressions per scope (LIFO order)
+	globalSlots       map[string]int               // module-global var name -> slot index in the x28 globals array
+	globalMutable     map[string]bool              // module-global var name -> is mutable
+	cstructs          map[string]*CStructDecl      // cstruct name -> declaration (field layout)
+	varCStructType    map[string]string            // variable name -> cstruct type it points at
 }
 
 // ARM64LambdaFunc represents a lambda function for ARM64
@@ -63,17 +67,72 @@ type ARM64LoopInfo struct {
 func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConstants) *ARM64CodeGen {
 	// Use the target from ExecutableBuilder (which has the correct OS)
 	return &ARM64CodeGen{
-		out:           &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
-		eb:            eb,
-		stackVars:     make(map[string]int),
-		mutableVars:   make(map[string]bool),
-		lambdaVars:    make(map[string]bool),
-		varTypes:      make(map[string]string),
-		stackSize:     0,
-		stringCounter: 0,
-		stringInterns: make(map[string]string),
-		labelCounter:  0,
-		cConstants:    cConstants,
+		out:            &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
+		eb:             eb,
+		stackVars:      make(map[string]int),
+		mutableVars:    make(map[string]bool),
+		lambdaVars:     make(map[string]bool),
+		varTypes:       make(map[string]string),
+		stackSize:      0,
+		stringCounter:  0,
+		stringInterns:  make(map[string]string),
+		labelCounter:   0,
+		cConstants:     cConstants,
+		globalSlots:    make(map[string]int),
+		globalMutable:  make(map[string]bool),
+		cstructs:       make(map[string]*CStructDecl),
+		varCStructType: make(map[string]string),
+	}
+}
+
+// collectGlobals identifies module-level variables that are captured by a lambda
+// and promotes them to globals stored in a heap array addressed via x28. This is
+// how closures over module state (the common case: top-level `state`, counters,
+// configuration) work on ARM64 — a captured global is a single shared slot that
+// both the module body and any lambda read/write by reference. Per-invocation
+// capture of an enclosing lambda's parameters (e.g. make_adder) is not handled
+// here and remains a known limitation.
+func (acg *ARM64CodeGen) collectGlobals(program *Program) {
+	// The module body is the program's top-level statements; if the program is
+	// auto-wrapped as `main = { ... }`, the block's statements are module-level
+	// too. Collect both so captured module vars are found in either shape.
+	var moduleStmts []Statement
+	moduleStmts = append(moduleStmts, program.Statements...)
+	for _, stmt := range program.Statements {
+		if as, ok := stmt.(*AssignStmt); ok && as.Name == "main" {
+			if lam, ok := as.Value.(*LambdaExpr); ok {
+				if blk, ok := lam.Body.(*BlockExpr); ok {
+					moduleStmts = append(moduleStmts, blk.Statements...)
+				}
+			}
+		}
+	}
+
+	// Names that any lambda defined at module level captures from the enclosing
+	// scope.
+	captured := make(map[string]bool)
+	for _, stmt := range moduleStmts {
+		as, ok := stmt.(*AssignStmt)
+		if !ok || as.IsUpdate {
+			continue
+		}
+		if lam, ok := as.Value.(*LambdaExpr); ok {
+			collectCapturedVariables(lam.Body, lam.Params, captured)
+		}
+	}
+
+	// A module var that some lambda captures becomes a global slot.
+	for _, stmt := range moduleStmts {
+		as, ok := stmt.(*AssignStmt)
+		if !ok || as.IsUpdate {
+			continue
+		}
+		if captured[as.Name] {
+			if _, seen := acg.globalSlots[as.Name]; !seen {
+				acg.globalSlots[as.Name] = len(acg.globalSlots)
+				acg.globalMutable[as.Name] = as.Mutable
+			}
+		}
 	}
 }
 
@@ -102,6 +161,22 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 	// Set frame pointer
 	if err := acg.out.AddImm64("x29", "sp", 0); err != nil {
 		return err
+	}
+
+	// Identify module-level globals captured by lambdas and, if any, allocate a
+	// heap array for them whose base lives in x28 (callee-saved, so it survives
+	// every call and is visible from lambda bodies). See collectGlobals.
+	acg.collectGlobals(program)
+	if len(acg.globalSlots) > 0 {
+		if err := acg.out.MovImm64("x0", uint64(len(acg.globalSlots)*8)); err != nil {
+			return err
+		}
+		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+			return err
+		}
+		if err := acg.out.MovReg64("x28", "x0"); err != nil {
+			return err
+		}
 	}
 
 	// Compile each statement
@@ -250,8 +325,10 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 	case *LoopStmt:
 		return acg.compileLoopStatement(s)
 	case *CStructDecl:
-		// Cstruct declarations generate no runtime code
-		// Constants are already available via Name_SIZEOF and Name_field_OFFSET
+		// Cstruct declarations generate no runtime code, but we record the field
+		// layout so field access (p.x) and indexed field writes (p[i] <- v) can
+		// emit typed loads/stores at the right offsets.
+		acg.cstructs[s.Name] = s
 		return nil
 	case *CImportStmt:
 		// C imports are handled at compile-time to populate cConstants
@@ -290,6 +367,8 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 		return acg.compileMapUpdate(s)
 	case *IfStmt:
 		return acg.compileIfStatement(s)
+	case *MultipleAssignStmt:
+		return acg.compileMultipleAssign(s)
 	default:
 		return fmt.Errorf("unsupported statement type for ARM64: %T", stmt)
 	}
@@ -381,6 +460,40 @@ func (acg *ARM64CodeGen) compileIfStatement(stmt *IfStmt) error {
 // Lists/maps are laid out as [count(8)][elem0(8)][elem1(8)]..., so element i
 // lives at base + 8 + i*8 (matching the IndexExpr read path).
 func (acg *ARM64CodeGen) compileMapUpdate(stmt *MapUpdateStmt) error {
+	// C-struct indexed field write: p[i] <- v writes field i (by declaration
+	// order) as raw typed memory. The index must be a constant.
+	if decl := acg.cstructForExpr(&IdentExpr{Name: stmt.MapName}); decl != nil {
+		idxExpr := stmt.Index
+		if cast, ok := idxExpr.(*CastExpr); ok {
+			idxExpr = cast.Expr
+		}
+		num, ok := idxExpr.(*NumberExpr)
+		if !ok {
+			return fmt.Errorf("cstruct field write requires a constant index")
+		}
+		fi := int(num.Value)
+		if fi < 0 || fi >= len(decl.Fields) {
+			return fmt.Errorf("cstruct %s has no field index %d", decl.Name, fi)
+		}
+		// Evaluate value -> d0, spill; load pointer -> x9; store.
+		if err := acg.compileExpression(stmt.Value); err != nil {
+			return err
+		}
+		acg.out.SubImm64("sp", "sp", 16)
+		if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil {
+			return err
+		}
+		if err := acg.compileExpression(&IdentExpr{Name: stmt.MapName}); err != nil {
+			return err
+		}
+		acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x78, 0x9e}) // fcvtzs x9, d0 (numeric ptr)
+		if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
+			return err
+		}
+		acg.out.AddImm64("sp", "sp", 16)
+		return acg.emitCStructFieldStore(&decl.Fields[fi])
+	}
+
 	// Evaluate the new value into d0 and stash it.
 	if err := acg.compileExpression(stmt.Value); err != nil {
 		return err
@@ -406,9 +519,31 @@ func (acg *ARM64CodeGen) compileMapUpdate(stmt *MapUpdateStmt) error {
 	}
 	acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x78, 0x9e}) // fcvtzs x1, d0
 
-	// Restore container pointer and compute element address: x0 + 8 + index*8.
+	// Restore container pointer (x0); value is now at [sp,0].
 	acg.out.LdrImm64("x0", "sp", 0)
 	acg.out.AddImm64("sp", "sp", 16)
+
+	// Maps/strings (key,value pairs) update by key; lists update by flat index.
+	updType := acg.getExprType(&IdentExpr{Name: stmt.MapName})
+	if updType == "map" || updType == "string" {
+		// x7 = address of the value slot for key x1 (0 if the key is absent).
+		if err := acg.emitMapValueSlotAddr(); err != nil {
+			return err
+		}
+		if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
+			return err
+		}
+		acg.out.AddImm64("sp", "sp", 16)
+		// Skip the store when the key was not found.
+		skipPos := acg.eb.text.Len()
+		acg.out.out.writer.WriteBytes([]byte{0x07, 0x00, 0x00, 0xb4}) // cbz x7, +0
+		acg.out.out.writer.WriteBytes([]byte{0xe0, 0x00, 0x00, 0xfd}) // str d0, [x7]
+		skipLabel := acg.eb.text.Len()
+		acg.patchJumpOffset(skipPos, int32(skipLabel-skipPos))
+		return nil
+	}
+
+	// List: element address = x0 + 8 + index*8.
 	acg.out.AddImm64("x0", "x0", 8)
 	acg.out.out.writer.WriteBytes([]byte{0x21, 0xf0, 0x7d, 0xd3}) // lsl x1, x1, #3
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0x8b}) // add x0, x0, x1
@@ -419,6 +554,237 @@ func (acg *ARM64CodeGen) compileMapUpdate(stmt *MapUpdateStmt) error {
 	}
 	acg.out.AddImm64("sp", "sp", 16)
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0xfd}) // str d0, [x0]
+	return nil
+}
+
+// cstructForExpr returns the cstruct declaration for an expression that holds a
+// pointer to one (a cstruct-typed variable, or an `as Struct` cast), else nil.
+func (acg *ARM64CodeGen) cstructForExpr(expr Expression) *CStructDecl {
+	switch e := expr.(type) {
+	case *IdentExpr:
+		if name, ok := acg.varCStructType[e.Name]; ok {
+			return acg.cstructs[name]
+		}
+	case *CastExpr:
+		if decl, ok := acg.cstructs[e.Type]; ok {
+			return decl
+		}
+	}
+	return nil
+}
+
+// emitLDST emits a single scaled load/store with base register x9 and Rt=0
+// (x0/w0 or d0/s0 depending on baseOp). baseOp is the opcode with imm/Rn/Rt=0.
+func (acg *ARM64CodeGen) emitLDST(baseOp uint32, scale, off int) {
+	imm := uint32(off/scale) & 0xfff
+	instr := baseOp | (imm << 10) | (9 << 5)
+	acg.out.out.writer.WriteBytes([]byte{byte(instr), byte(instr >> 8), byte(instr >> 16), byte(instr >> 24)})
+}
+
+// emitCStructFieldLoad loads the field at its offset (pointer in x9) and leaves
+// the value in d0 (numeric, or pointer-bits for ptr/cstr fields).
+func (acg *ARM64CodeGen) emitCStructFieldLoad(f *CStructField) error {
+	w := acg.out.out.writer
+	off := f.Offset
+	ucvtf := []byte{0x00, 0x00, 0x63, 0x9e} // ucvtf d0, x0
+	scvtf := []byte{0x00, 0x00, 0x62, 0x9e} // scvtf d0, x0
+	switch f.Type {
+	case "uint8":
+		acg.emitLDST(0x39400000, 1, off) // ldrb w0
+		w.WriteBytes(ucvtf)
+	case "int8":
+		acg.emitLDST(0x39800000, 1, off) // ldrsb x0
+		w.WriteBytes(scvtf)
+	case "uint16":
+		acg.emitLDST(0x79400000, 2, off) // ldrh w0
+		w.WriteBytes(ucvtf)
+	case "int16":
+		acg.emitLDST(0x79800000, 2, off) // ldrsh x0
+		w.WriteBytes(scvtf)
+	case "uint32":
+		acg.emitLDST(0xb9400000, 4, off) // ldr w0
+		w.WriteBytes(ucvtf)
+	case "int32":
+		acg.emitLDST(0xb9800000, 4, off) // ldrsw x0
+		w.WriteBytes(scvtf)
+	case "uint64":
+		acg.emitLDST(0xf9400000, 8, off) // ldr x0
+		w.WriteBytes(ucvtf)
+	case "int64":
+		acg.emitLDST(0xf9400000, 8, off) // ldr x0
+		w.WriteBytes(scvtf)
+	case "float32":
+		acg.emitLDST(0xbd400000, 4, off)             // ldr s0
+		w.WriteBytes([]byte{0x00, 0xc0, 0x22, 0x1e}) // fcvt d0, s0
+	case "float64":
+		acg.emitLDST(0xfd400000, 8, off) // ldr d0
+	case "cstr", "ptr":
+		acg.emitLDST(0xf9400000, 8, off)             // ldr x0
+		w.WriteBytes([]byte{0x00, 0x00, 0x67, 0x9e}) // fmov d0, x0 (keep bits)
+	default:
+		return fmt.Errorf("unsupported cstruct field type for ARM64 load: %s", f.Type)
+	}
+	return nil
+}
+
+// emitCStructFieldStore stores d0 into the field at its offset (pointer in x9),
+// converting d0 to the field's width/type.
+func (acg *ARM64CodeGen) emitCStructFieldStore(f *CStructField) error {
+	w := acg.out.out.writer
+	off := f.Offset
+	fcvtzuW := []byte{0x00, 0x00, 0x79, 0x1e} // fcvtzu w0, d0
+	fcvtzsW := []byte{0x00, 0x00, 0x78, 0x1e} // fcvtzs w0, d0
+	fcvtzuX := []byte{0x00, 0x00, 0x79, 0x9e} // fcvtzu x0, d0
+	fcvtzsX := []byte{0x00, 0x00, 0x78, 0x9e} // fcvtzs x0, d0
+	switch f.Type {
+	case "uint8":
+		w.WriteBytes(fcvtzuW)
+		acg.emitLDST(0x39000000, 1, off) // strb w0
+	case "int8":
+		w.WriteBytes(fcvtzsW)
+		acg.emitLDST(0x39000000, 1, off)
+	case "uint16":
+		w.WriteBytes(fcvtzuW)
+		acg.emitLDST(0x79000000, 2, off) // strh w0
+	case "int16":
+		w.WriteBytes(fcvtzsW)
+		acg.emitLDST(0x79000000, 2, off)
+	case "uint32":
+		w.WriteBytes(fcvtzuW)
+		acg.emitLDST(0xb9000000, 4, off) // str w0
+	case "int32":
+		w.WriteBytes(fcvtzsW)
+		acg.emitLDST(0xb9000000, 4, off)
+	case "uint64":
+		w.WriteBytes(fcvtzuX)
+		acg.emitLDST(0xf9000000, 8, off) // str x0
+	case "int64":
+		w.WriteBytes(fcvtzsX)
+		acg.emitLDST(0xf9000000, 8, off)
+	case "float32":
+		w.WriteBytes([]byte{0x00, 0x40, 0x62, 0x1e}) // fcvt s0, d0
+		acg.emitLDST(0xbd000000, 4, off)             // str s0
+	case "float64":
+		acg.emitLDST(0xfd000000, 8, off) // str d0
+	case "cstr", "ptr":
+		w.WriteBytes([]byte{0x00, 0x00, 0x66, 0x9e}) // fmov x0, d0 (bits)
+		acg.emitLDST(0xf9000000, 8, off)             // str x0
+	default:
+		return fmt.Errorf("unsupported cstruct field type for ARM64 store: %s", f.Type)
+	}
+	return nil
+}
+
+// emitMapValueSlotAddr searches a map/string for key x1 (pointer in x0) and
+// leaves the address of its value slot in x7, or 0 if the key is absent. Same
+// layout as emitMapKeyLookup.
+func (acg *ARM64CodeGen) emitMapValueSlotAddr() error {
+	if err := acg.out.LdrImm64Double("d1", "x0", 0); err != nil { // count
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x2", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x3", 0); err != nil { // i
+		return err
+	}
+	loopStart := acg.eb.text.Len()
+	if err := acg.out.CmpReg64("x3", "x2"); err != nil {
+		return err
+	}
+	notFoundJump := acg.eb.text.Len()
+	acg.out.BranchCond("ge", 0)
+	if err := acg.out.LslImm64("x5", "x3", 4); err != nil {
+		return err
+	}
+	if err := acg.out.AddReg64("x4", "x0", "x5"); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("x4", "x4", 8); err != nil { // &key[i]
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d1", "x4", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x6", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.CmpReg64("x6", "x1"); err != nil {
+		return err
+	}
+	foundJump := acg.eb.text.Len()
+	acg.out.BranchCond("eq", 0)
+	if err := acg.out.AddImm64("x3", "x3", 1); err != nil {
+		return err
+	}
+	backPos := acg.eb.text.Len()
+	acg.out.Branch(0)
+	acg.patchJumpOffset(backPos, int32(loopStart-backPos))
+
+	foundLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(foundJump, int32(foundLabel-foundJump))
+	if err := acg.out.AddImm64("x7", "x4", 8); err != nil { // value slot
+		return err
+	}
+	endJump := acg.eb.text.Len()
+	acg.out.Branch(0)
+
+	notFoundLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(notFoundJump, int32(notFoundLabel-notFoundJump))
+	if err := acg.out.MovImm64("x7", 0); err != nil {
+		return err
+	}
+
+	endLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(endJump, int32(endLabel-endJump))
+	return nil
+}
+
+// compileMultipleAssign compiles `a, b = expr` where expr yields a flat tuple
+// [count][elem0][elem1]... (e.g. pop returns [new_list, popped]). Element i is
+// unpacked from offset 8+i*8 into the i-th name.
+func (acg *ARM64CodeGen) compileMultipleAssign(stmt *MultipleAssignStmt) error {
+	if err := acg.compileExpression(stmt.Value); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil { // tuple ptr
+		return err
+	}
+	// Spill the pointer so it survives across element loads.
+	acg.out.SubImm64("sp", "sp", 16)
+	if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+
+	for i, name := range stmt.Names {
+		var offset int32
+		if stmt.IsUpdate {
+			so, ok := acg.stackVars[name]
+			if !ok {
+				return fmt.Errorf("cannot update undefined variable '%s'", name)
+			}
+			offset = int32(16 + so - 8)
+		} else if so, exists := acg.stackVars[name]; exists && acg.mutableVars[name] {
+			offset = int32(16 + so - 8)
+		} else {
+			acg.stackSize += 8
+			acg.stackVars[name] = acg.stackSize
+			acg.mutableVars[name] = stmt.Mutable
+			offset = int32(16 + acg.stackSize - 8)
+		}
+
+		if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+			return err
+		}
+		if err := acg.out.LdrImm64Double("d0", "x0", int32(8+i*8)); err != nil {
+			return err
+		}
+		if err := acg.out.StrImm64Double("d0", "x29", offset); err != nil {
+			return err
+		}
+	}
+
+	acg.out.AddImm64("sp", "sp", 16)
 	return nil
 }
 
@@ -472,8 +838,28 @@ func (acg *ARM64CodeGen) compileJumpStatement(stmt *JumpStmt) error {
 		return fmt.Errorf("%s used outside of loop", keyword)
 	}
 
-	// Loop continue/break handling (not fully implemented yet)
-	return fmt.Errorf("loop jump statements not yet implemented for ARM64")
+	// Resolve which loop this jump targets. Default to the innermost; a positive
+	// label selects an enclosing loop by its @N label.
+	target := len(acg.activeLoops) - 1
+	for j := range acg.activeLoops {
+		if acg.activeLoops[j].Label == stmt.Label {
+			target = j
+			break
+		}
+	}
+
+	// Emit a placeholder branch; the loop's epilogue patches it to the loop end
+	// (break) or the continue/step position (continue).
+	pos := acg.eb.text.Len()
+	if err := acg.out.Branch(0); err != nil {
+		return err
+	}
+	if stmt.IsBreak {
+		acg.activeLoops[target].EndPatches = append(acg.activeLoops[target].EndPatches, pos)
+	} else {
+		acg.activeLoops[target].ContinuePatches = append(acg.activeLoops[target].ContinuePatches, pos)
+	}
+	return nil
 }
 
 // pushDeferScope creates a new defer scope for collecting deferred expressions
@@ -645,6 +1031,11 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
 
 	case *IdentExpr:
+		// Module globals live in the heap array based at x28 (visible from any
+		// lambda body), addressed by their fixed slot.
+		if slot, isGlobal := acg.globalSlots[e.Name]; isGlobal {
+			return acg.out.LdrImm64Double("d0", "x28", int32(slot*8))
+		}
 		// Load variable from stack into d0
 		stackOffset, exists := acg.stackVars[e.Name]
 		if !exists {
@@ -720,39 +1111,52 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 				return nil
 			}
 
-			if leftType == "string" && rightType == "string" {
-				// String concatenation
-				// Compile left string (result in d0)
+			if leftType == "list" && rightType != "list" {
+				// List + element: append the element (shorthand for list += elem).
 				if err := acg.compileExpression(e.Left); err != nil {
 					return err
 				}
-				// Convert d0 to x0
-				acg.out.SubImm64("sp", "sp", 16)
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
-				if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+				if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
 					return err
 				}
-				acg.out.AddImm64("sp", "sp", 16)
-
-				// Push x0 to stack
 				acg.out.SubImm64("sp", "sp", 16)
 				if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
 					return err
 				}
-
-				// Compile right string (result in d0)
 				if err := acg.compileExpression(e.Right); err != nil {
 					return err
 				}
-				// Convert d0 to x1
-				acg.out.SubImm64("sp", "sp", 16)
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
-				if err := acg.out.LdrImm64("x1", "sp", 0); err != nil {
+				if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
 					return err
 				}
 				acg.out.AddImm64("sp", "sp", 16)
+				if err := acg.eb.GenerateCallInstruction("_tim_append"); err != nil {
+					return err
+				}
+				return acg.out.ScvtfInt64ToDouble("d0", "x0")
+			}
 
-				// Restore left ptr to x0
+			if leftType == "string" && rightType == "string" {
+				// String concatenation. String pointers are stored numerically
+				// (scvtf), so recover them with fcvtzs — a bit reinterpret would
+				// pass garbage to the helper and crash.
+				if err := acg.compileExpression(e.Left); err != nil {
+					return err
+				}
+				if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+					return err
+				}
+				// Spill left pointer across the right operand's evaluation.
+				acg.out.SubImm64("sp", "sp", 16)
+				if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+					return err
+				}
+				if err := acg.compileExpression(e.Right); err != nil {
+					return err
+				}
+				if err := acg.out.FcvtzsDoubleToInt64("x1", "d0"); err != nil {
+					return err
+				}
 				if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
 					return err
 				}
@@ -762,17 +1166,47 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 				if err := acg.eb.GenerateCallInstruction("_tim_string_concat"); err != nil {
 					return err
 				}
+				// Result pointer back to the numeric convention.
+				return acg.out.ScvtfInt64ToDouble("d0", "x0")
+			}
+		}
 
-				// Convert result x0 back to d0
-				acg.out.SubImm64("sp", "sp", 16)
-				if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+		// String equality/inequality compares contents, not pointer identity.
+		// (Identical literals are interned to one address, but runtime-built
+		// strings are not, so a numeric compare would be wrong.)
+		if (e.Operator == "==" || e.Operator == "!=") &&
+			acg.getExprType(e.Left) == "string" && acg.getExprType(e.Right) == "string" {
+			if err := acg.compileExpression(e.Left); err != nil {
+				return err
+			}
+			if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+				return err
+			}
+			acg.out.SubImm64("sp", "sp", 16)
+			if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+				return err
+			}
+			if err := acg.compileExpression(e.Right); err != nil {
+				return err
+			}
+			if err := acg.out.FcvtzsDoubleToInt64("x1", "d0"); err != nil {
+				return err
+			}
+			if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+				return err
+			}
+			acg.out.AddImm64("sp", "sp", 16)
+			if err := acg.eb.GenerateCallInstruction("_tim_string_eq"); err != nil {
+				return err
+			}
+			// x0 = 1 if equal else 0. Invert for "!=".
+			if e.Operator == "!=" {
+				if err := acg.out.CmpImm64("x0", 0); err != nil {
 					return err
 				}
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x40, 0xfd}) // ldr d0, [sp]
-				acg.out.AddImm64("sp", "sp", 16)
-
-				return nil
+				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x17, 0x9f, 0x9a}) // cset x0, eq
 			}
+			return acg.out.ScvtfInt64ToDouble("d0", "x0")
 		}
 
 		// Special handling for or! operator (railway-oriented programming)
@@ -881,8 +1315,31 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			// fmul d0, d0, d1
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x08, 0x61, 0x1e})
 		case "/":
+			// Division by zero yields an error-NaN (0x7FF8000064763000, "dv0")
+			// that or! can detect, rather than +/-inf.
+			// fcmp d1, #0.0
+			acg.out.out.writer.WriteBytes([]byte{0x28, 0x20, 0x60, 0x1e})
+			// b.ne do_div (divisor non-zero: normal division)
+			nePos := acg.eb.text.Len()
+			acg.out.BranchCond("ne", 0)
+			// divisor is zero: load the error-NaN sentinel into d0
+			if err := acg.out.MovImm64("x0", 0x7FF8000064763000); err != nil {
+				return err
+			}
+			if err := acg.out.FmovGPToDouble("d0", "x0"); err != nil {
+				return err
+			}
+			// b end_div
+			bEndPos := acg.eb.text.Len()
+			acg.out.Branch(0)
+			// do_div:
+			doDivLabel := acg.eb.text.Len()
+			acg.patchJumpOffset(nePos, int32(doDivLabel-nePos))
 			// fdiv d0, d0, d1
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x18, 0x61, 0x1e})
+			// end_div:
+			endDivLabel := acg.eb.text.Len()
+			acg.patchJumpOffset(bEndPos, int32(endDivLabel-bEndPos))
 		case "==":
 			// fcmp d0, d1
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e})
@@ -926,6 +1383,21 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			// scvtf d0, x0
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
 		case "mod", "%":
+			// Modulo by zero yields the same error-NaN as division by zero.
+			// fcmp d1, #0.0
+			acg.out.out.writer.WriteBytes([]byte{0x28, 0x20, 0x60, 0x1e})
+			neModPos := acg.eb.text.Len()
+			acg.out.BranchCond("ne", 0) // b.ne do_mod
+			if err := acg.out.MovImm64("x0", 0x7FF8000064763000); err != nil {
+				return err
+			}
+			if err := acg.out.FmovGPToDouble("d0", "x0"); err != nil {
+				return err
+			}
+			bModEndPos := acg.eb.text.Len()
+			acg.out.Branch(0) // b end_mod
+			doModLabel := acg.eb.text.Len()
+			acg.patchJumpOffset(neModPos, int32(doModLabel-neModPos))
 			// Modulo: a % b = a - b * floor(a / b)
 			// d0 = dividend (a), d1 = divisor (b)
 			// fmov d2, d0 (save dividend in d2)
@@ -942,6 +1414,8 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x08, 0x63, 0x1e})
 			// fsub d0, d2, d0 (d0 = a - floor(a / b) * b)
 			acg.out.out.writer.WriteBytes([]byte{0x40, 0x38, 0x60, 0x1e})
+			modEndLabel := acg.eb.text.Len()
+			acg.patchJumpOffset(bModEndPos, int32(modEndLabel-bModEndPos))
 		case "and":
 			// Logical AND: returns 1.0 if both non-zero, else 0.0
 			// Compare d0 with 0.0
@@ -1212,16 +1686,24 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		acg.out.LdrImm64("x0", "sp", 0)
 		acg.out.AddImm64("sp", "sp", 16)
 
-		// x0 = list pointer, x1 = index
-		// Skip past count (8 bytes) and index by (index * 8)
-		acg.out.AddImm64("x0", "x0", 8)
-		// x1 = x1 << 3 (multiply by 8)
-		acg.out.out.writer.WriteBytes([]byte{0x21, 0xf0, 0x7d, 0xd3}) // lsl x1, x1, #3
-		// x0 = x0 + x1
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0x8b}) // add x0, x0, x1
-
-		// Load element into d0
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x40, 0xfd}) // ldr d0, [x0]
+		// x0 = pointer, x1 = index/key.
+		// Maps and strings store [count][key0][val0]... (16-byte pairs), so
+		// m[k] is a key lookup. Lists store [count][elem0][elem1]... (flat).
+		idxType := acg.getExprType(e.List)
+		if idxType == "map" || idxType == "string" {
+			if err := acg.emitMapKeyLookup(); err != nil {
+				return err
+			}
+		} else {
+			// Skip past count (8 bytes) and index by (index * 8)
+			acg.out.AddImm64("x0", "x0", 8)
+			// x1 = x1 << 3 (multiply by 8)
+			acg.out.out.writer.WriteBytes([]byte{0x21, 0xf0, 0x7d, 0xd3}) // lsl x1, x1, #3
+			// x0 = x0 + x1
+			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0x8b}) // add x0, x0, x1
+			// Load element into d0
+			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x40, 0xfd}) // ldr d0, [x0]
+		}
 
 	case *CallExpr:
 		return acg.compileCall(e)
@@ -1259,8 +1741,8 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			return err
 		}
 		// Move C to d3 (accumulator)
-		// fmov d3, d0
-		acg.out.out.writer.WriteBytes([]byte{0x03, 0x40, 0x20, 0x1e})
+		// fmov d3, d0 (double-precision register move)
+		acg.out.out.writer.WriteBytes([]byte{0x03, 0x40, 0x60, 0x1e})
 
 		// Pop B to d1 (Dm)
 		if err := acg.out.LdrImm64Double("d1", "sp", 0); err != nil {
@@ -1274,24 +1756,24 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		}
 		acg.out.AddImm64("sp", "sp", 16)
 
-		// Result in d0 (Dd)
+		// Result in d0 (Dd). ARM64 fused ops are defined as:
+		//   FMADD  = Da + Dn*Dm        FMSUB  = Da - Dn*Dm
+		//   FNMADD = -(Da + Dn*Dm)     FNMSUB = Dn*Dm - Da
+		// with Dn=a (d2), Dm=b (d1), Da=c (d3).
 		if e.IsNegMul {
 			if e.IsSub {
-				// -(a*b) - c -> FNMSUB
-				return acg.out.FnmsubScalar64("d0", "d2", "d1", "d3")
-			} else {
-				// -(a*b) + c -> FNMADD
+				// -(a*b) - c -> -(Dn*Dm + Da) -> FNMADD
 				return acg.out.FnmaddScalar64("d0", "d2", "d1", "d3")
 			}
-		} else {
-			if e.IsSub {
-				// a*b - c -> FMSUB
-				return acg.out.FmsubScalar64("d0", "d2", "d1", "d3")
-			} else {
-				// a*b + c -> FMADD
-				return acg.out.FmaddScalar64("d0", "d2", "d1", "d3")
-			}
+			// -(a*b) + c -> Da - Dn*Dm -> FMSUB
+			return acg.out.FmsubScalar64("d0", "d2", "d1", "d3")
 		}
+		if e.IsSub {
+			// a*b - c -> Dn*Dm - Da -> FNMSUB
+			return acg.out.FnmsubScalar64("d0", "d2", "d1", "d3")
+		}
+		// a*b + c -> FMADD
+		return acg.out.FmaddScalar64("d0", "d2", "d1", "d3")
 
 	case *LambdaExpr:
 		// Generate a unique function name for this lambda
@@ -1353,6 +1835,14 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x20, 0xaa})
 			// scvtf d0, x0
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+
+		case "#":
+			// Length operator: the operand is a list/map pointer (numeric double);
+			// the length is stored in the first 8 bytes.
+			// fcvtzs x0, d0
+			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
+			// ldr d0, [x0]
+			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x40, 0xfd})
 
 		default:
 			return fmt.Errorf("unsupported unary operator for ARM64: %s", e.Operator)
@@ -1745,6 +2235,27 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		// Full implementation would need pattern matching codegen
 		return fmt.Errorf("pattern lambdas not yet implemented in ARM64 (requires pattern matching)")
 
+	case *FieldAccessExpr:
+		// C-struct field access (p.x) reads raw typed memory at the field offset.
+		if decl := acg.cstructForExpr(e.Object); decl != nil {
+			for i := range decl.Fields {
+				if decl.Fields[i].Name == e.FieldName {
+					if err := acg.compileExpression(e.Object); err != nil {
+						return err
+					}
+					acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x78, 0x9e}) // fcvtzs x9, d0 (numeric ptr)
+					return acg.emitCStructFieldLoad(&decl.Fields[i])
+				}
+			}
+			return fmt.Errorf("cstruct %s has no field %s", decl.Name, e.FieldName)
+		}
+		// Otherwise Tim map field access: m.x is sugar for m[hashStringKey("x")].
+		indexExpr := &IndexExpr{
+			List:  e.Object,
+			Index: &NumberExpr{Value: float64(hashStringKey(e.FieldName))},
+		}
+		return acg.compileExpression(indexExpr)
+
 	default:
 		return fmt.Errorf("unsupported expression type for ARM64: %T", expr)
 	}
@@ -1754,6 +2265,26 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 
 // compileAssignment compiles an assignment statement
 func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
+	// Module globals: store to the shared heap slot based at x28. Define and
+	// update both resolve to the same slot (capture-by-reference).
+	if slot, isGlobal := acg.globalSlots[assign.Name]; isGlobal {
+		if assign.IsUpdate && !acg.globalMutable[assign.Name] {
+			return fmt.Errorf("cannot update immutable variable '%s' (use <- only for mutable variables)", assign.Name)
+		}
+		oldName := acg.currentAssignName
+		acg.currentAssignName = assign.Name
+		if err := acg.compileExpression(assign.Value); err != nil {
+			return err
+		}
+		acg.currentAssignName = oldName
+		switch assign.Value.(type) {
+		case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+			acg.lambdaVars[assign.Name] = true
+		}
+		acg.varTypes[assign.Name] = acg.getExprType(assign.Value)
+		return acg.out.StrImm64Double("d0", "x28", int32(slot*8))
+	}
+
 	// Validate assignment semantics
 	_, exists := acg.stackVars[assign.Name]
 	isMutable := acg.mutableVars[assign.Name]
@@ -1827,6 +2358,12 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 			case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
 				acg.lambdaVars[assign.Name] = true
 			}
+			// Track cstruct-typed pointers (e.g. `p := malloc(n) as Point`).
+			if cast, ok := assign.Value.(*CastExpr); ok {
+				if _, isStruct := acg.cstructs[cast.Type]; isStruct {
+					acg.varCStructType[assign.Name] = cast.Type
+				}
+			}
 			// x29 points to saved fp location, variables start at offset 16
 			offset = int32(16 + acg.stackSize - 8)
 		}
@@ -1860,7 +2397,9 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 		var nextClauseJumpPos int
 
 		if clause.IsValueMatch {
-			// Compare condition (d0) with guard value
+			// Compare condition (d0) with guard value. (Note: the parser usually
+			// rewrites value matches into a `condition == guard` boolean guard, so
+			// string matches are handled by the == operator's string path below.)
 			if err := acg.compileExpression(clause.Guard); err != nil {
 				return err
 			}
@@ -1888,6 +2427,13 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 			// Jump to next clause if false (== 0.0)
 			nextClauseJumpPos = acg.eb.text.Len()
 			acg.out.BranchCond("eq", 0)
+		} else {
+			// Guardless clause from the `cond { body }` form: the condition itself
+			// is the boolean test (d0 already holds it). Run the body only if true.
+			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
+			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+			nextClauseJumpPos = acg.eb.text.Len()
+			acg.out.BranchCond("eq", 0) // skip body if condition == 0
 		}
 
 		// Matched! Compile result
@@ -1902,11 +2448,9 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 		acg.out.Branch(0)
 		endJumpPositions = append(endJumpPositions, endJumpPos)
 
-		// This clause's "next clause" target is here
-		if clause.IsValueMatch || clause.Guard != nil {
-			currentPos := acg.eb.text.Len()
-			acg.patchJumpOffset(nextClauseJumpPos, int32(currentPos-nextClauseJumpPos))
-		}
+		// Every clause now emits a guard branch; patch it to skip to the next clause.
+		currentPos := acg.eb.text.Len()
+		acg.patchJumpOffset(nextClauseJumpPos, int32(currentPos-nextClauseJumpPos))
 	}
 
 	// Default clause
@@ -1958,6 +2502,9 @@ func (acg *ARM64CodeGen) patchJumpOffset(pos int, offset int32) {
 	// Check if it's a conditional branch (B.cond) or unconditional branch (B)
 	if (instr & 0xff000010) == 0x54000000 {
 		// Conditional branch: B.cond - imm19 at bits [23:5]
+		instr = (instr & 0xff00001f) | ((uint32(imm) & 0x7ffff) << 5)
+	} else if (instr & 0x7e000000) == 0x34000000 {
+		// Compare-and-branch: CBZ/CBNZ - imm19 at bits [23:5]
 		instr = (instr & 0xff00001f) | ((uint32(imm) & 0x7ffff) << 5)
 	} else if (instr & 0xfc000000) == 0x14000000 {
 		// Unconditional branch: B - imm26 at bits [25:0]
@@ -2073,7 +2620,7 @@ func (acg *ARM64CodeGen) compileParallelExpr(expr *ParallelExpr) error {
 	// mov x0, x15
 	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0f, 0xaa})
 	// lsl x0, x0, #3 (multiply by 8)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xfc, 0x43, 0xd3})
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf0, 0x7d, 0xd3})
 	// add x0, x0, #8 (skip length)
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x00, 0x91})
 	// add x0, x0, x13 (x0 = address of element)
@@ -2117,7 +2664,7 @@ func (acg *ARM64CodeGen) compileParallelExpr(expr *ParallelExpr) error {
 	// mov x0, x15
 	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0f, 0xaa})
 	// lsl x0, x0, #3
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xfc, 0x43, 0xd3})
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf0, 0x7d, 0xd3})
 	// add x0, x0, #8
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x00, 0x91})
 	// add x0, x0, x12
@@ -2177,8 +2724,15 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 				}
 				return fmt.Errorf("undefined C function '%s.%s'", namespace, funcName)
 			}
-			// Not a C import - might be a method call or other namespaced access
-			return fmt.Errorf("undefined namespace '%s' for function call", namespace)
+			// If the "namespace" is actually a variable, this is method-call
+			// syntax: desugar xs.append(a) -> append(xs, a) and fall through.
+			if _, isVar := acg.stackVars[namespace]; isVar {
+				call.Function = funcName
+				call.Args = append([]Expression{&IdentExpr{Name: namespace}}, call.Args...)
+			} else {
+				// Not a C import - might be a method call or other namespaced access
+				return fmt.Errorf("undefined namespace '%s' for function call", namespace)
+			}
 		}
 	}
 
@@ -2232,10 +2786,26 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 		return acg.compileAlloc(call)
 	case "popcount", "clz", "ctz":
 		return acg.compileBitCount(call, call.Function)
+	case "head":
+		return acg.compileHead(call)
+	case "tail":
+		return acg.compileTail(call)
+	case "append":
+		return acg.compileAppend(call)
+	case "pop":
+		return acg.compilePop(call)
+	case "is_nan":
+		return acg.compileIsNan(call)
+	case "_error_code_extract":
+		return acg.compileErrorCodeExtract(call)
 	case "string_concat":
 		// Internal string concatenation function
 		// Arguments should already be in x0 and x1
-		return acg.eb.GenerateCallInstruction("_tim_string_concat")
+		if err := acg.eb.GenerateCallInstruction("_tim_string_concat"); err != nil {
+			return err
+		}
+		// Result pointer in x0 -> numeric double convention in d0.
+		return acg.out.ScvtfInt64ToDouble("d0", "x0")
 	case "write_i8", "write_i16", "write_i32", "write_i64",
 		"write_u8", "write_u16", "write_u32", "write_u64", "write_f64":
 		return acg.compileMemoryWrite(call)
@@ -4407,12 +4977,13 @@ func (acg *ARM64CodeGen) compileCFunctionCall(funcName string, args []Expression
 			}
 
 			if argType == "ptr" {
-				// Pointer: transfer bits from d0 to xN
-				// fmov xN, d0
+				// Pointer: transfer bits from d0 to xN.
+				// fmov xN, d0 (FP->GP) is 0x9e660000|N, i.e. byte[2]=0x66.
+				// (0x67 would be fmov dN, x0 — the wrong direction.)
 				acg.out.out.writer.WriteBytes([]byte{
 					byte(intRegNum),
 					0x00,
-					0x67,
+					0x66,
 					0x9e,
 				})
 			} else {
@@ -4659,6 +5230,8 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 	switch e := expr.(type) {
 	case *StringExpr:
 		return "string"
+	case *FStringExpr:
+		return "string"
 	case *NumberExpr:
 		return "number"
 	case *ListExpr:
@@ -4690,6 +5263,7 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 		stringFuncs := map[string]bool{
 			"str": true, "read_file": true, "readln": true,
 			"upper": true, "lower": true, "trim": true,
+			"_error_code_extract": true,
 		}
 		if stringFuncs[e.Function] {
 			return "string"
@@ -4705,6 +5279,273 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 	default:
 		return "unknown"
 	}
+}
+
+// emitMapKeyLookup searches a Tim map/string for a key. On entry x0 = pointer,
+// x1 = key (integer). It leaves the matching value in d0, or 0.0 if the key is
+// absent. Maps/strings are laid out [count][key0][val0][key1][val1]... with
+// 16-byte (key,value) pairs, so pair i has its key at ptr+8+i*16.
+func (acg *ARM64CodeGen) emitMapKeyLookup() error {
+	if err := acg.out.LdrImm64Double("d1", "x0", 0); err != nil { // count
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x2", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x3", 0); err != nil { // i = 0
+		return err
+	}
+	loopStart := acg.eb.text.Len()
+	if err := acg.out.CmpReg64("x3", "x2"); err != nil {
+		return err
+	}
+	notFoundJump := acg.eb.text.Len()
+	acg.out.BranchCond("ge", 0)                             // i >= count -> not found
+	if err := acg.out.LslImm64("x5", "x3", 4); err != nil { // i*16
+		return err
+	}
+	if err := acg.out.AddReg64("x4", "x0", "x5"); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("x4", "x4", 8); err != nil { // x4 = &key[i]
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d1", "x4", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x6", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.CmpReg64("x6", "x1"); err != nil {
+		return err
+	}
+	foundJump := acg.eb.text.Len()
+	acg.out.BranchCond("eq", 0) // key matches
+	if err := acg.out.AddImm64("x3", "x3", 1); err != nil {
+		return err
+	}
+	backPos := acg.eb.text.Len()
+	acg.out.Branch(0)
+	acg.patchJumpOffset(backPos, int32(loopStart-backPos))
+
+	// found: value sits right after the key.
+	foundLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(foundJump, int32(foundLabel-foundJump))
+	if err := acg.out.LdrImm64Double("d0", "x4", 8); err != nil {
+		return err
+	}
+	endJump := acg.eb.text.Len()
+	acg.out.Branch(0)
+
+	// not found: 0.0
+	notFoundLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(notFoundJump, int32(notFoundLabel-notFoundJump))
+	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x67, 0x9e}) // fmov d0, xzr
+
+	endLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(endJump, int32(endLabel-endJump))
+	return nil
+}
+
+// compileHead compiles head(list): the first element of a list. Lists store
+// their pointer as a numeric double, so recover it with fcvtzs and load elem 0
+// (which sits just past the 8-byte length field).
+func (acg *ARM64CodeGen) compileHead(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("head() requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+		return err
+	}
+	return acg.out.LdrImm64Double("d0", "x0", 8)
+}
+
+// compileTail compiles tail(list): a freshly allocated copy of the list with
+// the first element removed. _tim_tail returns the new pointer in x0, which is
+// converted back to the numeric double convention with scvtf.
+func (acg *ARM64CodeGen) compileTail(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("tail() requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("_tim_tail"); err != nil {
+		return err
+	}
+	return acg.out.ScvtfInt64ToDouble("d0", "x0")
+}
+
+// compileAppend compiles append(list, value): a freshly allocated copy of the
+// list with value appended. _tim_append takes the list pointer in x0 and the
+// value in d0; the list pointer is spilled across the value's evaluation.
+func (acg *ARM64CodeGen) compileAppend(call *CallExpr) error {
+	if len(call.Args) != 2 {
+		return fmt.Errorf("append() requires exactly 2 arguments")
+	}
+	// Evaluate the list, recover its pointer, and spill it to the stack.
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+		return err
+	}
+	acg.out.SubImm64("sp", "sp", 16)
+	if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+	// Evaluate the value (result in d0), then restore the list pointer to x0.
+	if err := acg.compileExpression(call.Args[1]); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+	acg.out.AddImm64("sp", "sp", 16)
+	if err := acg.eb.GenerateCallInstruction("_tim_append"); err != nil {
+		return err
+	}
+	return acg.out.ScvtfInt64ToDouble("d0", "x0")
+}
+
+// compilePop compiles pop(list): removes the last element. _tim_pop returns a
+// pointer to a flat 2-tuple [new_list_ptr, popped_value] which a MultipleAssign
+// destructures (element i at offset 8+i*8). The pointer is converted back to the
+// numeric double convention with scvtf.
+func (acg *ARM64CodeGen) compilePop(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("pop() requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("_tim_pop"); err != nil {
+		return err
+	}
+	return acg.out.ScvtfInt64ToDouble("d0", "x0")
+}
+
+// compileIsNan compiles is_nan(x): 1.0 if x is NaN, else 0.0. fcmp of a value
+// against itself sets the V (overflow/unordered) flag exactly when it is NaN.
+func (acg *ARM64CodeGen) compileIsNan(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("is_nan() requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x60, 0x1e}) // fcmp d0, d0
+	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x77, 0x9f, 0x9a}) // cset x0, vs
+	return acg.out.ScvtfInt64ToDouble("d0", "x0")
+}
+
+// compileErrorCodeExtract compiles the .error property: it extracts the 4-byte
+// error code packed into an error-NaN's mantissa and returns it as a 3-character
+// Tim string (e.g. "dv0"). A non-error (non-NaN) value yields the empty string.
+func (acg *ARM64CodeGen) compileErrorCodeExtract(call *CallExpr) error {
+	if len(call.Args) != 1 {
+		return fmt.Errorf("_error_code_extract requires exactly 1 argument")
+	}
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	// fcmp d0, d0 — sets the V (overflow) flag when d0 is NaN (unordered).
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x60, 0x1e})
+	nanPos := acg.eb.text.Len()
+	acg.out.BranchCond("vs", 0) // b.vs nan_path
+
+	// Not an error: return an empty string (count = 0.0).
+	if err := acg.out.MovImm64("x0", 8); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x1", 0); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x1", "x0", 0); err != nil {
+		return err
+	}
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x0"); err != nil {
+		return err
+	}
+	endPos := acg.eb.text.Len()
+	acg.out.Branch(0) // b end
+
+	// nan_path: build the 3-char error string from the mantissa bytes.
+	nanLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(nanPos, int32(nanLabel-nanPos))
+	if err := acg.out.FmovDoubleToGP("x9", "d0"); err != nil { // x9 = raw bits
+		return err
+	}
+	acg.out.SubImm64("sp", "sp", 32)
+	if err := acg.out.MovImm64("x10", 0xff); err != nil { // byte mask
+		return err
+	}
+	// Characters live at bits 31:24, 23:16, 15:8 of the mantissa.
+	for i, shift := range []int{24, 16, 8} {
+		if err := acg.out.MovImm64("x11", uint64(shift)); err != nil {
+			return err
+		}
+		if err := acg.out.LsrReg64("x12", "x9", "x11"); err != nil {
+			return err
+		}
+		if err := acg.out.AndReg64("x12", "x12", "x10"); err != nil {
+			return err
+		}
+		if err := acg.out.ScvtfInt64ToDouble("d1", "x12"); err != nil {
+			return err
+		}
+		if err := acg.out.StrImm64Double("d1", "sp", int32(i*8)); err != nil {
+			return err
+		}
+	}
+	// Allocate the string-map: 8-byte count + 3 * 16-byte (key,value) pairs.
+	if err := acg.out.MovImm64("x0", 56); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		return err
+	}
+	// count = 3.0 (0x4008000000000000)
+	if err := acg.out.MovImm64("x1", 0x4008000000000000); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x1", "x0", 0); err != nil {
+		return err
+	}
+	for i := range 3 {
+		if err := acg.out.MovImm64("x1", uint64(i)); err != nil { // key = i
+			return err
+		}
+		if err := acg.out.StrImm64("x1", "x0", int32(8+i*16)); err != nil {
+			return err
+		}
+		if err := acg.out.LdrImm64Double("d1", "sp", int32(i*8)); err != nil { // char value
+			return err
+		}
+		if err := acg.out.StrImm64Double("d1", "x0", int32(16+i*16)); err != nil {
+			return err
+		}
+	}
+	acg.out.AddImm64("sp", "sp", 32)
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x0"); err != nil {
+		return err
+	}
+
+	endLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(endPos, int32(endLabel-endPos))
+	return nil
 }
 
 // listHelperPrologue emits the standard frame used by the list builtins:
@@ -4737,7 +5578,7 @@ func (acg *ARM64CodeGen) emitListAlloc(countReg string) error {
 	if err := acg.out.AddImm64("x0", "x0", 15); err != nil { // round up to 16
 		return err
 	}
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x3c, 0x00, 0x92}) // and x0, x0, #~15
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 	return acg.eb.GenerateCallInstruction("malloc")
 }
 
@@ -4839,7 +5680,202 @@ func (acg *ARM64CodeGen) generateListBuiltinHelpers() error {
 	}
 	acg.out.MovReg64("x0", "x22")
 	acg.listHelperEpilogue()
+
+	// _tim_pop(x0=list_ptr) -> x0=ptr to flat 2-tuple [new_list_ptr, popped].
+	// new_list is a copy without the last element; popped is the last value
+	// (NaN for an empty list). new_list_ptr is stored scvtf-encoded so the
+	// MultipleAssign that reads it back recovers a valid pointer.
+	acg.eb.MarkLabel("_tim_pop")
+	acg.listHelperPrologue()
+	acg.out.MovReg64("x19", "x0") // list ptr
+	if err := acg.out.LdrImm64Double("d0", "x19", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x20", "d0"); err != nil { // count
+		return err
+	}
+	if err := acg.out.CmpImm64("x20", 0); err != nil {
+		return err
+	}
+	emptyJump := acg.eb.text.Len()
+	acg.out.BranchCond("eq", 0) // empty list -> empty path
+
+	// Non-empty: new count = count - 1; popped = last element.
+	acg.out.SubImm64("x21", "x20", 1)
+	if err := acg.out.LslImm64("x9", "x21", 3); err != nil { // new_count*8
+		return err
+	}
+	if err := acg.out.AddReg64("x9", "x9", "x19"); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d0", "x9", 8); err != nil { // popped = elem[count-1]
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "sp", 48); err != nil { // stash popped
+		return err
+	}
+	if err := acg.emitListAlloc("x21"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x22", "x0") // new_list ptr
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x21"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x22", 0); err != nil { // new length
+		return err
+	}
+	acg.out.AddImm64("x11", "x19", 8) // src = &elem0
+	acg.out.AddImm64("x12", "x22", 8) // dst = &new elem0
+	if err := acg.emitListCopyLoop("x21", "x11", "x12"); err != nil {
+		return err
+	}
+	buildJump := acg.eb.text.Len()
+	acg.out.Branch(0) // -> build tuple
+
+	// Empty path: new_list is an empty list, popped is NaN.
+	emptyLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(emptyJump, int32(emptyLabel-emptyJump))
+	if err := acg.out.MovImm64("x21", 0); err != nil {
+		return err
+	}
+	if err := acg.emitListAlloc("x21"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x22", "x0")
+	if err := acg.out.MovImm64("x9", 0); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x9", "x22", 0); err != nil { // length 0
+		return err
+	}
+	if err := acg.out.MovImm64("x9", 0x7FF8000000000000); err != nil { // NaN bits
+		return err
+	}
+	if err := acg.out.StrImm64("x9", "sp", 48); err != nil { // stash NaN as popped
+		return err
+	}
+
+	// Build the result tuple: [count=2.0][scvtf(new_list)][popped].
+	buildLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(buildJump, int32(buildLabel-buildJump))
+	if err := acg.out.MovImm64("x0", 32); err != nil { // 24 bytes, 16-aligned
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x9", 0x4000000000000000); err != nil { // 2.0
+		return err
+	}
+	if err := acg.out.StrImm64("x9", "x0", 0); err != nil {
+		return err
+	}
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x22"); err != nil { // new_list ptr -> double
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x0", 8); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d0", "sp", 48); err != nil { // popped
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x0", 16); err != nil {
+		return err
+	}
+	acg.listHelperEpilogue()
+
+	if err := acg.generateStringEqHelper(); err != nil {
+		return err
+	}
 	return nil
+}
+
+// generateStringEqHelper emits _tim_string_eq(x0=ptrA, x1=ptrB) -> x0 = 1 if the
+// two Tim strings hold the same characters, else 0. Leaf function (no calls), so
+// it needs no frame. Strings are [count][key,val pairs]; char i of a string at
+// ptr sits at ptr+16+i*16.
+func (acg *ARM64CodeGen) generateStringEqHelper() error {
+	acg.eb.MarkLabel("_tim_string_eq")
+	// countA -> x9, countB -> x10
+	if err := acg.out.LdrImm64Double("d0", "x0", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x9", "d0"); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d1", "x1", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x10", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.CmpReg64("x9", "x10"); err != nil {
+		return err
+	}
+	neqJump1 := acg.eb.text.Len()
+	acg.out.BranchCond("ne", 0) // lengths differ -> not equal
+
+	if err := acg.out.MovImm64("x11", 0); err != nil { // i = 0
+		return err
+	}
+	loopStart := acg.eb.text.Len()
+	if err := acg.out.CmpReg64("x11", "x9"); err != nil {
+		return err
+	}
+	eqJump := acg.eb.text.Len()
+	acg.out.BranchCond("ge", 0) // i >= count -> equal
+
+	if err := acg.out.LslImm64("x12", "x11", 4); err != nil { // i*16
+		return err
+	}
+	if err := acg.out.AddReg64("x13", "x0", "x12"); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d0", "x13", 16); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x14", "d0"); err != nil {
+		return err
+	}
+	if err := acg.out.AddReg64("x15", "x1", "x12"); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d1", "x15", 16); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x16", "d1"); err != nil {
+		return err
+	}
+	if err := acg.out.CmpReg64("x14", "x16"); err != nil {
+		return err
+	}
+	neqJump2 := acg.eb.text.Len()
+	acg.out.BranchCond("ne", 0) // chars differ -> not equal
+	if err := acg.out.AddImm64("x11", "x11", 1); err != nil {
+		return err
+	}
+	backPos := acg.eb.text.Len()
+	acg.out.Branch(0)
+	acg.patchJumpOffset(backPos, int32(loopStart-backPos))
+
+	// equal:
+	eqLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(eqJump, int32(eqLabel-eqJump))
+	if err := acg.out.MovImm64("x0", 1); err != nil {
+		return err
+	}
+	if err := acg.out.Return("x30"); err != nil {
+		return err
+	}
+
+	// not_equal:
+	neqLabel := acg.eb.text.Len()
+	acg.patchJumpOffset(neqJump1, int32(neqLabel-neqJump1))
+	acg.patchJumpOffset(neqJump2, int32(neqLabel-neqJump2))
+	if err := acg.out.MovImm64("x0", 0); err != nil {
+		return err
+	}
+	return acg.out.Return("x30")
 }
 
 // generateRuntimeHelpers generates ARM64 runtime helper functions
@@ -4882,12 +5918,12 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0xb7, 0x02, 0x16, 0x8b}) // add x23, x21, x22
 
 	// Calculate allocation size: x0 = 8 + x23 * 8
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x1e, 0x40, 0xd3}) // lsl x0, x23, #3 (multiply by 8)
+	acg.out.out.writer.WriteBytes([]byte{0xe0, 0xf2, 0x7d, 0xd3}) // lsl x0, x23, #3 (multiply by 8)
 	acg.out.AddImm64("x0", "x0", 8)                               // add x0, x0, #8
 
 	// Align to 16 bytes: x0 = (x0 + 15) & ~15
 	acg.out.AddImm64("x0", "x0", 15)                              // add x0, x0, #15
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x3c, 0x00, 0x92}) // and x0, x0, #0xfffffffffffffff0
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc(x0)
 	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
@@ -5018,13 +6054,13 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0xb7, 0x02, 0x16, 0x8b}) // add x23, x21, x22
 
 	// Calculate allocation size: x0 = 8 + x23 * 16 (strings use key-value pairs)
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x1e, 0x40, 0xd3}) // lsl x0, x23, #3 (multiply by 8)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x1e, 0x40, 0xd3}) // lsl x0, x0, #1 (multiply by 2, total *16)
+	acg.out.out.writer.WriteBytes([]byte{0xe0, 0xf2, 0x7d, 0xd3}) // lsl x0, x23, #3 (multiply by 8)
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf8, 0x7f, 0xd3}) // lsl x0, x0, #1 (multiply by 2, total *16)
 	acg.out.AddImm64("x0", "x0", 8)                               // add x0, x0, #8
 
 	// Align to 16 bytes
 	acg.out.AddImm64("x0", "x0", 15)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x3c, 0x00, 0x92}) // and x0, x0, #0xfffffffffffffff0
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc(x0)
 	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
@@ -5119,8 +6155,10 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	// Return result
 	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x09, 0xaa}) // mov x0, x9
 
-	// Epilogue
-	acg.out.out.writer.WriteBytes([]byte{0xf7, 0x03, 0x43, 0xa9}) // ldp x23, x0, [sp, #48]
+	// Epilogue. Restore only x23 (not the paired x0) so the result survives.
+	if err := acg.out.LdrImm64("x23", "sp", 48); err != nil { // ldr x23, [sp, #48]
+		return err
+	}
 	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x42, 0xa9}) // ldp x21, x22, [sp, #32]
 	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x41, 0xa9}) // ldp x19, x20, [sp, #16]
 	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc4, 0xa8}) // ldp x29, x30, [sp], #64
@@ -5344,11 +6382,11 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0xf4, 0x03, 0x02, 0xaa}) // mov x20, x2 (len)
 
 	// Calculate allocation size for map: 8 + len * 16
-	acg.out.out.writer.WriteBytes([]byte{0xa0, 0x1e, 0x40, 0xd3}) // lsl x0, x20, #3 (len * 8)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x1e, 0x40, 0xd3}) // lsl x0, x0, #1 (len * 16)
+	acg.out.out.writer.WriteBytes([]byte{0x80, 0xf2, 0x7d, 0xd3}) // lsl x0, x20, #3 (len * 8)
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf8, 0x7f, 0xd3}) // lsl x0, x0, #1 (len * 16)
 	acg.out.AddImm64("x0", "x0", 8)
 	acg.out.AddImm64("x0", "x0", 15)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x3c, 0x00, 0x92}) // and x0, x0, #~15
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc
 	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
@@ -6200,8 +7238,9 @@ func (acg *ARM64CodeGen) compileMemoryWrite(call *CallExpr) error {
 	if err := acg.compileExpression(call.Args[0]); err != nil {
 		return err
 	}
-	// Convert pointer from float64 to int: fmov x9, d0
-	acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x67, 0x9e})
+	// Recover the pointer into x9. C-FFI pointers (e.g. from c.malloc) use the
+	// numeric convention, so convert value->int: fcvtzs x9, d0.
+	acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x78, 0x9e})
 
 	// Save pointer to stack
 	if err := acg.out.SubImm64("sp", "sp", 16); err != nil {

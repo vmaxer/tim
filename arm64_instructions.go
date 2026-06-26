@@ -1144,9 +1144,9 @@ func (a *ARM64Out) FmaddScalar64(dest, op1, op2, acc string) error {
 		return fmt.Errorf("invalid ARM64 FP register: %s", acc)
 	}
 
-	// FMADD (scalar, double): sf=1, S=0, type=01, opcode=0000
-	// 1f000000 | (Rm<<16) | (Ra<<10) | (Rn<<5) | Rd
-	instr := uint32(0x1f000000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+	// FMADD (scalar, double): type=01 (bit 22 set) selects double precision.
+	// 1f400000 | (Rm<<16) | (Ra<<10) | (Rn<<5) | Rd
+	instr := uint32(0x1f400000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 	a.encodeInstr(instr)
 	return nil
 }
@@ -1170,8 +1170,8 @@ func (a *ARM64Out) FmsubScalar64(dest, op1, op2, acc string) error {
 		return fmt.Errorf("invalid ARM64 FP register: %s", acc)
 	}
 
-	// FMSUB (scalar, double): opcode=1000 (negate accumulator)
-	instr := uint32(0x1f008000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+	// FMSUB (scalar, double): type=01 (bit 22), o1=1 (bit 15) negates accumulator.
+	instr := uint32(0x1f408000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 	a.encodeInstr(instr)
 	return nil
 }
@@ -1195,8 +1195,8 @@ func (a *ARM64Out) FnmaddScalar64(dest, op1, op2, acc string) error {
 		return fmt.Errorf("invalid ARM64 FP register: %s", acc)
 	}
 
-	// FNMADD (scalar, double): opcode=0001 (negate product) -> bit 21 set
-	instr := uint32(0x1f200000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+	// FNMADD (scalar, double): type=01 (bit 22), o0=1 (bit 21) negates the result.
+	instr := uint32(0x1f600000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 	a.encodeInstr(instr)
 	return nil
 }
@@ -1220,8 +1220,8 @@ func (a *ARM64Out) FnmsubScalar64(dest, op1, op2, acc string) error {
 		return fmt.Errorf("invalid ARM64 FP register: %s", acc)
 	}
 
-	// FNMSUB (scalar, double): opcode=1001 (negate product and accumulator)
-	instr := uint32(0x1f208000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
+	// FNMSUB (scalar, double): type=01 (bit 22), o0=1 (bit 21), o1=1 (bit 15).
+	instr := uint32(0x1f608000) | (rm << 16) | (ra << 10) | (rn << 5) | rd
 	a.encodeInstr(instr)
 	return nil
 }
