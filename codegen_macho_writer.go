@@ -184,10 +184,22 @@ func (fc *TimCompiler) writeMachOARM64(outputPath string) error {
 	// LC_CODE_SIGNATURE
 	loadCmdsSize += uint32(binary.Size(LinkEditDataCommand{}))
 
-	// LC_LOAD_DYLIB (default to libSystem)
-	dylibPath := "/usr/lib/libSystem.B.dylib\x00"
-	dylibCmdSize := (uint32(binary.Size(LoadCommand{})+16+len(dylibPath)) + 7) &^ 7
-	loadCmdsSize += dylibCmdSize
+	// LC_LOAD_DYLIB — one per unique linked library. This MUST match WriteMachO's
+	// dylib list, otherwise textSectAddr (and every label/PC-relocation computed
+	// from it) is off by the size of the extra LC_LOAD_DYLIB commands, so closure
+	// function pointers resolve to the wrong code (e.g. when linking libSDL3).
+	uniqueLibs := make(map[string]bool)
+	for _, libPath := range fc.eb.functionLibraries {
+		uniqueLibs[libPath] = true
+	}
+	if len(uniqueLibs) == 0 {
+		uniqueLibs["/usr/lib/libSystem.B.dylib"] = true
+	}
+	for libPath := range uniqueLibs {
+		dylibPathWithNull := libPath + "\x00"
+		dylibCmdSize := (uint32(binary.Size(LoadCommand{})+16+len(dylibPathWithNull)) + 7) &^ 7
+		loadCmdsSize += dylibCmdSize
+	}
 
 	// LC_DYSYMTAB
 	loadCmdsSize += uint32(binary.Size(DysymtabCommand{}))

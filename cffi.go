@@ -589,19 +589,30 @@ func evalSimpleExpression(expr string, constants *CHeaderConstants) (int64, bool
 func parseValue(s string, constants *CHeaderConstants) (int64, bool) {
 	s = strings.TrimSpace(s)
 
-	// Try hex
-	if strings.HasPrefix(s, "0x") || strings.HasPrefix(s, "0X") {
-		if v, err := strconv.ParseInt(s[2:], 16, 64); err == nil {
+	// Strip C integer-literal suffixes (u/U/l/L and combinations, e.g. the `u`
+	// in `0x16362004u`); without this, hex/decimal parsing fails and enum values
+	// silently fall back to a sequential index.
+	core := strings.TrimRight(s, "uUlL")
+
+	// Try hex (signed first, then unsigned for values like 0xFFFFFFFF).
+	if strings.HasPrefix(core, "0x") || strings.HasPrefix(core, "0X") {
+		if v, err := strconv.ParseInt(core[2:], 16, 64); err == nil {
 			return v, true
+		}
+		if v, err := strconv.ParseUint(core[2:], 16, 64); err == nil {
+			return int64(v), true
 		}
 	}
 
-	// Try decimal
-	if v, err := strconv.ParseInt(s, 10, 64); err == nil {
+	// Try decimal (signed, then unsigned).
+	if v, err := strconv.ParseInt(core, 10, 64); err == nil {
 		return v, true
 	}
+	if v, err := strconv.ParseUint(core, 10, 64); err == nil {
+		return int64(v), true
+	}
 
-	// Try constant reference
+	// Try constant reference (use the original spelling, not suffix-stripped).
 	if val, ok := constants.Constants[s]; ok {
 		return val, true
 	}

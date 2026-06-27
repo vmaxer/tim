@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"maps"
 	"os"
 	"slices"
 	"strconv"
@@ -12,31 +13,34 @@ import (
 
 // ARM64CodeGen handles ARM64 code generation for macOS
 type ARM64CodeGen struct {
-	out               *ARM64Out
-	eb                *ExecutableBuilder
-	stackVars         map[string]int               // variable name -> stack offset from fp
-	mutableVars       map[string]bool              // variable name -> is mutable
-	lambdaVars        map[string]bool              // variable name -> is callable function (has signature)
-	varTypes          map[string]string            // variable name -> type (for type tracking)
-	stackSize         int                          // current stack size
-	stackFrameSize    uint64                       // total stack frame size allocated in prologue
-	stringCounter     int                          // counter for string labels
-	stringInterns     map[string]string            // string value -> label (for string interning)
-	labelCounter      int                          // counter for jump labels
-	activeLoops       []ARM64LoopInfo              // stack of active loops for break/continue
-	lambdaFuncs       []ARM64LambdaFunc            // list of lambda functions to generate
-	lambdaCounter     int                          // counter for lambda names
-	currentLambda     *ARM64LambdaFunc             // current lambda being compiled (for recursion)
-	cConstants        map[string]*CHeaderConstants // C constants from imports
-	currentArena      int                          // Arena depth (0=none, 1=first arena, 2=nested, etc.)
-	usesArenas        bool                         // Track if program uses any arena blocks
-	currentAssignName string                       // Name of variable being assigned (for lambda self-reference)
-	deferredExprs     [][]Expression               // Stack of deferred expressions per scope (LIFO order)
-	globalSlots       map[string]int               // module-global var name -> slot index in the x28 globals array
-	globalMutable     map[string]bool              // module-global var name -> is mutable
-	cstructs          map[string]*CStructDecl      // cstruct name -> declaration (field layout)
-	varCStructType    map[string]string            // variable name -> cstruct type it points at
-	closurePtrOffset  int32                        // frame offset where the current lambda's closure pointer (x9) is saved
+	out                *ARM64Out
+	eb                 *ExecutableBuilder
+	stackVars          map[string]int               // variable name -> stack offset from fp
+	mutableVars        map[string]bool              // variable name -> is mutable
+	lambdaVars         map[string]bool              // variable name -> is callable function (has signature)
+	varTypes           map[string]string            // variable name -> type (for type tracking)
+	stackSize          int                          // current stack size
+	stackFrameSize     uint64                       // total stack frame size allocated in prologue
+	stringCounter      int                          // counter for string labels
+	stringInterns      map[string]string            // string value -> label (for string interning)
+	labelCounter       int                          // counter for jump labels
+	activeLoops        []ARM64LoopInfo              // stack of active loops for break/continue
+	lambdaFuncs        []ARM64LambdaFunc            // list of lambda functions to generate
+	lambdaCounter      int                          // counter for lambda names
+	currentLambda      *ARM64LambdaFunc             // current lambda being compiled (for recursion)
+	cConstants         map[string]*CHeaderConstants // C constants from imports
+	currentArena       int                          // Arena depth (0=none, 1=first arena, 2=nested, etc.)
+	usesArenas         bool                         // Track if program uses any arena blocks
+	currentAssignName  string                       // Name of variable being assigned (for lambda self-reference)
+	deferredExprs      [][]Expression               // Stack of deferred expressions per scope (LIFO order)
+	globalSlots        map[string]int               // module-global var name -> slot index in the x28 globals array
+	globalMutable      map[string]bool              // module-global var name -> is mutable
+	cstructs           map[string]*CStructDecl      // cstruct name -> declaration (field layout)
+	varCStructType     map[string]string            // variable name -> cstruct type it points at
+	closurePtrOffset   int32                        // frame offset where the current lambda's closure pointer (x9) is saved
+	boxedVars          map[string]bool              // names that live in a heap cell in the current scope (captured-and-mutated locals)
+	returnsClosure     map[string]bool              // lambda-var name -> its body evaluates to a closure (so `g = f(x); g()` invokes it)
+	funcReturnsCStruct map[string]string            // lambda-var name -> cstruct type its body returns (so `p = vadd(a,b)` is typed)
 }
 
 // ARM64LambdaFunc represents a lambda function for ARM64
@@ -48,7 +52,11 @@ type ARM64LambdaFunc struct {
 	FuncStart   int      // Position where function starts (including prologue, for recursion)
 	VarName     string   // Variable name this lambda is assigned to (for recursion)
 	IsRecursive bool     // Whether this lambda calls itself recursively
-	Captures    []string // Names captured by value from the enclosing scope (closure env order)
+	Captures    []string // Names captured from the enclosing scope (closure env order)
+	// BoxedCaptures marks which of Captures are boxed: the env slot holds a heap
+	// cell pointer (by reference) rather than a value, so the lambda can mutate
+	// the captured variable and have it persist (the make_counter pattern).
+	BoxedCaptures map[string]bool
 }
 
 // ARM64LoopInfo tracks information about an active loop
@@ -69,21 +77,250 @@ type ARM64LoopInfo struct {
 func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConstants) *ARM64CodeGen {
 	// Use the target from ExecutableBuilder (which has the correct OS)
 	return &ARM64CodeGen{
-		out:            &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
-		eb:             eb,
-		stackVars:      make(map[string]int),
-		mutableVars:    make(map[string]bool),
-		lambdaVars:     make(map[string]bool),
-		varTypes:       make(map[string]string),
-		stackSize:      0,
-		stringCounter:  0,
-		stringInterns:  make(map[string]string),
-		labelCounter:   0,
-		cConstants:     cConstants,
-		globalSlots:    make(map[string]int),
-		globalMutable:  make(map[string]bool),
-		cstructs:       make(map[string]*CStructDecl),
-		varCStructType: make(map[string]string),
+		out:                &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
+		eb:                 eb,
+		stackVars:          make(map[string]int),
+		mutableVars:        make(map[string]bool),
+		lambdaVars:         make(map[string]bool),
+		varTypes:           make(map[string]string),
+		stackSize:          0,
+		stringCounter:      0,
+		stringInterns:      make(map[string]string),
+		labelCounter:       0,
+		cConstants:         cConstants,
+		globalSlots:        make(map[string]int),
+		globalMutable:      make(map[string]bool),
+		cstructs:           make(map[string]*CStructDecl),
+		varCStructType:     make(map[string]string),
+		boxedVars:          make(map[string]bool),
+		returnsClosure:     make(map[string]bool),
+		funcReturnsCStruct: make(map[string]string),
+	}
+}
+
+// cStructTypeOf returns the cstruct type name that an expression evaluates to, or
+// "" if it is not a (known) cstruct value. Recognizes `as Struct` casts, struct
+// constructors `Struct(...)`, calls to functions known to return a struct, and
+// identifiers already tracked as struct-typed.
+func (acg *ARM64CodeGen) cStructTypeOf(expr Expression) string {
+	switch e := expr.(type) {
+	case *CastExpr:
+		if _, ok := acg.cstructs[e.Type]; ok {
+			return e.Type
+		}
+	case *CallExpr:
+		if _, ok := acg.cstructs[e.Function]; ok {
+			return e.Function
+		}
+		if t, ok := acg.funcReturnsCStruct[e.Function]; ok {
+			return t
+		}
+	case *IdentExpr:
+		if t, ok := acg.varCStructType[e.Name]; ok {
+			return t
+		}
+	}
+	return ""
+}
+
+// lambdaReturnCStructType returns the cstruct type a lambda body evaluates to
+// (its last expression), or "" — used so `vadd = (a,b)->{...Point(...)}` lets
+// `p = vadd(a,b)` know p is a Point.
+func (acg *ARM64CodeGen) lambdaReturnCStructType(body Expression) string {
+	last := body
+	if b, ok := body.(*BlockExpr); ok {
+		if len(b.Statements) == 0 {
+			return ""
+		}
+		switch s := b.Statements[len(b.Statements)-1].(type) {
+		case *ExpressionStmt:
+			last = s.Expr
+		case *JumpStmt:
+			last = s.Value
+		default:
+			return ""
+		}
+	}
+	if last == nil {
+		return ""
+	}
+	return acg.cStructTypeOf(last)
+}
+
+// isLambdaValue reports whether expr is a lambda literal in any of its forms.
+func isLambdaValue(expr Expression) bool {
+	switch expr.(type) {
+	case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+		return true
+	}
+	return false
+}
+
+// lambdaBodyReturnsClosure reports whether a lambda whose body is `body`
+// evaluates to a closure — its value (the body itself, or the last expression of
+// a block) is a lambda. This lets `g = make_counter(0)` mark g as callable so
+// `g()` invokes the returned closure rather than yielding its value.
+func lambdaBodyReturnsClosure(body Expression) bool {
+	if isLambdaValue(body) {
+		return true
+	}
+	if blk, ok := body.(*BlockExpr); ok && len(blk.Statements) > 0 {
+		switch s := blk.Statements[len(blk.Statements)-1].(type) {
+		case *ExpressionStmt:
+			return isLambdaValue(s.Expr)
+		case *JumpStmt:
+			return s.Value != nil && isLambdaValue(s.Value)
+		}
+	}
+	return false
+}
+
+// markIfClosure records that variable `name` holds a callable closure when its
+// initializer is a lambda, a call to a closure-returning function, or an alias of
+// another closure variable. Tracking this is what makes a closure stored in a
+// variable invocable with zero arguments (e.g. counter()).
+func (acg *ARM64CodeGen) markIfClosure(name string, value Expression) {
+	switch v := value.(type) {
+	case *LambdaExpr:
+		acg.lambdaVars[name] = true
+		acg.returnsClosure[name] = lambdaBodyReturnsClosure(v.Body)
+		if ct := acg.lambdaReturnCStructType(v.Body); ct != "" {
+			acg.funcReturnsCStruct[name] = ct
+		}
+	case *PatternLambdaExpr, *MultiLambdaExpr:
+		acg.lambdaVars[name] = true
+	case *CallExpr:
+		if acg.returnsClosure[v.Function] {
+			acg.lambdaVars[name] = true
+		}
+	case *IdentExpr:
+		if acg.lambdaVars[v.Name] {
+			acg.lambdaVars[name] = true
+			acg.returnsClosure[name] = acg.returnsClosure[v.Name]
+		}
+	}
+}
+
+// boxedCaptureVars returns the names that the function whose body is `body` must
+// heap-box: variables that some nested lambda updates via `<-` and captures from
+// the enclosing scope. Boxing gives them a shared heap cell so a closure's
+// mutation persists and is visible across calls (the canonical make_counter
+// pattern). Read-only captures are unaffected (still captured by value).
+func boxedCaptureVars(body Expression) map[string]bool {
+	out := make(map[string]bool)
+	forEachChildLambda(body, func(lam *LambdaExpr) {
+		bound := make(map[string]bool)
+		for _, p := range lam.Params {
+			bound[p] = true
+		}
+		collectUpdatedFreeVars(lam.Body, bound, out)
+	})
+	return out
+}
+
+// forEachChildLambda walks expr and calls fn for each lambda nested within it,
+// without descending into the lambdas' own bodies (so fn receives the immediate
+// child lambdas; deeper nesting is handled by the recursion in
+// collectUpdatedFreeVars, which tracks the correct bound names per level).
+func forEachChildLambda(expr Expression, fn func(*LambdaExpr)) {
+	switch e := expr.(type) {
+	case *LambdaExpr:
+		fn(e)
+	case *BlockExpr:
+		for _, stmt := range e.Statements {
+			switch s := stmt.(type) {
+			case *AssignStmt:
+				forEachChildLambda(s.Value, fn)
+			case *ExpressionStmt:
+				forEachChildLambda(s.Expr, fn)
+			case *JumpStmt:
+				if s.Value != nil {
+					forEachChildLambda(s.Value, fn)
+				}
+			}
+		}
+	case *BinaryExpr:
+		forEachChildLambda(e.Left, fn)
+		forEachChildLambda(e.Right, fn)
+	case *CallExpr:
+		for _, a := range e.Args {
+			forEachChildLambda(a, fn)
+		}
+	case *MatchExpr:
+		forEachChildLambda(e.Condition, fn)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				forEachChildLambda(c.Guard, fn)
+			}
+			forEachChildLambda(c.Result, fn)
+		}
+		if e.DefaultExpr != nil {
+			forEachChildLambda(e.DefaultExpr, fn)
+		}
+	case *JumpExpr:
+		if e.Value != nil {
+			forEachChildLambda(e.Value, fn)
+		}
+	}
+}
+
+// collectUpdatedFreeVars records, into out, the names that expr updates via `<-`
+// that are not bound within expr (i.e. free variables it mutates). bound tracks
+// names introduced by params and `:=` declarations as the walk descends; nested
+// lambdas extend bound with their own params.
+func collectUpdatedFreeVars(expr Expression, bound map[string]bool, out map[string]bool) {
+	switch e := expr.(type) {
+	case *BlockExpr:
+		local := make(map[string]bool)
+		maps.Copy(local, bound)
+		for _, stmt := range e.Statements {
+			switch s := stmt.(type) {
+			case *AssignStmt:
+				collectUpdatedFreeVars(s.Value, local, out)
+				if s.IsUpdate {
+					if !local[s.Name] {
+						out[s.Name] = true
+					}
+				} else {
+					local[s.Name] = true
+				}
+			case *ExpressionStmt:
+				collectUpdatedFreeVars(s.Expr, local, out)
+			case *JumpStmt:
+				if s.Value != nil {
+					collectUpdatedFreeVars(s.Value, local, out)
+				}
+			}
+		}
+	case *LambdaExpr:
+		inner := make(map[string]bool)
+		maps.Copy(inner, bound)
+		for _, p := range e.Params {
+			inner[p] = true
+		}
+		collectUpdatedFreeVars(e.Body, inner, out)
+	case *BinaryExpr:
+		collectUpdatedFreeVars(e.Left, bound, out)
+		collectUpdatedFreeVars(e.Right, bound, out)
+	case *CallExpr:
+		for _, a := range e.Args {
+			collectUpdatedFreeVars(a, bound, out)
+		}
+	case *MatchExpr:
+		collectUpdatedFreeVars(e.Condition, bound, out)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				collectUpdatedFreeVars(c.Guard, bound, out)
+			}
+			collectUpdatedFreeVars(c.Result, bound, out)
+		}
+		if e.DefaultExpr != nil {
+			collectUpdatedFreeVars(e.DefaultExpr, bound, out)
+		}
+	case *JumpExpr:
+		if e.Value != nil {
+			collectUpdatedFreeVars(e.Value, bound, out)
+		}
 	}
 }
 
@@ -121,6 +358,59 @@ func (acg *ARM64CodeGen) computeCaptures(body Expression, params []string) []str
 	}
 	slices.Sort(caps)
 	return caps
+}
+
+// emitLoadBoxCellPtr loads the heap cell pointer of boxed variable `name` into
+// the given GP register. The pointer lives either in the variable's stack slot
+// (a boxed local) or in the closure env (a boxed capture, by reference).
+func (acg *ARM64CodeGen) emitLoadBoxCellPtr(name, reg string) error {
+	if so, ok := acg.stackVars[name]; ok && so != -1 {
+		return acg.out.LdrImm64(reg, "x29", int32(16+so-8))
+	}
+	if acg.currentLambda != nil {
+		if idx := slices.Index(acg.currentLambda.Captures, name); idx >= 0 {
+			if err := acg.out.LdrImm64(reg, "x29", acg.closurePtrOffset); err != nil {
+				return err
+			}
+			return acg.out.LdrImm64(reg, reg, int32(8+idx*8))
+		}
+	}
+	return fmt.Errorf("boxed variable '%s' not found in scope", name)
+}
+
+// emitStoreBoxedVar stores the value currently in d0 through the heap cell of
+// boxed variable `name` (used for `<-` updates of a boxed local or capture).
+func (acg *ARM64CodeGen) emitStoreBoxedVar(name string) error {
+	if err := acg.emitLoadBoxCellPtr(name, "x10"); err != nil {
+		return err
+	}
+	return acg.out.StrImm64Double("d0", "x10", 0)
+}
+
+// emitBoxedDeclaration allocates a heap cell for a new boxed local, stores the
+// value in d0 into it, and writes the cell pointer into the variable's stack
+// slot at slotOffset (relative to x29). The slot then holds a shared pointer
+// that nested closures capture by reference.
+func (acg *ARM64CodeGen) emitBoxedDeclaration(slotOffset int32) error {
+	// Spill the value across the malloc call (malloc may clobber d0).
+	acg.out.SubImm64("sp", "sp", 16)
+	if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x0", 8); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
+		return err
+	}
+	acg.out.AddImm64("sp", "sp", 16)
+	if err := acg.out.StrImm64Double("d0", "x0", 0); err != nil { // cell[0] = value
+		return err
+	}
+	return acg.out.StrImm64("x0", "x29", slotOffset) // slot = cell pointer
 }
 
 // collectGlobals identifies module-level variables that are captured by a lambda
@@ -180,6 +470,11 @@ func (acg *ARM64CodeGen) collectGlobals(program *Program) {
 
 // CompileProgram compiles a Tim program to ARM64
 func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
+	// Register cstruct layouts up front so constructors, field access, and
+	// return-type inference work regardless of statement order (the per-stmt
+	// CStructDecl case still records any declared inline as well).
+	maps.Copy(acg.cstructs, program.CStructs)
+
 	// Initialize arena tracking
 	acg.currentArena = 1 // Start at 1 to enable default global arena
 
@@ -217,6 +512,30 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 			return err
 		}
 		if err := acg.out.MovReg64("x28", "x0"); err != nil {
+			return err
+		}
+	}
+
+	// Bump arena for cstruct values: x27 = current top, x26 = limit. cstruct
+	// constructors bump x27 instead of calling malloc, and `arena { }` frees a
+	// scope's allocations by restoring x27. The buffer is overcommitted (pages are
+	// lazy), so the reservation is cheap. x26/x27 are callee-saved, so they
+	// survive every libc/SDL/lambda call. Only set up when the program uses
+	// cstructs (the only bump-arena consumer).
+	if len(program.CStructs) > 0 {
+		if err := acg.out.MovImm64("x0", arenaBumpSize); err != nil {
+			return err
+		}
+		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+			return err
+		}
+		if err := acg.out.MovReg64("x27", "x0"); err != nil { // top = base
+			return err
+		}
+		if err := acg.out.MovImm64("x1", arenaBumpSize); err != nil {
+			return err
+		}
+		if err := acg.out.AddReg64("x26", "x27", "x1"); err != nil { // limit = base + size
 			return err
 		}
 	}
@@ -717,6 +1036,100 @@ func (acg *ARM64CodeGen) emitCStructFieldStore(f *CStructField) error {
 	return nil
 }
 
+// arenaBumpSize is the size of the cstruct bump-arena buffer reserved at startup
+// (1 GiB). It is overcommitted, so only pages actually touched cost memory; it
+// must comfortably hold the live allocations of one `arena { }` scope.
+const arenaBumpSize = 0x40000000
+
+// emitBumpAlloc allocates `size` bytes (rounded up to 16) from the x27 bump arena,
+// leaving the pointer in x0. On overflow it falls back to malloc (so correctness
+// never depends on the arena being large enough — only memory reuse does).
+func (acg *ARM64CodeGen) emitBumpAlloc(size int) error {
+	rounded := (size + 15) &^ 15
+	if err := acg.out.MovReg64("x0", "x27"); err != nil { // x0 = current top
+		return err
+	}
+	if rounded <= 4095 {
+		if err := acg.out.AddImm64("x1", "x27", uint32(rounded)); err != nil {
+			return err
+		}
+	} else {
+		if err := acg.out.MovImm64("x1", uint64(rounded)); err != nil {
+			return err
+		}
+		if err := acg.out.AddReg64("x1", "x27", "x1"); err != nil {
+			return err
+		}
+	}
+	// cmp x1, x26  (subs xzr, x1, x26)
+	cmp := uint32(0xEB000000) | (26 << 16) | (1 << 5) | 31
+	acg.out.out.writer.WriteBytes([]byte{byte(cmp), byte(cmp >> 8), byte(cmp >> 16), byte(cmp >> 24)})
+	fbJump := acg.eb.text.Len()
+	if err := acg.out.BranchCond("hi", 0); err != nil { // overflow -> fall back to malloc
+		return err
+	}
+	if err := acg.out.MovReg64("x27", "x1"); err != nil { // commit new top
+		return err
+	}
+	doneJump := acg.eb.text.Len()
+	if err := acg.out.Branch(0); err != nil {
+		return err
+	}
+	fbPos := acg.eb.text.Len()
+	acg.patchJumpOffset(fbJump, int32(fbPos-fbJump))
+	if err := acg.out.MovImm64("x0", uint64(size)); err != nil {
+		return err
+	}
+	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		return err
+	}
+	donePos := acg.eb.text.Len()
+	acg.patchJumpOffset(doneJump, int32(donePos-doneJump))
+	return nil
+}
+
+// compileCStructConstructor compiles a cstruct value constructor, e.g.
+// `Point(3.0, 4.0)`: allocate the struct, store each argument into its field,
+// and yield a numeric pointer to the value (the convention cstruct field access
+// expects). A field whose type is itself a cstruct receives another struct
+// pointer (stored as an 8-byte pointer), so nested structs compose.
+func (acg *ARM64CodeGen) compileCStructConstructor(decl *CStructDecl, args []Expression) error {
+	if len(args) != len(decl.Fields) {
+		return fmt.Errorf("%s constructor expects %d arguments, got %d", decl.Name, len(decl.Fields), len(args))
+	}
+	size := decl.Size
+	if size <= 0 {
+		size = len(decl.Fields) * 8
+	}
+	// Allocate the struct value from the bump arena (freed by the enclosing
+	// `arena { }`), falling back to malloc on overflow.
+	if err := acg.emitBumpAlloc(size); err != nil {
+		return err
+	}
+	// Spill the struct pointer so it survives compiling each field value.
+	acg.out.SubImm64("sp", "sp", 16)
+	if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+	for i := range decl.Fields {
+		if err := acg.compileExpression(args[i]); err != nil { // value in d0
+			return err
+		}
+		if err := acg.out.LdrImm64("x9", "sp", 0); err != nil { // struct pointer
+			return err
+		}
+		if err := acg.emitCStructFieldStore(&decl.Fields[i]); err != nil {
+			return err
+		}
+	}
+	if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+	acg.out.AddImm64("sp", "sp", 16)
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0 (numeric ptr)
+	return nil
+}
+
 // emitMapValueSlotAddr searches a map/string for key x1 (pointer in x0) and
 // leaves the address of its value slot in x7, or 0 if the key is absent. Same
 // layout as emitMapKeyLookup.
@@ -937,11 +1350,14 @@ func (acg *ARM64CodeGen) compileArenaStmt(stmt *ArenaStmt) error {
 	// Save previous arena context and increment depth
 	previousArena := acg.currentArena
 	acg.currentArena++
-	arenaDepth := acg.currentArena
 
-	// Note: Arena setup is simplified for ARM64
-	// alloc() will call malloc() directly
-	_ = arenaDepth // Mark as used
+	// Save the bump-arena top (x27) so it can be restored when the block exits,
+	// freeing every cstruct value allocated within it.
+	acg.stackSize += 8
+	arenaSaveSlot := int32(16 + acg.stackSize - 8)
+	if err := acg.out.StrImm64("x27", "x29", arenaSaveSlot); err != nil {
+		return err
+	}
 
 	// Push defer scope for arena
 	acg.pushDeferScope()
@@ -961,8 +1377,10 @@ func (acg *ARM64CodeGen) compileArenaStmt(stmt *ArenaStmt) error {
 	// Restore previous arena context
 	acg.currentArena = previousArena
 
-	// Note: Arena cleanup is simplified for ARM64
-	// Memory will be freed when alloc() calls malloc() on next arena block
+	// Restore the bump-arena top — frees this scope's cstruct allocations.
+	if err := acg.out.LdrImm64("x27", "x29", arenaSaveSlot); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1087,6 +1505,13 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 					if err := acg.out.LdrImm64("x9", "x29", acg.closurePtrOffset); err != nil {
 						return err
 					}
+					if acg.boxedVars[e.Name] {
+						// Boxed capture: the env slot holds a cell pointer; deref it.
+						if err := acg.out.LdrImm64("x9", "x9", int32(8+idx*8)); err != nil {
+							return err
+						}
+						return acg.out.LdrImm64Double("d0", "x9", 0)
+					}
 					return acg.out.LdrImm64Double("d0", "x9", int32(8+idx*8))
 				}
 			}
@@ -1098,6 +1523,13 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		// ldr d0, [x29, #offset]
 		// x29 points to saved fp location, variables start at offset 16
 		offset := int32(16 + stackOffset - 8)
+		if acg.boxedVars[e.Name] {
+			// Boxed local: the slot holds a cell pointer; deref it.
+			if err := acg.out.LdrImm64("x9", "x29", offset); err != nil {
+				return err
+			}
+			return acg.out.LdrImm64Double("d0", "x9", 0)
+		}
 		if err := acg.out.LdrImm64Double("d0", "x29", offset); err != nil {
 			return err
 		}
@@ -1670,6 +2102,61 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 
 	case *ListExpr:
 		// Lists are stored as: [count][elem0][elem1]...
+		// If every element is a number literal we can emit the whole thing as
+		// static rodata. Otherwise we build it on the heap at runtime, evaluating
+		// each element expression (e.g. struct constructors or variables).
+		allNumbers := true
+		for _, elem := range e.Elements {
+			if _, ok := elem.(*NumberExpr); !ok {
+				allNumbers = false
+				break
+			}
+		}
+
+		if !allNumbers {
+			n := len(e.Elements)
+			if err := acg.out.MovImm64("x0", uint64((n+1)*8)); err != nil {
+				return err
+			}
+			if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+				return err
+			}
+			// Spill the base pointer across element evaluation.
+			acg.out.SubImm64("sp", "sp", 16)
+			if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+				return err
+			}
+			// Store the count (as float64) at [base].
+			if err := acg.out.MovImm64("x1", uint64(n)); err != nil {
+				return err
+			}
+			if err := acg.out.ScvtfInt64ToDouble("d0", "x1"); err != nil {
+				return err
+			}
+			if err := acg.out.LdrImm64("x9", "sp", 0); err != nil {
+				return err
+			}
+			if err := acg.out.StrImm64Double("d0", "x9", 0); err != nil {
+				return err
+			}
+			for i, elem := range e.Elements {
+				if err := acg.compileExpression(elem); err != nil { // value in d0
+					return err
+				}
+				if err := acg.out.LdrImm64("x9", "sp", 0); err != nil {
+					return err
+				}
+				if err := acg.out.StrImm64Double("d0", "x9", int32(8+i*8)); err != nil {
+					return err
+				}
+			}
+			if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
+				return err
+			}
+			acg.out.AddImm64("sp", "sp", 16)
+			return acg.out.ScvtfInt64ToDouble("d0", "x0") // numeric pointer
+		}
+
 		// For now, store list data in rodata
 		labelName := fmt.Sprintf("list_%d", acg.stringCounter)
 		acg.stringCounter++
@@ -1684,16 +2171,13 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			listData = append(listData, byte((countBits>>(i*8))&0xFF))
 		}
 
-		// Elements (for now, only support number literals)
+		// Elements (number literals)
 		for _, elem := range e.Elements {
-			if numExpr, ok := elem.(*NumberExpr); ok {
-				elemBits := uint64(0)
-				*(*float64)(unsafe.Pointer(&elemBits)) = numExpr.Value
-				for i := range 8 {
-					listData = append(listData, byte((elemBits>>(i*8))&0xFF))
-				}
-			} else {
-				return fmt.Errorf("unsupported list element type for ARM64: %T", elem)
+			numExpr := elem.(*NumberExpr)
+			elemBits := uint64(0)
+			*(*float64)(unsafe.Pointer(&elemBits)) = numExpr.Value
+			for i := range 8 {
+				listData = append(listData, byte((elemBits>>(i*8))&0xFF))
 			}
 		}
 
@@ -1844,6 +2328,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			VarName:  acg.currentAssignName, // Store variable name for self-recursion
 			Captures: caps,
 		})
+		lambdaIdx := len(acg.lambdaFuncs) - 1
 
 		// Allocate the closure object: 8 (func ptr) + 8*len(caps).
 		if err := acg.out.MovImm64("x0", uint64(8+len(caps)*8)); err != nil {
@@ -1868,6 +2353,24 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			return err
 		}
 		for i, name := range caps {
+			if acg.boxedVars[name] {
+				// Captured by reference: the env slot holds the shared cell
+				// pointer so the closure's mutations persist and are visible.
+				if err := acg.emitLoadBoxCellPtr(name, "x11"); err != nil {
+					return err
+				}
+				if err := acg.out.LdrImm64("x9", "sp", 0); err != nil {
+					return err
+				}
+				if err := acg.out.StrImm64("x11", "x9", int32(8+i*8)); err != nil {
+					return err
+				}
+				if acg.lambdaFuncs[lambdaIdx].BoxedCaptures == nil {
+					acg.lambdaFuncs[lambdaIdx].BoxedCaptures = make(map[string]bool)
+				}
+				acg.lambdaFuncs[lambdaIdx].BoxedCaptures[name] = true
+				continue
+			}
 			if err := acg.compileExpression(&IdentExpr{Name: name}); err != nil {
 				return err
 			}
@@ -2359,10 +2862,7 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 			return err
 		}
 		acg.currentAssignName = oldName
-		switch assign.Value.(type) {
-		case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
-			acg.lambdaVars[assign.Name] = true
-		}
+		acg.markIfClosure(assign.Name, assign.Value)
 		acg.varTypes[assign.Name] = acg.getExprType(assign.Value)
 		return acg.out.StrImm64Double("d0", "x28", int32(slot*8))
 	}
@@ -2371,12 +2871,17 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 	_, exists := acg.stackVars[assign.Name]
 	isMutable := acg.mutableVars[assign.Name]
 
+	// A nested closure updating a variable it captured by reference: the name is
+	// not a local of this lambda but is one of its boxed captures.
+	isBoxedCaptureUpdate := assign.IsUpdate && !exists && acg.boxedVars[assign.Name] &&
+		acg.currentLambda != nil && slices.Contains(acg.currentLambda.Captures, assign.Name)
+
 	if assign.IsUpdate {
 		// <- Update existing mutable variable
-		if !exists {
+		if !exists && !isBoxedCaptureUpdate {
 			return fmt.Errorf("cannot update undefined variable '%s'", assign.Name)
 		}
-		if !isMutable {
+		if exists && !isMutable {
 			return fmt.Errorf("cannot update immutable variable '%s' (use <- only for mutable variables)", assign.Name)
 		}
 	} else if assign.Mutable {
@@ -2405,6 +2910,14 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 
 	// Restore previous assignment context
 	acg.currentAssignName = oldAssignName
+
+	// Boxed variables live in a heap cell shared with nested closures: store the
+	// value through the cell pointer rather than into the stack slot directly.
+	// This covers both `<-` updates of a boxed local and a closure updating a
+	// boxed capture by reference.
+	if assign.IsUpdate && (isBoxedCaptureUpdate || acg.boxedVars[assign.Name]) {
+		return acg.emitStoreBoxedVar(assign.Name)
+	}
 
 	var offset int32
 	if assign.IsUpdate {
@@ -2435,19 +2948,22 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 			}
 			// Track the type of the value being assigned
 			acg.varTypes[assign.Name] = acg.getExprType(assign.Value)
-			// Track if this is a lambda/function
-			switch assign.Value.(type) {
-			case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
-				acg.lambdaVars[assign.Name] = true
-			}
-			// Track cstruct-typed pointers (e.g. `p := malloc(n) as Point`).
-			if cast, ok := assign.Value.(*CastExpr); ok {
-				if _, isStruct := acg.cstructs[cast.Type]; isStruct {
-					acg.varCStructType[assign.Name] = cast.Type
-				}
+			// Track if this is a lambda/function (or a variable holding a closure
+			// returned from a call) so it can be invoked, including with no args.
+			acg.markIfClosure(assign.Name, assign.Value)
+			// Track cstruct-typed pointers (e.g. `p := malloc(n) as Point`,
+			// `p = Point(...)`, or `p = f(...)` where f returns a cstruct).
+			if ct := acg.cStructTypeOf(assign.Value); ct != "" {
+				acg.varCStructType[assign.Name] = ct
 			}
 			// x29 points to saved fp location, variables start at offset 16
 			offset = int32(16 + acg.stackSize - 8)
+
+			// A new mutable local that a nested closure mutates is boxed: its
+			// slot holds a heap cell pointer instead of the value.
+			if acg.boxedVars[assign.Name] {
+				return acg.emitBoxedDeclaration(offset)
+			}
 		}
 	}
 
@@ -2786,6 +3302,11 @@ func (acg *ARM64CodeGen) compileParallelExpr(expr *ParallelExpr) error {
 // compileCall compiles a function call
 // Confidence that this function is working: 75%
 func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
+	// CStruct value constructor: Point(x, y, ...) allocates the struct value.
+	if decl, ok := acg.cstructs[call.Function]; ok {
+		return acg.compileCStructConstructor(decl, call.Args)
+	}
+
 	// Check if this is a namespaced call (e.g., sdl.SDL_Init, c.sin)
 	if strings.Contains(call.Function, ".") {
 		parts := strings.SplitN(call.Function, ".", 2)
@@ -2983,6 +3504,16 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 			sig := &CFunctionSignature{
 				ReturnType: "double",
 				Params:     []CFunctionParam{{Type: "double", Name: "x"}},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "pow", "atan2", "fmod", "hypot", "copysign", "fdim", "fmax", "fmin", "nextafter":
+			// Two-argument libm functions: double f(double, double)
+			sig := &CFunctionSignature{
+				ReturnType: "double",
+				Params: []CFunctionParam{
+					{Type: "double", Name: "x"},
+					{Type: "double", Name: "y"},
+				},
 			}
 			return acg.compileCFunctionCall(call.Function, call.Args, sig)
 		case "malloc":
@@ -3512,6 +4043,19 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 		return err
 	}
 
+	// Save sp at loop entry so break/continue can restore it. A jump out of the
+	// body from inside a partially-pushed expression (e.g. `cond { ret @ }`, which
+	// pushes the match condition) would otherwise leave sp below entry and corrupt
+	// the function epilogue.
+	acg.stackSize += 8
+	spSlot := int32(16 + acg.stackSize - 8)
+	if err := acg.out.AddImm64("x16", "sp", 0); err != nil { // x16 = sp
+		return err
+	}
+	if err := acg.out.StrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+
 	// Loop start label
 	loopStartPos := acg.eb.text.Len()
 
@@ -3567,6 +4111,15 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 	continuePos := acg.eb.text.Len()
 	acg.activeLoops[len(acg.activeLoops)-1].ContinuePos = continuePos
 
+	// Restore sp to its loop-entry value (no-op on normal fallthrough; corrects a
+	// `continue` that jumped out of a partially-pushed expression).
+	if err := acg.out.LdrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("sp", "x16", 0); err != nil { // sp = x16
+		return err
+	}
+
 	// Patch all continue jumps to point here
 	for _, patchPos := range acg.activeLoops[len(acg.activeLoops)-1].ContinuePatches {
 		offset := int32(continuePos - patchPos)
@@ -3597,8 +4150,15 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 	backOffset := int32(loopStartPos - loopBackJumpPos)
 	acg.out.Branch(backOffset)
 
-	// Loop end label
+	// Loop end label — restore sp here so a `break` (`ret @`) that left sp below
+	// the loop-entry value can't corrupt the function epilogue.
 	loopEndPos := acg.eb.text.Len()
+	if err := acg.out.LdrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("sp", "x16", 0); err != nil { // sp = x16
+		return err
+	}
 
 	// Patch all end jumps
 	for _, patchPos := range acg.activeLoops[len(acg.activeLoops)-1].EndPatches {
@@ -4091,6 +4651,37 @@ func (acg *ARM64CodeGen) emitWriteFloat(precision int, fd uint64, trim bool) err
 	if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil { // save value
 		return err
 	}
+
+	// Leading '-' for values in (-1, 0): the integer part is 0, so _tim_itoa
+	// can't carry the sign. Emit it here when value < 0 and trunc(value) == 0.
+	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil { // intpart
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr (0.0)
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+	geJump := acg.eb.text.Len()
+	acg.out.BranchCond("ge", 0)                                   // value >= 0 -> no sign
+	acg.out.out.writer.WriteBytes([]byte{0x1f, 0x00, 0x00, 0xf1}) // cmp x0, #0
+	neJump := acg.eb.text.Len()
+	acg.out.BranchCond("ne", 0)                        // intpart != 0 -> itoa carries the sign
+	if err := acg.out.MovImm64("x9", 45); err != nil { // '-'
+		return err
+	}
+	if err := acg.out.StrImm64("x9", "sp", 8); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("x1", "sp", 8); err != nil {
+		return err
+	}
+	if err := acg.out.MovImm64("x2", 1); err != nil {
+		return err
+	}
+	if err := acg.emitSyscallWrite(fd); err != nil {
+		return err
+	}
+	signHere := acg.eb.text.Len()
+	acg.patchJumpOffset(geJump, int32(signHere-geJump))
+	acg.patchJumpOffset(neJump, int32(signHere-neJump))
 
 	// Integer part via _tim_itoa.
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e}) // fcvtzs x0, d0
@@ -5024,9 +5615,9 @@ func (acg *ARM64CodeGen) compileCFunctionCall(funcName string, args []Expression
 				// ADD x0, x0, label@PAGEOFF
 				acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x91})
 
-				// Move x0 to d0 (as bits)
-				// fmov d0, x0
-				acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x67, 0x9e})
+				// String pointer -> d0 numerically (scvtf), matching the unified
+				// numeric pointer convention used by all FFI pointers below.
+				acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
 			} else {
 				if err := acg.compileExpression(args[i]); err != nil {
 					return err
@@ -5051,58 +5642,45 @@ func (acg *ARM64CodeGen) compileCFunctionCall(funcName string, args []Expression
 
 	for i := range numArgs {
 		argType := argTypes[i]
-
-		// Load from stack into d0
 		offset := int32(i * 8)
-		if err := acg.out.LdrImm64Double("d0", "sp", offset); err != nil {
-			return err
-		}
-
 		isIntArg := (argType == "int" || argType == "ptr")
 
 		if isIntArg {
 			if intRegNum >= 8 {
 				return fmt.Errorf("%s: too many integer/pointer arguments", funcName)
 			}
-
+			xreg := fmt.Sprintf("x%d", intRegNum)
+			// Load the spilled float64 bit pattern into a scratch FP register
+			// (d16 — not an argument register) so float args already placed in
+			// d0-d7 are not clobbered, then convert into the GP arg register.
+			if err := acg.out.LdrImm64Double("d16", "sp", offset); err != nil {
+				return err
+			}
 			if argType == "ptr" {
-				// Pointer: transfer bits from d0 to xN.
-				// fmov xN, d0 (FP->GP) is 0x9e660000|N, i.e. byte[2]=0x66.
-				// (0x67 would be fmov dN, x0 — the wrong direction.)
-				acg.out.out.writer.WriteBytes([]byte{
-					byte(intRegNum),
-					0x00,
-					0x66,
-					0x9e,
-				})
+				// Pointer arg: recover the raw pointer from the numeric value
+				// (fcvtzs), matching c.malloc/write_*/cstruct and the FFI pointer
+				// return below. (A bit-reinterpret would mis-pass numeric pointers.)
+				if err := acg.out.FcvtzsDoubleToInt64(xreg, "d16"); err != nil {
+					return err
+				}
 			} else {
-				// Integer: convert float64 to int64
-				// fcvtzs xN, d0
-				acg.out.out.writer.WriteBytes([]byte{
-					byte(intRegNum),
-					0x00,
-					0x78,
-					0x9e,
-				})
+				if err := acg.out.FcvtzsDoubleToInt64(xreg, "d16"); err != nil {
+					return err
+				}
 			}
 			intRegNum++
 		} else {
-			// Float argument
+			// Float argument: load directly into its destination register dN.
+			// (The old code round-tripped every arg through d0, so loading the
+			// second float arg clobbered the first — pow/atan2 got both args
+			// equal to the last one.)
 			if floatRegNum >= 8 {
 				return fmt.Errorf("%s: too many float arguments", funcName)
 			}
-
-			if floatRegNum != 0 {
-				// Move d0 to dN
-				// fmov dN, d0
-				acg.out.out.writer.WriteBytes([]byte{
-					byte(floatRegNum),
-					0x40,
-					0x60,
-					0x1e,
-				})
+			dreg := fmt.Sprintf("d%d", floatRegNum)
+			if err := acg.out.LdrImm64Double(dreg, "sp", offset); err != nil {
+				return err
 			}
-			// else: first float arg already in d0
 			floatRegNum++
 		}
 	}
@@ -5137,9 +5715,9 @@ func (acg *ARM64CodeGen) compileCFunctionCall(funcName string, args []Expression
 	// Handle return value conversion
 	returnType := sig.ReturnType
 	if isPointerType(returnType) {
-		// Pointer return: convert x0 to float64 bits in d0
-		// fmov d0, x0
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x67, 0x9e})
+		// Pointer return: store the pointer numerically (scvtf), the unified FFI
+		// pointer convention (matches c.malloc, write_*, cstruct, and ptr args).
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
 	} else if strings.Contains(returnType, "int") || strings.Contains(returnType, "long") ||
 		strings.Contains(returnType, "short") || strings.Contains(returnType, "char") ||
 		strings.Contains(returnType, "size") || strings.Contains(returnType, "bool") {
@@ -5235,11 +5813,25 @@ func (acg *ARM64CodeGen) generateLambdaFunctions() error {
 		oldStackVars := acg.stackVars
 		oldStackSize := acg.stackSize
 		oldCurrentLambda := acg.currentLambda
+		oldBoxedVars := acg.boxedVars
 
 		// Create new scope for lambda
 		acg.stackVars = make(map[string]int)
 		acg.stackSize = 0
 		acg.currentLambda = &lambda
+
+		// Boxed names in this scope: locals this body's nested lambdas mutate,
+		// plus captures inherited by reference from the enclosing scope. Module
+		// globals (shared via x28) are never boxed.
+		acg.boxedVars = boxedCaptureVars(lambda.Body)
+		for name := range lambda.BoxedCaptures {
+			acg.boxedVars[name] = true
+		}
+		for name := range acg.boxedVars {
+			if _, isGlobal := acg.globalSlots[name]; isGlobal {
+				delete(acg.boxedVars, name)
+			}
+		}
 
 		// Reserve the first frame slot for the closure pointer (passed in x9 by
 		// the caller) so the body can read its captured values from [x9+8+i*8].
@@ -5317,6 +5909,7 @@ func (acg *ARM64CodeGen) generateLambdaFunctions() error {
 		acg.stackVars = oldStackVars
 		acg.stackSize = oldStackSize
 		acg.currentLambda = oldCurrentLambda
+		acg.boxedVars = oldBoxedVars
 	}
 
 	return nil

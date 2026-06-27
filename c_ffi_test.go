@@ -44,6 +44,25 @@ printf("cos(0.0) = %v\n", result)
 	}
 }
 
+// TestTwoArgLibm tests two-argument libm functions (double f(double, double)).
+// Regression: the ARM64 C-call marshaller round-tripped every argument through
+// d0, so the second float arg clobbered the first — pow(2,10) computed pow(10,10).
+func TestTwoArgLibm(t *testing.T) {
+	code := `
+println(pow(2.0, 10.0))
+println(fmod(10.0, 3.0))
+println(hypot(3.0, 4.0))
+println(fmin(3.0, 7.0))
+println(fmax(3.0, 7.0))
+`
+	output := compileAndRun(t, code)
+	for _, want := range []string{"1024", "1", "5", "3", "7"} {
+		if !strings.Contains(output, want) {
+			t.Errorf("Expected %q in output, got: %s", want, output)
+		}
+	}
+}
+
 // Confidence that this function is working: 90%
 // TestNullPointerLiterals tests that 0, [], {} can be used as null pointers
 func TestNullPointerLiterals(t *testing.T) {

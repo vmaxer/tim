@@ -508,6 +508,17 @@ func (fc *TimCompiler) processCImports(program *Program) {
 					fmt.Fprintf(os.Stderr, "Added %d built-in glibc functions\n", len(glibcDef.Functions))
 				}
 			}
+
+			// Record which library each imported function belongs to, so the
+			// linker (Mach-O/ELF/PE writers) binds the call to the right dylib/.so
+			// instead of defaulting to libSystem. Keyed by bare function name.
+			if consts := fc.cConstants[cImport.Alias]; consts != nil {
+				for name := range consts.Functions {
+					if _, exists := fc.cFunctionLibs[name]; !exists {
+						fc.cFunctionLibs[name] = cImport.Library
+					}
+				}
+			}
 		}
 	}
 }
@@ -19589,6 +19600,11 @@ func getUnknownFunctions(program *Program) []string {
 		"asin": true, "acos": true, "atan": true, "atan2": true,
 		"exp": true, "log": true, "log10": true, "pow": true,
 		"min": true, "max": true,
+		// Additional single-arg libm (handled by the codegen libm fallback)
+		"cbrt": true, "exp2": true, "log2": true, "trunc": true, "fabs": true,
+		// Two-arg libm: double f(double, double)
+		"fmod": true, "hypot": true, "copysign": true,
+		"fdim": true, "fmax": true, "fmin": true, "nextafter": true,
 		// Raylib graphics (linked directly against libraylib via C FFI)
 		"InitWindow": true, "CloseWindow": true, "DrawRectangle": true,
 		"BeginDrawing": true, "EndDrawing": true, "ClearBackground": true,
@@ -19647,6 +19663,13 @@ func getUnknownFunctions(program *Program) []string {
 
 	// Collect all defined functions
 	defined := collectDefinedFunctions(program)
+
+	// CStruct type names act as value constructors (e.g. Point(3.0, 4.0)).
+	for _, stmt := range program.Statements {
+		if cs, ok := stmt.(*CStructDecl); ok {
+			defined[cs.Name] = true
+		}
+	}
 
 	// Find unknown functions (called but not builtin, not defined, and not from C imports)
 	var unknown []string

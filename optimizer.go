@@ -1444,6 +1444,14 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 	case *IndexExpr:
 		collectCapturedVarsExpr(e.List, paramSet, captured)
 		collectCapturedVarsExpr(e.Index, paramSet, captured)
+	case *CastExpr:
+		collectCapturedVarsExpr(e.Expr, paramSet, captured)
+	case *FieldAccessExpr:
+		collectCapturedVarsExpr(e.Object, paramSet, captured)
+	case *UnaryExpr:
+		collectCapturedVarsExpr(e.Operand, paramSet, captured)
+	case *LengthExpr:
+		collectCapturedVarsExpr(e.Operand, paramSet, captured)
 	case *MatchExpr:
 		collectCapturedVarsExpr(e.Condition, paramSet, captured)
 		for _, clause := range e.Clauses {
@@ -1480,6 +1488,19 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 				localParamSet[s.Name] = true
 			case *ExpressionStmt:
 				collectCapturedVarsExpr(s.Expr, localParamSet, captured)
+			case *LoopStmt:
+				// The iterable is evaluated in the enclosing scope; the body runs
+				// with the iterator bound locally. Without this, variables read
+				// only inside a loop body were never detected as captured.
+				collectCapturedVarsExpr(s.Iterable, localParamSet, captured)
+				bodyParamSet := make(map[string]bool)
+				maps.Copy(bodyParamSet, localParamSet)
+				bodyParamSet[s.Iterator] = true
+				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, bodyParamSet, captured)
+			case *JumpStmt:
+				if s.Value != nil {
+					collectCapturedVarsExpr(s.Value, localParamSet, captured)
+				}
 			}
 		}
 	}

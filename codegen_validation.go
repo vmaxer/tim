@@ -26,6 +26,9 @@ func (fc *TimCompiler) validateGeneratedCode() []string {
 		"printf": true, "exit": true, "malloc": true, "free": true, "realloc": true,
 		"getenv": true, "strlen": true, "memcpy": true, "memset": true, "pow": true,
 		"fflush": true, "ExitProcess": true, "GetProcessHeap": true, "HeapAlloc": true,
+		// Two-argument libm functions (double f(double, double)).
+		"atan2": true, "fmod": true, "hypot": true, "copysign": true,
+		"fdim": true, "fmax": true, "fmin": true, "nextafter": true,
 	}
 
 	// Built-in/intrinsic functions that get compiled into other code

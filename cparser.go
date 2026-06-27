@@ -753,6 +753,28 @@ func (p *CParser) match(value string) bool {
 }
 
 // tryParseTypedefEnum tries to parse a typedef enum
+// parseCIntLiteral parses a C integer literal (hex 0x.., binary 0b.., or
+// decimal), already stripped of u/U/l/L suffixes. It accepts unsigned values
+// that exceed int64 (e.g. 0xFFFFFFFF) by reinterpreting them.
+func parseCIntLiteral(s string) (int64, bool) {
+	s = strings.TrimSpace(s)
+	base := 10
+	digits := s
+	switch {
+	case strings.HasPrefix(s, "0x"), strings.HasPrefix(s, "0X"):
+		base, digits = 16, s[2:]
+	case strings.HasPrefix(s, "0b"), strings.HasPrefix(s, "0B"):
+		base, digits = 2, s[2:]
+	}
+	if v, err := strconv.ParseInt(digits, base, 64); err == nil {
+		return v, true
+	}
+	if v, err := strconv.ParseUint(digits, base, 64); err == nil {
+		return int64(v), true
+	}
+	return 0, false
+}
+
 func (p *CParser) tryParseTypedefEnum() bool {
 	saved := p.pos
 	p.advance() // Skip 'typedef'
@@ -806,27 +828,26 @@ func (p *CParser) parseEnum() {
 			if !p.isAtEnd() && p.peek().Value == "=" {
 				p.advance() // Skip '='
 
-				if !p.isAtEnd() {
-					valueTok := p.peek()
-					if valueTok.Type == CTokNumber {
-						// Parse the value
-						valueStr := valueTok.Value
-						var parsedValue int64
-						var err error
-
-						// Handle hex values
-						if strings.HasPrefix(valueStr, "0x") || strings.HasPrefix(valueStr, "0X") {
-							parsedValue, err = strconv.ParseInt(valueStr[2:], 16, 64)
-						} else if strings.HasPrefix(valueStr, "0b") || strings.HasPrefix(valueStr, "0B") {
-							parsedValue, err = strconv.ParseInt(valueStr[2:], 2, 64)
-						} else {
-							parsedValue, err = strconv.ParseInt(valueStr, 10, 64)
+				// Consume ALL value tokens up to the next ',' or '}'. An identifier
+				// value (e.g. SDL_PIXELFORMAT_ARGB32 = SDL_PIXELFORMAT_ARGB8888) MUST
+				// be consumed, else it is re-parsed as a bogus member that overwrites
+				// the referenced constant with the running counter.
+				var valueToks []CToken
+				for !p.isAtEnd() && p.peek().Value != "," && p.peek().Value != "}" {
+					valueToks = append(valueToks, p.peek())
+					p.advance()
+				}
+				if len(valueToks) == 1 {
+					vt := valueToks[0]
+					switch vt.Type {
+					case CTokNumber:
+						if v, ok := parseCIntLiteral(strings.TrimRight(vt.Value, "uUlL")); ok {
+							enumValue = int(v)
 						}
-
-						if err == nil {
-							enumValue = int(parsedValue)
+					case CTokIdentifier:
+						if ref, ok := p.results.Constants[vt.Value]; ok {
+							enumValue = int(ref)
 						}
-						p.advance()
 					}
 				}
 			}

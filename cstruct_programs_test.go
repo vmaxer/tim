@@ -99,6 +99,37 @@ c.free(v)
 		})
 	}
 }
+
+// TestCStructByValue covers struct values: the constructor Vec(...), passing a
+// struct to a function and re-tagging the param with `as`, returning a struct,
+// and inferred return typing (no cast needed on the call result).
+func TestCStructByValue(t *testing.T) {
+	source := `cstruct Vec { x as float64, y as float64 }
+
+vadd = (a, b) -> {
+    aa = a as Vec
+    bb = b as Vec
+    Vec(aa.x + bb.x, aa.y + bb.y)
+}
+
+dot = (a, b) -> {
+    aa = a as Vec
+    bb = b as Vec
+    aa.x*bb.x + aa.y*bb.y
+}
+
+main = {
+    p = Vec(3.0, 4.0)
+    q = Vec(10.0, 20.0)
+    r = vadd(p, q)
+    println(r.x)
+    println(r.y)
+    println(dot(p, q))
+}
+`
+	testInlineTim(t, "cstruct_by_value", source, "13\n24\n110\n")
+}
+
 func TestExistingCStructPrograms(t *testing.T) {
 	tests := []string{
 		"cstruct_test",

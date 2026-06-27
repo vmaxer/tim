@@ -102,24 +102,25 @@ func (p *Parser) parseNumberLiteral(s string) float64 {
 }
 
 type Parser struct {
-	lexer           *Lexer
-	current         Token
-	peek            Token
-	filename        string
-	source          string
-	loopDepth       int                     // Current loop nesting level (0 = not in loop, 1 = outer loop, etc.)
-	functionDepth   int                     // Current function nesting level (0 = module level, 1+ = inside function/lambda)
-	constants       map[string]Expression   // Compile-time constants (immutable literals)
-	aliases         map[string]TokenType    // Keyword aliases (e.g., "for" -> TOKEN_AT)
-	cstructs        map[string]*CStructDecl // CStruct declarations for metadata access
-	cImports        map[string]bool         // C import namespaces (e.g., "sdl", "c")
-	speculative     bool                    // True when in speculative parsing mode (suppress errors)
-	errors          *ErrorCollector         // Railway-oriented error collector
-	inMatchBlock    bool                    // True when parsing inside a match block (prevents nested match parsing)
-	inConditionLoop bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
-	scopes          []map[string]bool       // Stack of variable scopes for shadow detection
-	lambdaParams    []string                // Temporary storage for lambda parameters being parsed
-	pendingHoists   []Statement             // Synthesized top-level defs to inject before the current statement
+	lexer            *Lexer
+	current          Token
+	peek             Token
+	filename         string
+	source           string
+	loopDepth        int                     // Current loop nesting level (0 = not in loop, 1 = outer loop, etc.)
+	functionDepth    int                     // Current function nesting level (0 = module level, 1+ = inside function/lambda)
+	constants        map[string]Expression   // Compile-time constants (immutable literals)
+	aliases          map[string]TokenType    // Keyword aliases (e.g., "for" -> TOKEN_AT)
+	cstructs         map[string]*CStructDecl // CStruct declarations for metadata access
+	cImports         map[string]bool         // C import namespaces (e.g., "sdl", "c")
+	speculative      bool                    // True when in speculative parsing mode (suppress errors)
+	errors           *ErrorCollector         // Railway-oriented error collector
+	inMatchBlock     bool                    // True when parsing inside a match block (prevents nested match parsing)
+	matchResultDepth int                     // >0 while parsing a match-clause result: a top-level '|' starts the next guard clause, not a pipe
+	inConditionLoop  bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
+	scopes           []map[string]bool       // Stack of variable scopes for shadow detection
+	lambdaParams     []string                // Temporary storage for lambda parameters being parsed
+	pendingHoists    []Statement             // Synthesized top-level defs to inject before the current statement
 }
 
 type parserState struct {
@@ -1856,6 +1857,7 @@ const (
 	BlockTypeMap       BlockType = iota // {key: value, ...}
 	BlockTypeMatch                      // {pattern -> result, ...} or {| guard -> result}
 	BlockTypeStatement                  // {stmt; stmt; expr}
+	BlockTypeMixed                      // {stmt; stmt; | guard => result ~> default}
 )
 
 // parseMapLiteralBody parses the body of a map literal (assumes '{' already consumed)
@@ -1946,6 +1948,7 @@ func (p *Parser) disambiguateBlock() BlockType {
 	braceDepth := 1 // Start at 1 because we're already inside the opening {
 	foundColon := false
 	foundArrow := false
+	foundAssign := false // an assignment (= := <-) at depth 1 before the first arrow
 
 	// Scan tokens within this block
 	for range maxBlockIterations {
@@ -1986,6 +1989,11 @@ func (p *Parser) disambiguateBlock() BlockType {
 					// Found ':' before any arrows and not a type annotation → map literal
 					foundColon = true
 				}
+			} else if tok.Type == TOKEN_EQUALS || tok.Type == TOKEN_COLON_EQUALS || tok.Type == TOKEN_LEFT_ARROW {
+				// An assignment before any arrow signals a mixed block: leading
+				// statements followed by a guard match (spec: statements execute
+				// first, then the guard match is evaluated and returned).
+				foundAssign = true
 			} else if tok.Type == TOKEN_FAT_ARROW || tok.Type == TOKEN_DEFAULT_ARROW {
 				// Found arrow → match block (=> or ~>)
 				foundArrow = true
@@ -2007,6 +2015,9 @@ func (p *Parser) disambiguateBlock() BlockType {
 		return BlockTypeMap
 	}
 	if foundArrow {
+		if foundAssign {
+			return BlockTypeMixed
+		}
 		return BlockTypeMatch
 	}
 	return BlockTypeStatement
@@ -2465,7 +2476,9 @@ func (p *Parser) parseMatchTarget() Expression {
 		// Otherwise parse as expression
 		fallthrough
 	default:
+		p.matchResultDepth++
 		expr := p.parseExpression()
+		p.matchResultDepth--
 
 		// Check if this expression has a match block attached
 		if p.peek.Type == TOKEN_LBRACE {
@@ -3509,13 +3522,18 @@ func (p *Parser) parseOnePatternClause() *PatternClause {
 
 // Confidence that this function is working: 100%
 func (p *Parser) parseExpression() Expression {
+	// Track nesting DEPTH (increment on entry, decrement on exit) so the guard
+	// catches genuinely runaway recursion without capping total program size — a
+	// cumulative counter falsely trips "infinite recursion" on large programs.
 	globalParseCallCount++
 	if globalParseCallCount > maxParseRecursion {
 		// Print stack trace
 		debug.PrintStack()
-		p.error(fmt.Sprintf("infinite recursion in parseExpression: count=%d, token type=%v value='%v' line=%d", globalParseCallCount, p.current.Type, p.current.Value, p.current.Line))
+		p.error(fmt.Sprintf("infinite recursion in parseExpression: depth=%d, token type=%v value='%v' line=%d", globalParseCallCount, p.current.Type, p.current.Value, p.current.Line))
 	}
-	return p.parsePipe()
+	result := p.parsePipe()
+	globalParseCallCount--
+	return result
 }
 
 // parsePipe handles | and || operators (lowest precedence)
@@ -3524,6 +3542,11 @@ func (p *Parser) parsePipe() Expression {
 	left := p.parseReduce()
 
 	for p.peek.Type == TOKEN_PIPE || p.peek.Type == TOKEN_PIPEPIPE {
+		// Inside a match-clause result, a top-level '|' is the next guard clause's
+		// marker, not the pipe operator — stop so the clause result ends here.
+		if p.peek.Type == TOKEN_PIPE && p.matchResultDepth > 0 {
+			break
+		}
 		op := p.peek.Type
 		p.nextToken() // skip current
 		p.nextToken() // skip '|' or '||'
@@ -3815,6 +3838,33 @@ func (p *Parser) parseLambdaBody() Expression {
 			// Don't skip the '}' - let the caller handle it
 
 			// Return a BlockExpr containing the statements
+			return &BlockExpr{Statements: statements}
+
+		case BlockTypeMixed:
+			// Leading statements, then a trailing guard match that is evaluated
+			// and returned (spec: "Statements execute first, then the guard match
+			// is evaluated and returned").
+			var statements []Statement
+			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_PIPE {
+				stmt := p.parseStatement()
+				if stmt != nil {
+					statements = append(statements, stmt)
+				}
+				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
+					p.nextToken()
+					p.skipNewlines()
+				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
+					p.nextToken()
+					break
+				} else {
+					p.nextToken()
+					p.skipNewlines()
+				}
+			}
+			// current is now at the guard match's leading '|'. Parse it against a
+			// constant-true condition and make it the block's return value.
+			matchExpr := p.parseMatchBlock(&NumberExpr{Value: 1.0})
+			statements = append(statements, &ExpressionStmt{Expr: matchExpr})
 			return &BlockExpr{Statements: statements}
 		}
 	}
@@ -4763,6 +4813,36 @@ func (p *Parser) parsePrimary() Expression {
 			// Don't skip the '}' - let the caller handle it
 
 			// Return a BlockExpr containing the statements
+			return &BlockExpr{Statements: statements}
+
+		case BlockTypeMixed:
+			// Leading statements followed by a trailing guard match (the value).
+			p.functionDepth++
+			p.pushScope()
+			defer func() {
+				p.functionDepth--
+				p.popScope()
+			}()
+
+			var statements []Statement
+			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_PIPE {
+				stmt := p.parseStatement()
+				if stmt != nil {
+					statements = append(statements, stmt)
+				}
+				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
+					p.nextToken()
+					p.skipNewlines()
+				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
+					p.nextToken()
+					break
+				} else {
+					p.nextToken()
+					p.skipNewlines()
+				}
+			}
+			matchExpr := p.parseMatchBlock(&NumberExpr{Value: 1.0})
+			statements = append(statements, &ExpressionStmt{Expr: matchExpr})
 			return &BlockExpr{Statements: statements}
 		}
 
