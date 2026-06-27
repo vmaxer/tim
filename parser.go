@@ -4638,7 +4638,9 @@ func (p *Parser) parsePrimary() Expression {
 
 			// Try to parse as lambda parameter list
 			params := []string{p.current.Value}
+			paramTypes := make(map[string]string) // param name -> `as Type` annotation
 			variadicParam := ""
+			firstParamName := p.current.Value
 			p.nextToken() // skip first ident
 
 			// Check for variadic marker on first parameter
@@ -4649,7 +4651,8 @@ func (p *Parser) parsePrimary() Expression {
 				p.nextToken()       // skip '...'
 			}
 
-			// Skip optional type annotation: as Type (if not variadic)
+			// Optional type annotation: `as Type` (if not variadic). Captured so a
+			// cstruct-typed param's fields resolve in the body without manual casts.
 			if variadicParam == "" && p.current.Type == TOKEN_AS {
 				p.nextToken() // skip 'as'
 				if p.current.Type != TOKEN_IDENT {
@@ -4659,6 +4662,7 @@ func (p *Parser) parsePrimary() Expression {
 					p.nextToken() // skip ')'
 					return expr
 				}
+				paramTypes[firstParamName] = p.current.Value
 				p.nextToken() // skip type name
 			}
 
@@ -4687,7 +4691,7 @@ func (p *Parser) parsePrimary() Expression {
 
 					params = append(params, paramName)
 
-					// Skip optional type annotation
+					// Optional type annotation (captured for cstruct field access).
 					if p.current.Type == TOKEN_AS {
 						p.nextToken() // skip 'as'
 						if p.current.Type != TOKEN_IDENT {
@@ -4697,6 +4701,7 @@ func (p *Parser) parsePrimary() Expression {
 							p.nextToken() // skip ')'
 							return expr
 						}
+						paramTypes[paramName] = p.current.Value
 						p.nextToken() // skip type name
 					}
 				}
@@ -4721,7 +4726,7 @@ func (p *Parser) parsePrimary() Expression {
 				p.lambdaParams = params // Store params for parseLambdaBody
 				body := p.parseLambdaBody()
 				p.lambdaParams = nil
-				return &LambdaExpr{Params: params, VariadicParam: variadicParam, Body: body}
+				return &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, Body: body}
 			}
 
 			// Not a lambda after all, restore and parse as expression

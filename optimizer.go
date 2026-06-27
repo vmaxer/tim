@@ -20,7 +20,23 @@ import (
 // - Purity analysis
 // - Closure analysis
 
+// optimizerCStructNames holds the cstruct type names of the program being
+// optimized, so the inliner can recognize constructor calls.
+var optimizerCStructNames map[string]bool
+
+func isCStructConstructorCall(e Expression) bool {
+	if c, ok := e.(*CallExpr); ok {
+		return optimizerCStructNames[c.Function]
+	}
+	return false
+}
+
 func optimizeProgram(program *Program) *Program {
+	optimizerCStructNames = make(map[string]bool, len(program.CStructs))
+	for name := range program.CStructs {
+		optimizerCStructNames[name] = true
+	}
+
 	// Pass 1: Constant folding (2 + 3 → 5)
 	for i, stmt := range program.Statements {
 		program.Statements[i] = foldConstants(stmt)
@@ -1654,9 +1670,10 @@ func collectInlineCandidates(stmt Statement, candidates map[string]*LambdaExpr) 
 				if !isComplexExpression(lambda.Body) {
 					// Store a copy to avoid mutation
 					candidates[s.Name] = &LambdaExpr{
-						Params: lambda.Params,
-						Body:   lambda.Body,
-						IsPure: lambda.IsPure,
+						Params:            lambda.Params,
+						ParamCStructTypes: lambda.ParamCStructTypes,
+						Body:              lambda.Body,
+						IsPure:            lambda.IsPure,
 					}
 				}
 			}
@@ -1796,9 +1813,11 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 			// 1. Parameter count matches
 			// 2. Called at least once
 			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 {
-				// Inline by substituting parameters with arguments (which may now be inlined)
-				inlinedBody := substituteParams(lambda.Body, lambda.Params, e.Args)
-				return inlinedBody
+				// Inline the body, let-binding any non-trivial argument so it is
+				// evaluated exactly once (naive substitution would duplicate e.g.
+				// `vscale(b,s)` into each `.x/.y/.z` use — quadratic blowup and
+				// extra allocations).
+				return inlineWithLetBinding(lambda, e.Args)
 			}
 		}
 		return e
@@ -1853,6 +1872,23 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 		e.A = inlineFunctionsExpr(e.A, candidates, callCounts)
 		e.B = inlineFunctionsExpr(e.B, candidates, callCounts)
 		e.C = inlineFunctionsExpr(e.C, candidates, callCounts)
+		return e
+	case *FieldAccessExpr:
+		e.Object = inlineFunctionsExpr(e.Object, candidates, callCounts)
+		return e
+	case *CastExpr:
+		e.Expr = inlineFunctionsExpr(e.Expr, candidates, callCounts)
+		return e
+	case *UnaryExpr:
+		e.Operand = inlineFunctionsExpr(e.Operand, candidates, callCounts)
+		return e
+	case *LengthExpr:
+		e.Operand = inlineFunctionsExpr(e.Operand, candidates, callCounts)
+		return e
+	case *JumpExpr:
+		if e.Value != nil {
+			e.Value = inlineFunctionsExpr(e.Value, candidates, callCounts)
+		}
 		return e
 	default:
 		return expr
@@ -1925,6 +1961,67 @@ func deepCopyExpr(expr Expression) Expression {
 }
 
 // substituteParams replaces parameter references with actual arguments
+var inlineTempCounter int
+
+// inlineArgIsTrivial reports whether an argument is safe to substitute directly
+// into every use without a binding: a bare variable or literal has no evaluation
+// cost and no side effects, so duplicating it is free.
+func inlineArgIsTrivial(arg Expression) bool {
+	switch arg.(type) {
+	case *IdentExpr, *NumberExpr, *StringExpr:
+		return true
+	}
+	return false
+}
+
+// inlineWithLetBinding inlines a candidate lambda at a call site. Trivial args are
+// substituted directly; non-trivial args are bound to a fresh local first
+// (`__inl_N = arg`) so they are computed once, then the body is emitted as a block
+// whose value is the substituted body.
+func inlineWithLetBinding(lambda *LambdaExpr, args []Expression) Expression {
+	substMap := make(map[string]Expression, len(lambda.Params))
+	var bindings []Statement
+	for i, param := range lambda.Params {
+		arg := args[i]
+		// A cstruct-typed param carries the type that makes its `a.x` field
+		// accesses work in the body; after substitution the access site is in the
+		// caller's scope where the arg may be untyped, so wrap with `as Type`.
+		ctype := ""
+		if lambda.ParamCStructTypes != nil {
+			ctype = lambda.ParamCStructTypes[param]
+		}
+		wrap := func(e Expression) Expression {
+			if ctype != "" {
+				return &CastExpr{Expr: e, Type: ctype}
+			}
+			return e
+		}
+		switch {
+		case isCStructConstructorCall(arg):
+			// Substitute the constructor directly. The codegen folds `Ctor(..).f`
+			// to the f-th argument (SROA) — and since the fields are distinct
+			// expressions, accessing .x/.y/.z does not re-evaluate anything. A cast
+			// wrapper would hide the constructor from the fold, so don't add one.
+			substMap[param] = arg
+		case inlineArgIsTrivial(arg):
+			// Cheap to duplicate (a variable read or literal).
+			substMap[param] = wrap(arg)
+		default:
+			// Non-trivial scalar/opaque arg: bind once to avoid re-evaluation.
+			inlineTempCounter++
+			tmp := fmt.Sprintf("__inl_%d", inlineTempCounter)
+			bindings = append(bindings, &AssignStmt{Name: tmp, Value: wrap(arg)})
+			substMap[param] = &IdentExpr{Name: tmp}
+		}
+	}
+	body := substituteParamsExpr(lambda.Body, substMap)
+	if len(bindings) == 0 {
+		return body
+	}
+	stmts := append(bindings, &ExpressionStmt{Expr: body})
+	return &BlockExpr{Statements: stmts}
+}
+
 func substituteParams(body Expression, params []string, args []Expression) Expression {
 	// Create substitution map
 	substMap := make(map[string]Expression)
@@ -2035,6 +2132,29 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 			IsSub:    e.IsSub,
 			IsNegMul: e.IsNegMul,
 		}
+	case *FieldAccessExpr:
+		return &FieldAccessExpr{
+			Object:     substituteParamsExpr(e.Object, substMap),
+			FieldName:  e.FieldName,
+			StructName: e.StructName,
+			Offset:     e.Offset,
+		}
+	case *CastExpr:
+		return &CastExpr{
+			Expr:       substituteParamsExpr(e.Expr, substMap),
+			Type:       e.Type,
+			RawBitcast: e.RawBitcast,
+		}
+	case *UnaryExpr:
+		return &UnaryExpr{Operator: e.Operator, Operand: substituteParamsExpr(e.Operand, substMap)}
+	case *LengthExpr:
+		return &LengthExpr{Operand: substituteParamsExpr(e.Operand, substMap)}
+	case *JumpExpr:
+		var v Expression
+		if e.Value != nil {
+			v = substituteParamsExpr(e.Value, substMap)
+		}
+		return &JumpExpr{Label: e.Label, Value: v, IsBreak: e.IsBreak}
 	default:
 		// Literals (NumberExpr, StringExpr, etc.) are returned as-is
 		return expr

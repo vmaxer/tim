@@ -134,6 +134,70 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "typed_lambda_params",
+			// `(a as V, b as V)` typed params let the body use a.x/b.x directly,
+			// no `aa = a as V` cast. Also exercises the inliner substituting a
+			// param inside a field access (previously dropped -> "undefined a").
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				vadd = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vdot = (a as V, b as V) -> a.x*b.x + a.y*b.y + a.z*b.z
+				main = {
+					p = V(1.0, 2.0, 3.0)
+					q = V(10.0, 20.0, 30.0)
+					r = vadd(p, q)
+					println(r.x)
+					println(r.z)
+					println(vdot(p, q))
+				}
+			`,
+			expectedOutput: "11\n33\n140\n",
+			expectCompile:  true,
+		},
+		{
+			name: "inlined_struct_ops_sroa",
+			// Typed-param v3 ops are inline candidates; inlining must preserve the
+			// param's cstruct type (so `a.x` doesn't become a map access) and the
+			// codegen folds `Struct(..).field` to the field expression (SROA), all
+			// while keeping nested/composed results correct.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				vadd   = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vsub   = (a as V, b as V) -> V(a.x-b.x, a.y-b.y, a.z-b.z)
+				vscale = (a as V, s) -> V(a.x*s, a.y*s, a.z*s)
+				vdot   = (a as V, b as V) -> a.x*b.x + a.y*b.y + a.z*b.z
+				vmix   = (a as V, b as V, t) -> vadd(vscale(a, 1.0 - t), vscale(b, t))
+				main = {
+					p = V(1.0, 2.0, 3.0)
+					q = V(4.0, 5.0, 6.0)
+					m = vmix(p, q, 0.5)
+					println(m.y)
+					println(vdot(vadd(p, q), vscale(p, 2.0)))
+				}
+			`,
+			expectedOutput: "3.5\n92\n",
+			expectCompile:  true,
+		},
+		{
+			name: "expr_register_stack",
+			// Deeply nested arithmetic exercises the FP expression register stack
+			// (left operand kept in d24+ instead of a memory spill) and its
+			// fall-back to memory when an operand contains a call (sqrt here).
+			code: `
+				main = {
+					a = 10.0
+					b = 3.0
+					println(((1.0+2.0)*(3.0+4.0)) + ((5.0-1.0)*(6.0-2.0)))
+					println(a*a + b*b - a*b)
+					println((1.0+2.0+3.0+4.0+5.0+6.0+7.0+8.0+9.0+10.0))
+					println(sqrt(9.0) + sqrt(16.0) * 2.0)
+					println((sqrt(4.0) + 1.0) * (sqrt(9.0) + 1.0))
+				}
+			`,
+			expectedOutput: "37\n79\n55\n11\n12\n",
+			expectCompile:  true,
+		},
+		{
 			name: "loop_break_restores_sp",
 			// Breaking out of a loop with `cond { ret @ }` must restore sp: the
 			// value-match pushes its condition, and the break branches out before

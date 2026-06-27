@@ -41,18 +41,20 @@ type ARM64CodeGen struct {
 	boxedVars          map[string]bool              // names that live in a heap cell in the current scope (captured-and-mutated locals)
 	returnsClosure     map[string]bool              // lambda-var name -> its body evaluates to a closure (so `g = f(x); g()` invokes it)
 	funcReturnsCStruct map[string]string            // lambda-var name -> cstruct type its body returns (so `p = vadd(a,b)` is typed)
+	fpDepth            int                          // expression-stack depth: BinaryExpr keeps its left operand in d24+fpDepth instead of spilling to memory, when the right operand has no call
 }
 
 // ARM64LambdaFunc represents a lambda function for ARM64
 type ARM64LambdaFunc struct {
-	Name        string
-	Params      []string
-	Body        Expression
-	BodyStart   int      // Position where lambda body code starts (for tail recursion)
-	FuncStart   int      // Position where function starts (including prologue, for recursion)
-	VarName     string   // Variable name this lambda is assigned to (for recursion)
-	IsRecursive bool     // Whether this lambda calls itself recursively
-	Captures    []string // Names captured from the enclosing scope (closure env order)
+	Name              string
+	Params            []string
+	ParamCStructTypes map[string]string // param name -> cstruct type (from `(a as V)`)
+	Body              Expression
+	BodyStart         int      // Position where lambda body code starts (for tail recursion)
+	FuncStart         int      // Position where function starts (including prologue, for recursion)
+	VarName           string   // Variable name this lambda is assigned to (for recursion)
+	IsRecursive       bool     // Whether this lambda calls itself recursively
+	Captures          []string // Names captured from the enclosing scope (closure env order)
 	// BoxedCaptures marks which of Captures are boxed: the env slot holds a heap
 	// cell pointer (by reference) rather than a value, so the lambda can mutate
 	// the captured variable and have it persist (the make_counter pattern).
@@ -118,6 +120,19 @@ func (acg *ARM64CodeGen) cStructTypeOf(expr Expression) string {
 	case *IdentExpr:
 		if t, ok := acg.varCStructType[e.Name]; ok {
 			return t
+		}
+	case *BlockExpr:
+		// A block (e.g. an inlined function body) evaluates to its last
+		// expression — look through it so `r = { …; V(…) }` is typed as V.
+		if n := len(e.Statements); n > 0 {
+			switch s := e.Statements[n-1].(type) {
+			case *ExpressionStmt:
+				return acg.cStructTypeOf(s.Expr)
+			case *JumpStmt:
+				if s.Value != nil {
+					return acg.cStructTypeOf(s.Value)
+				}
+			}
 		}
 	}
 	return ""
@@ -358,6 +373,51 @@ func (acg *ARM64CodeGen) computeCaptures(body Expression, params []string) []str
 	}
 	slices.Sort(caps)
 	return caps
+}
+
+// emitFmovD emits `fmov d{dst}, d{src}` (register move between FP registers).
+func (acg *ARM64CodeGen) emitFmovD(dst, src uint32) {
+	instr := uint32(0x1e604000) | (src << 5) | dst
+	acg.out.out.writer.WriteBytes([]byte{byte(instr), byte(instr >> 8), byte(instr >> 16), byte(instr >> 24)})
+}
+
+// exprHasCall conservatively reports whether compiling expr emits any `bl`
+// (function call, libm, map access via a runtime helper, struct construction that
+// may spill to malloc, match, etc.). It is used to decide whether the expression
+// register stack (d24-d31, caller-saved) is safe to use: a call would clobber
+// those registers, so when the right operand of a binary op has a call we fall
+// back to a memory spill instead.
+func (acg *ARM64CodeGen) exprHasCall(expr Expression) bool {
+	switch e := expr.(type) {
+	case *NumberExpr, *StringExpr, *IdentExpr:
+		return false
+	case *BinaryExpr:
+		return acg.exprHasCall(e.Left) || acg.exprHasCall(e.Right)
+	case *UnaryExpr:
+		return acg.exprHasCall(e.Operand)
+	case *CastExpr:
+		return acg.exprHasCall(e.Expr)
+	case *FMAExpr:
+		return acg.exprHasCall(e.A) || acg.exprHasCall(e.B) || acg.exprHasCall(e.C)
+	case *FieldAccessExpr:
+		// `Ctor(...).field` folds to the field argument (no call there).
+		if ctor, ok := e.Object.(*CallExpr); ok {
+			if decl, isS := acg.cstructs[ctor.Function]; isS && len(ctor.Args) == len(decl.Fields) {
+				for i := range decl.Fields {
+					if decl.Fields[i].Name == e.FieldName {
+						return acg.exprHasCall(ctor.Args[i])
+					}
+				}
+			}
+		}
+		// A cstruct field is a plain typed load; a map field uses a helper call.
+		if acg.cstructForExpr(e.Object) != nil {
+			return acg.exprHasCall(e.Object)
+		}
+		return true
+	default:
+		return true
+	}
 }
 
 // emitLoadBoxCellPtr loads the heap cell pointer of boxed variable `name` into
@@ -1768,23 +1828,31 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			return err
 		}
 
-		// Push d0 onto stack to save left operand (maintain 16-byte alignment)
-		acg.out.SubImm64("sp", "sp", 16)
-		// str d0, [sp]
-		acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
-
-		// Compile right operand (result in d0)
-		if err := acg.compileExpression(e.Right); err != nil {
-			return err
+		// Keep the left operand in a scratch FP register (d24+depth) across the
+		// right operand instead of spilling to memory — but only when the right
+		// operand has no call (which would clobber the caller-saved d24-d31) and
+		// the stack isn't exhausted. Deeper nesting uses higher registers.
+		if acg.fpDepth < 8 && !acg.exprHasCall(e.Right) {
+			reg := uint32(24 + acg.fpDepth)
+			acg.emitFmovD(reg, 0) // fmov d{reg}, d0  (save left)
+			acg.fpDepth++
+			if err := acg.compileExpression(e.Right); err != nil {
+				return err
+			}
+			acg.fpDepth--
+			acg.out.out.writer.WriteBytes([]byte{0x01, 0x40, 0x60, 0x1e}) // fmov d1, d0 (right)
+			acg.emitFmovD(0, reg)                                         // fmov d0, d{reg} (restore left)
+		} else {
+			// Memory spill (16-byte aligned).
+			acg.out.SubImm64("sp", "sp", 16)
+			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
+			if err := acg.compileExpression(e.Right); err != nil {
+				return err
+			}
+			acg.out.out.writer.WriteBytes([]byte{0x01, 0x40, 0x60, 0x1e}) // fmov d1, d0
+			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x40, 0xfd}) // ldr d0, [sp]
+			acg.out.AddImm64("sp", "sp", 16)
 		}
-
-		// Move right operand to d1
-		// fmov d1, d0
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x40, 0x60, 0x1e})
-
-		// Pop left operand into d0
-		acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x40, 0xfd}) // ldr d0, [sp]
-		acg.out.AddImm64("sp", "sp", 16)
 
 		// Perform operation: d0 = d0 op d1
 		switch e.Operator {
@@ -2322,11 +2390,12 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		caps := acg.computeCaptures(e.Body, e.Params)
 
 		acg.lambdaFuncs = append(acg.lambdaFuncs, ARM64LambdaFunc{
-			Name:     funcName,
-			Params:   e.Params,
-			Body:     e.Body,
-			VarName:  acg.currentAssignName, // Store variable name for self-recursion
-			Captures: caps,
+			Name:              funcName,
+			Params:            e.Params,
+			ParamCStructTypes: e.ParamCStructTypes,
+			Body:              e.Body,
+			VarName:           acg.currentAssignName, // Store variable name for self-recursion
+			Captures:          caps,
 		})
 		lambdaIdx := len(acg.lambdaFuncs) - 1
 
@@ -2821,6 +2890,21 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		return fmt.Errorf("pattern lambdas not yet implemented in ARM64 (requires pattern matching)")
 
 	case *FieldAccessExpr:
+		// SROA fast path: `Struct(e0, e1, ...).field` folds straight to the
+		// matching argument expression — no allocation, no memory round-trip. After
+		// inlining, the hot path is full of these (e.g. `vadd(...).x` becomes
+		// `V(a.x+b.x, ...).x` -> `a.x+b.x`), so this keeps intermediate vectors out
+		// of the bump arena entirely.
+		if ctor, ok := e.Object.(*CallExpr); ok {
+			if decl, isStruct := acg.cstructs[ctor.Function]; isStruct && len(ctor.Args) == len(decl.Fields) {
+				for i := range decl.Fields {
+					if decl.Fields[i].Name == e.FieldName {
+						return acg.compileExpression(ctor.Args[i])
+					}
+				}
+			}
+		}
+
 		// C-struct field access (p.x) reads raw typed memory at the field offset.
 		if decl := acg.cstructForExpr(e.Object); decl != nil {
 			for i := range decl.Fields {
@@ -2978,20 +3062,27 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 		return err
 	}
 
-	// Save condition to stack (16-byte aligned)
-	acg.out.SubImm64("sp", "sp", 16)
-	if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil {
-		return err
+	// The condition is only needed by value-match clauses, guardless `cond { … }`
+	// clauses, and the no-clause form. A plain guard match (`{ | g => r ~> d }`)
+	// never reads it — so skip spilling it (and the per-clause reload) entirely,
+	// which is the common case in heavily-branchy code.
+	condUsed := len(expr.Clauses) == 0
+	for _, c := range expr.Clauses {
+		if c.IsValueMatch || c.Guard == nil {
+			condUsed = true
+			break
+		}
+	}
+	if condUsed {
+		acg.out.SubImm64("sp", "sp", 16)
+		if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil {
+			return err
+		}
 	}
 
 	var endJumpPositions []int
 
 	for _, clause := range expr.Clauses {
-		// Load condition from stack to d0
-		if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
-			return err
-		}
-
 		var nextClauseJumpPos int
 
 		if clause.IsValueMatch {
@@ -3027,7 +3118,10 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 			acg.out.BranchCond("eq", 0)
 		} else {
 			// Guardless clause from the `cond { body }` form: the condition itself
-			// is the boolean test (d0 already holds it). Run the body only if true.
+			// is the boolean test. Load it (it was spilled) and run the body if true.
+			if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
+				return err
+			}
 			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
 			nextClauseJumpPos = acg.eb.text.Len()
@@ -3075,8 +3169,10 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 		acg.patchJumpOffset(jumpPos, offset)
 	}
 
-	// Clean up stack
-	acg.out.AddImm64("sp", "sp", 16)
+	// Clean up the condition spill slot (only allocated when condUsed).
+	if condUsed {
+		acg.out.AddImm64("sp", "sp", 16)
+	}
 
 	return nil
 }
@@ -5859,6 +5955,14 @@ func (acg *ARM64CodeGen) generateLambdaFunctions() error {
 			acg.stackSize += 8
 			paramOffset := acg.stackSize
 			acg.stackVars[paramName] = paramOffset
+
+			// A `(a as V)` cstruct-typed param: record the type so `a.x` reads the
+			// field directly, no manual `aa = a as V` needed.
+			if ct, ok := lambda.ParamCStructTypes[paramName]; ok {
+				if _, isStruct := acg.cstructs[ct]; isStruct {
+					acg.varCStructType[paramName] = ct
+				}
+			}
 
 			// Store parameter from d register to stack at positive offset
 			// x29 points to saved fp, variables start at offset 16
