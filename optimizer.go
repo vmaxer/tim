@@ -24,6 +24,9 @@ import (
 // optimized, so the inliner can recognize constructor calls.
 var optimizerCStructNames map[string]bool
 
+// optimizerCStructDecls maps cstruct name -> declaration (for SROA field info).
+var optimizerCStructDecls map[string]*CStructDecl
+
 func isCStructConstructorCall(e Expression) bool {
 	if c, ok := e.(*CallExpr); ok {
 		return optimizerCStructNames[c.Function]
@@ -36,6 +39,9 @@ func optimizeProgram(program *Program) *Program {
 	for name := range program.CStructs {
 		optimizerCStructNames[name] = true
 	}
+	optimizerCStructDecls = program.CStructs
+	inlineReinlineDepth = 0
+	inlineTempCounter = 0
 
 	// Pass 1: Constant folding (2 + 3 → 5)
 	for i, stmt := range program.Statements {
@@ -69,6 +75,16 @@ func optimizeProgram(program *Program) *Program {
 		analyzePurity(stmt, pureFunctions)
 	}
 
+	// Pass 4.5: Operator overloading for cstructs. `a + b` on two V-typed operands
+	// desugars to `V_add(a, b)` (and `*`→V_mul/V_scale, `-`→V_sub, `/`→V_div) when
+	// that function is defined. Runs BEFORE inlining so the operator call inlines
+	// like any other. Conservative: only fires when operand types are known from
+	// explicit annotations / constructors / casts, so scalar arithmetic is never
+	// touched.
+	if len(optimizerCStructDecls) > 0 {
+		desugarOperatorOverloads(program)
+	}
+
 	// Pass 5: Function inlining (substitute small function calls with their bodies)
 	inlineCandidates := make(map[string]*LambdaExpr) // Functions that can be inlined
 	callCounts := make(map[string]int)               // Number of times each function is called
@@ -91,6 +107,17 @@ func optimizeProgram(program *Program) *Program {
 	// Pass 6: Constant folding after inlining (fold inlined expressions)
 	for i, stmt := range program.Statements {
 		program.Statements[i] = foldConstants(stmt)
+	}
+
+	// Pass 6b: Scalar replacement of aggregates (SROA). A non-escaping local
+	// `p = Struct(a, b, c)` used only via `p.field` is replaced by per-field
+	// scalars — no heap allocation, no pointer round-trip, fields stay in
+	// registers. This is the dominant win for struct-heavy numeric code (the
+	// metaballs v3 temporaries).
+	if len(optimizerCStructDecls) > 0 {
+		for _, stmt := range program.Statements {
+			sroaStmt(stmt)
+		}
 	}
 
 	// Pass 7: Loop vectorization (convert scalar loops to SIMD)
@@ -1692,7 +1719,28 @@ func isComplexExpression(expr Expression) bool {
 	case *BlockExpr:
 		return true // Don't inline blocks
 	case *MatchExpr:
-		return true // Don't inline match expressions (can be large)
+		// Allow inlining of SMALL, simple match expressions (the common case of
+		// tiny predicate/clamp helpers like `(x) -> { | x < 1 => a ~> b }`), which
+		// otherwise force a real call in the hottest loops. Reject large or
+		// nested-complex matches.
+		if len(e.Clauses) > 4 {
+			return true
+		}
+		if e.Condition != nil && isComplexExpression(e.Condition) {
+			return true
+		}
+		for _, c := range e.Clauses {
+			if c.Guard != nil && isComplexExpression(c.Guard) {
+				return true
+			}
+			if c.Result != nil && isComplexExpression(c.Result) {
+				return true
+			}
+		}
+		if e.DefaultExpr != nil && isComplexExpression(e.DefaultExpr) {
+			return true
+		}
+		return false
 	case *ParallelExpr:
 		return true // Don't inline parallel operations
 	case *CallExpr:
@@ -1817,7 +1865,17 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 				// evaluated exactly once (naive substitution would duplicate e.g.
 				// `vscale(b,s)` into each `.x/.y/.z` use — quadratic blowup and
 				// extra allocations).
-				return inlineWithLetBinding(lambda, e.Args)
+				inlined := inlineWithLetBinding(lambda, e.Args)
+				// Re-inline the result so nested candidate calls collapse too
+				// (e.g. at -> vadd -> vscale -> V), which lets `p = Ctor(...)`
+				// form and SROA fire. Depth-bounded to stop runaway recursion on
+				// self-recursive one-liner candidates.
+				if inlineReinlineDepth < 200 {
+					inlineReinlineDepth++
+					inlined = inlineFunctionsExpr(inlined, candidates, callCounts)
+					inlineReinlineDepth--
+				}
+				return inlined
 			}
 		}
 		return e
@@ -1963,13 +2021,22 @@ func deepCopyExpr(expr Expression) Expression {
 // substituteParams replaces parameter references with actual arguments
 var inlineTempCounter int
 
+// inlineReinlineDepth bounds re-inlining of an inlined body (so nested candidate
+// calls collapse) without looping forever on self-recursive one-liner candidates.
+var inlineReinlineDepth int
+
 // inlineArgIsTrivial reports whether an argument is safe to substitute directly
 // into every use without a binding: a bare variable or literal has no evaluation
 // cost and no side effects, so duplicating it is free.
 func inlineArgIsTrivial(arg Expression) bool {
-	switch arg.(type) {
+	switch a := arg.(type) {
 	case *IdentExpr, *NumberExpr, *StringExpr:
 		return true
+	case *CastExpr:
+		// A cast of a trivial value (e.g. `ro as V`) is still cheap to duplicate,
+		// and substituting it un-bound avoids wrapping the inlined body in a block
+		// — which would hide a `p = Ctor(...)` result from SROA.
+		return inlineArgIsTrivial(a.Expr)
 	}
 	return false
 }
@@ -2255,4 +2322,619 @@ func shouldApplyIntegerOptimization(left, right Expression) bool {
 	}
 
 	return false
+}
+
+// ---------------------------------------------------------------------------
+// SROA: scalar replacement of non-escaping local aggregates.
+//
+// Within a block, `p = Struct(a, b, c)` (immutable, p never reassigned, p used
+// only as `p.field`) is replaced by per-field scalar locals and every `p.field`
+// is rewritten to the matching scalar. This removes the heap allocation and the
+// pointer/memory round-trip for struct temporaries. Escape analysis stops at
+// nested lambdas (a captured struct local is treated as escaping).
+// ---------------------------------------------------------------------------
+
+func sroaScalarName(structVar, field string) string {
+	return "__sroa_" + structVar + "_" + field
+}
+
+// sroaStmt applies SROA inside any block reachable from stmt (lambda bodies,
+// loop bodies, etc.), mutating in place.
+func sroaStmt(stmt Statement) {
+	switch s := stmt.(type) {
+	case *AssignStmt:
+		sroaExpr(s.Value)
+	case *ExpressionStmt:
+		sroaExpr(s.Expr)
+	case *LoopStmt:
+		sroaExpr(s.Iterable)
+		s.Body = sroaBlockStmts(s.Body)
+	case *WhileStmt:
+		sroaExpr(s.Condition)
+		s.Body = sroaBlockStmts(s.Body)
+	case *JumpStmt:
+		if s.Value != nil {
+			sroaExpr(s.Value)
+		}
+	}
+}
+
+// sroaExpr recurses into expressions, applying SROA to any BlockExpr it finds
+// (e.g. a lambda body or a block used as a value).
+func sroaExpr(expr Expression) {
+	switch e := expr.(type) {
+	case *LambdaExpr:
+		if blk, ok := e.Body.(*BlockExpr); ok {
+			blk.Statements = sroaBlockStmts(blk.Statements)
+		} else {
+			sroaExpr(e.Body)
+		}
+	case *BlockExpr:
+		e.Statements = sroaBlockStmts(e.Statements)
+	case *BinaryExpr:
+		sroaExpr(e.Left)
+		sroaExpr(e.Right)
+	case *CallExpr:
+		for _, a := range e.Args {
+			sroaExpr(a)
+		}
+	case *DirectCallExpr:
+		sroaExpr(e.Callee)
+		for _, a := range e.Args {
+			sroaExpr(a)
+		}
+	case *MatchExpr:
+		sroaExpr(e.Condition)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				sroaExpr(c.Guard)
+			}
+			sroaExpr(c.Result)
+		}
+		if e.DefaultExpr != nil {
+			sroaExpr(e.DefaultExpr)
+		}
+	case *FieldAccessExpr:
+		sroaExpr(e.Object)
+	case *CastExpr:
+		sroaExpr(e.Expr)
+	case *UnaryExpr:
+		sroaExpr(e.Operand)
+	case *FMAExpr:
+		sroaExpr(e.A)
+		sroaExpr(e.B)
+		sroaExpr(e.C)
+	}
+}
+
+// sroaBlockStmts scalarizes qualifying struct locals within one block's
+// statement list (and recurses into nested blocks first).
+func sroaBlockStmts(stmts []Statement) []Statement {
+	// Recurse into nested blocks first so inner scopes are handled.
+	for _, s := range stmts {
+		sroaStmt(s)
+	}
+
+	out := make([]Statement, 0, len(stmts))
+	for i := range stmts {
+		as, ok := stmts[i].(*AssignStmt)
+		if !ok || as.Mutable || as.IsUpdate {
+			out = append(out, stmts[i])
+			continue
+		}
+		ctor, ok := as.Value.(*CallExpr)
+		if !ok {
+			out = append(out, stmts[i])
+			continue
+		}
+		decl := optimizerCStructDecls[ctor.Function]
+		if decl == nil || len(ctor.Args) != len(decl.Fields) {
+			out = append(out, stmts[i])
+			continue
+		}
+		// `p` must not escape anywhere in the remaining statements of this block.
+		rest := stmts[i+1:]
+		if structVarEscapesInStmts(as.Name, rest) {
+			out = append(out, stmts[i])
+			continue
+		}
+		// Scalarize: emit one assignment per field, and rewrite p.field uses.
+		fieldToScalar := make(map[string]string, len(decl.Fields))
+		for fi := range decl.Fields {
+			scalar := sroaScalarName(as.Name, decl.Fields[fi].Name)
+			fieldToScalar[decl.Fields[fi].Name] = scalar
+			out = append(out, &AssignStmt{Name: scalar, Value: ctor.Args[fi]})
+		}
+		for _, s := range rest {
+			rewriteFieldAccessStmt(s, as.Name, fieldToScalar)
+		}
+	}
+	return out
+}
+
+// structVarEscapesInStmts reports whether `name` is used as anything other than
+// `name.field` across the given statements (recursing into nested control flow,
+// stopping at nested lambdas where the var would be captured).
+func structVarEscapesInStmts(name string, stmts []Statement) bool {
+	for _, stmt := range stmts {
+		switch s := stmt.(type) {
+		case *AssignStmt:
+			if s.Name == name {
+				return true // reassignment / redefinition — bail
+			}
+			if structVarEscapesInExpr(name, s.Value) {
+				return true
+			}
+		case *ExpressionStmt:
+			if structVarEscapesInExpr(name, s.Expr) {
+				return true
+			}
+		case *LoopStmt:
+			if s.Iterator == name || structVarEscapesInExpr(name, s.Iterable) || structVarEscapesInStmts(name, s.Body) {
+				return true
+			}
+		case *WhileStmt:
+			if structVarEscapesInExpr(name, s.Condition) || structVarEscapesInStmts(name, s.Body) {
+				return true
+			}
+		case *JumpStmt:
+			if s.Value != nil && structVarEscapesInExpr(name, s.Value) {
+				return true
+			}
+		case *MapUpdateStmt:
+			// `p[i] <- v` / field write — treat as escape.
+			if s.MapName == name || structVarEscapesInExpr(name, s.Index) || structVarEscapesInExpr(name, s.Value) {
+				return true
+			}
+		default:
+			return true // unknown statement form — be conservative
+		}
+	}
+	return false
+}
+
+func structVarEscapesInExpr(name string, expr Expression) bool {
+	switch e := expr.(type) {
+	case nil:
+		return false
+	case *IdentExpr:
+		return e.Name == name // a bare reference is an escape
+	case *FieldAccessExpr:
+		if id, ok := e.Object.(*IdentExpr); ok && id.Name == name {
+			return false // safe: p.field
+		}
+		return structVarEscapesInExpr(name, e.Object)
+	case *BinaryExpr:
+		return structVarEscapesInExpr(name, e.Left) || structVarEscapesInExpr(name, e.Right)
+	case *UnaryExpr:
+		return structVarEscapesInExpr(name, e.Operand)
+	case *CastExpr:
+		return structVarEscapesInExpr(name, e.Expr)
+	case *LengthExpr:
+		return structVarEscapesInExpr(name, e.Operand)
+	case *CallExpr:
+		for _, a := range e.Args {
+			if structVarEscapesInExpr(name, a) {
+				return true
+			}
+		}
+		return false
+	case *DirectCallExpr:
+		if structVarEscapesInExpr(name, e.Callee) {
+			return true
+		}
+		for _, a := range e.Args {
+			if structVarEscapesInExpr(name, a) {
+				return true
+			}
+		}
+		return false
+	case *IndexExpr:
+		return structVarEscapesInExpr(name, e.List) || structVarEscapesInExpr(name, e.Index)
+	case *ListExpr:
+		for _, el := range e.Elements {
+			if structVarEscapesInExpr(name, el) {
+				return true
+			}
+		}
+		return false
+	case *MapExpr:
+		for i := range e.Keys {
+			if structVarEscapesInExpr(name, e.Keys[i]) || structVarEscapesInExpr(name, e.Values[i]) {
+				return true
+			}
+		}
+		return false
+	case *MatchExpr:
+		if structVarEscapesInExpr(name, e.Condition) {
+			return true
+		}
+		for _, c := range e.Clauses {
+			if c.Guard != nil && structVarEscapesInExpr(name, c.Guard) {
+				return true
+			}
+			if structVarEscapesInExpr(name, c.Result) {
+				return true
+			}
+		}
+		return e.DefaultExpr != nil && structVarEscapesInExpr(name, e.DefaultExpr)
+	case *FMAExpr:
+		return structVarEscapesInExpr(name, e.A) || structVarEscapesInExpr(name, e.B) || structVarEscapesInExpr(name, e.C)
+	case *BlockExpr:
+		return structVarEscapesInStmts(name, e.Statements)
+	case *JumpExpr:
+		return e.Value != nil && structVarEscapesInExpr(name, e.Value)
+	case *LambdaExpr:
+		// Referenced inside a nested lambda => captured => escape (conservative).
+		return structVarEscapesInExpr(name, e.Body)
+	case *NumberExpr, *StringExpr:
+		return false
+	default:
+		return true // unknown expr form — be conservative
+	}
+}
+
+// rewriteFieldAccessStmt replaces every `name.field` with the field's scalar var
+// throughout a statement, mutating in place.
+func rewriteFieldAccessStmt(stmt Statement, name string, fieldToScalar map[string]string) {
+	switch s := stmt.(type) {
+	case *AssignStmt:
+		s.Value = rewriteFieldAccessExpr(s.Value, name, fieldToScalar)
+	case *ExpressionStmt:
+		s.Expr = rewriteFieldAccessExpr(s.Expr, name, fieldToScalar)
+	case *LoopStmt:
+		s.Iterable = rewriteFieldAccessExpr(s.Iterable, name, fieldToScalar)
+		for _, b := range s.Body {
+			rewriteFieldAccessStmt(b, name, fieldToScalar)
+		}
+	case *WhileStmt:
+		s.Condition = rewriteFieldAccessExpr(s.Condition, name, fieldToScalar)
+		for _, b := range s.Body {
+			rewriteFieldAccessStmt(b, name, fieldToScalar)
+		}
+	case *JumpStmt:
+		if s.Value != nil {
+			s.Value = rewriteFieldAccessExpr(s.Value, name, fieldToScalar)
+		}
+	case *MapUpdateStmt:
+		s.Index = rewriteFieldAccessExpr(s.Index, name, fieldToScalar)
+		s.Value = rewriteFieldAccessExpr(s.Value, name, fieldToScalar)
+	}
+}
+
+func rewriteFieldAccessExpr(expr Expression, name string, fieldToScalar map[string]string) Expression {
+	switch e := expr.(type) {
+	case *FieldAccessExpr:
+		if id, ok := e.Object.(*IdentExpr); ok && id.Name == name {
+			if scalar, found := fieldToScalar[e.FieldName]; found {
+				return &IdentExpr{Name: scalar}
+			}
+		}
+		e.Object = rewriteFieldAccessExpr(e.Object, name, fieldToScalar)
+		return e
+	case *BinaryExpr:
+		e.Left = rewriteFieldAccessExpr(e.Left, name, fieldToScalar)
+		e.Right = rewriteFieldAccessExpr(e.Right, name, fieldToScalar)
+		return e
+	case *UnaryExpr:
+		e.Operand = rewriteFieldAccessExpr(e.Operand, name, fieldToScalar)
+		return e
+	case *CastExpr:
+		e.Expr = rewriteFieldAccessExpr(e.Expr, name, fieldToScalar)
+		return e
+	case *LengthExpr:
+		e.Operand = rewriteFieldAccessExpr(e.Operand, name, fieldToScalar)
+		return e
+	case *CallExpr:
+		for i := range e.Args {
+			e.Args[i] = rewriteFieldAccessExpr(e.Args[i], name, fieldToScalar)
+		}
+		return e
+	case *DirectCallExpr:
+		e.Callee = rewriteFieldAccessExpr(e.Callee, name, fieldToScalar)
+		for i := range e.Args {
+			e.Args[i] = rewriteFieldAccessExpr(e.Args[i], name, fieldToScalar)
+		}
+		return e
+	case *IndexExpr:
+		e.List = rewriteFieldAccessExpr(e.List, name, fieldToScalar)
+		e.Index = rewriteFieldAccessExpr(e.Index, name, fieldToScalar)
+		return e
+	case *ListExpr:
+		for i := range e.Elements {
+			e.Elements[i] = rewriteFieldAccessExpr(e.Elements[i], name, fieldToScalar)
+		}
+		return e
+	case *MapExpr:
+		for i := range e.Keys {
+			e.Keys[i] = rewriteFieldAccessExpr(e.Keys[i], name, fieldToScalar)
+			e.Values[i] = rewriteFieldAccessExpr(e.Values[i], name, fieldToScalar)
+		}
+		return e
+	case *MatchExpr:
+		e.Condition = rewriteFieldAccessExpr(e.Condition, name, fieldToScalar)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				c.Guard = rewriteFieldAccessExpr(c.Guard, name, fieldToScalar)
+			}
+			c.Result = rewriteFieldAccessExpr(c.Result, name, fieldToScalar)
+		}
+		if e.DefaultExpr != nil {
+			e.DefaultExpr = rewriteFieldAccessExpr(e.DefaultExpr, name, fieldToScalar)
+		}
+		return e
+	case *FMAExpr:
+		e.A = rewriteFieldAccessExpr(e.A, name, fieldToScalar)
+		e.B = rewriteFieldAccessExpr(e.B, name, fieldToScalar)
+		e.C = rewriteFieldAccessExpr(e.C, name, fieldToScalar)
+		return e
+	case *BlockExpr:
+		for _, s := range e.Statements {
+			rewriteFieldAccessStmt(s, name, fieldToScalar)
+		}
+		return e
+	case *JumpExpr:
+		if e.Value != nil {
+			e.Value = rewriteFieldAccessExpr(e.Value, name, fieldToScalar)
+		}
+		return e
+	}
+	return expr
+}
+
+// ---------------------------------------------------------------------------
+// Operator overloading for cstructs.
+//
+// `a + b` where a and b are both cstruct type V desugars to `V_add(a, b)` (when
+// that function is defined); `*` uses `V_mul` for struct*struct or `V_scale` for
+// struct*scalar; `-`→`V_sub`, `/`→`V_div`. Type inference is conservative — an
+// operand's type is only known from a typed param, a typed loop var, a struct
+// constructor, an `as`/`:` cast, or a call to a struct-returning function — so
+// scalar arithmetic is never rewritten.
+// ---------------------------------------------------------------------------
+
+var opOverloadSuffix = map[string]string{"+": "add", "-": "sub", "*": "mul", "/": "div"}
+
+func desugarOperatorOverloads(program *Program) {
+	// Names of all defined functions, and the cstruct type each returns (if any).
+	defined := make(map[string]bool)
+	retType := make(map[string]string)
+	for _, stmt := range program.Statements {
+		if as, ok := stmt.(*AssignStmt); ok {
+			if lam, ok := as.Value.(*LambdaExpr); ok {
+				defined[as.Name] = true
+				retType[as.Name] = opLambdaReturnType(lam)
+			}
+		}
+	}
+
+	process := func(body Expression, params map[string]string) {
+		env := make(map[string]string)
+		maps.Copy(env, params)
+		opCollectLocalTypes(body, env, retType)
+		opDesugarExpr(body, env, retType, defined)
+	}
+
+	for _, stmt := range program.Statements {
+		if as, ok := stmt.(*AssignStmt); ok {
+			if lam, ok := as.Value.(*LambdaExpr); ok {
+				process(lam.Body, lam.ParamCStructTypes)
+				continue
+			}
+		}
+		// Top-level non-function statement (rare): desugar with an empty env.
+		opDesugarStmt(stmt, map[string]string{}, retType, defined)
+	}
+}
+
+// opLambdaReturnType returns the cstruct type a lambda's body evaluates to (its
+// final expression: a constructor, cast, or call to a struct-returning func).
+func opLambdaReturnType(lam *LambdaExpr) string {
+	last := lam.Body
+	if b, ok := lam.Body.(*BlockExpr); ok {
+		if len(b.Statements) == 0 {
+			return ""
+		}
+		switch s := b.Statements[len(b.Statements)-1].(type) {
+		case *ExpressionStmt:
+			last = s.Expr
+		case *JumpStmt:
+			last = s.Value
+		default:
+			return ""
+		}
+	}
+	return opExprStructType(last, nil, nil)
+}
+
+// opExprStructType infers the cstruct type of an expression given a local type
+// env and the function-return-type map (both may be nil).
+func opExprStructType(expr Expression, env, retType map[string]string) string {
+	switch e := expr.(type) {
+	case *CastExpr:
+		if optimizerCStructNames[e.Type] {
+			return e.Type
+		}
+	case *CallExpr:
+		if optimizerCStructNames[e.Function] {
+			return e.Function // a constructor
+		}
+		if retType != nil {
+			return retType[e.Function]
+		}
+	case *IdentExpr:
+		if env != nil {
+			return env[e.Name]
+		}
+	}
+	return ""
+}
+
+// opCollectLocalTypes scans a function body (recursing into nested control flow
+// but not nested lambdas) and records the cstruct type of struct-typed locals
+// and typed loop variables into env.
+func opCollectLocalTypes(expr Expression, env, retType map[string]string) {
+	switch e := expr.(type) {
+	case *BlockExpr:
+		for _, stmt := range e.Statements {
+			opCollectLocalTypesStmt(stmt, env, retType)
+		}
+	default:
+		// single-expression body: nothing to collect
+	}
+}
+
+func opCollectLocalTypesStmt(stmt Statement, env, retType map[string]string) {
+	switch s := stmt.(type) {
+	case *AssignStmt:
+		if !s.IsUpdate {
+			if t := opExprStructType(s.Value, env, retType); t != "" {
+				env[s.Name] = t
+			}
+		}
+	case *LoopStmt:
+		if optimizerCStructNames[s.IteratorType] {
+			env[s.Iterator] = s.IteratorType
+		}
+		for _, b := range s.Body {
+			opCollectLocalTypesStmt(b, env, retType)
+		}
+	case *WhileStmt:
+		for _, b := range s.Body {
+			opCollectLocalTypesStmt(b, env, retType)
+		}
+	}
+}
+
+func opDesugarStmt(stmt Statement, env, retType map[string]string, defined map[string]bool) {
+	switch s := stmt.(type) {
+	case *AssignStmt:
+		s.Value = opDesugarExpr(s.Value, env, retType, defined)
+	case *ExpressionStmt:
+		s.Expr = opDesugarExpr(s.Expr, env, retType, defined)
+	case *LoopStmt:
+		s.Iterable = opDesugarExpr(s.Iterable, env, retType, defined)
+		for _, b := range s.Body {
+			opDesugarStmt(b, env, retType, defined)
+		}
+	case *WhileStmt:
+		s.Condition = opDesugarExpr(s.Condition, env, retType, defined)
+		for _, b := range s.Body {
+			opDesugarStmt(b, env, retType, defined)
+		}
+	case *JumpStmt:
+		if s.Value != nil {
+			s.Value = opDesugarExpr(s.Value, env, retType, defined)
+		}
+	case *MapUpdateStmt:
+		s.Index = opDesugarExpr(s.Index, env, retType, defined)
+		s.Value = opDesugarExpr(s.Value, env, retType, defined)
+	}
+}
+
+func opDesugarExpr(expr Expression, env, retType map[string]string, defined map[string]bool) Expression {
+	switch e := expr.(type) {
+	case *BinaryExpr:
+		e.Left = opDesugarExpr(e.Left, env, retType, defined)
+		e.Right = opDesugarExpr(e.Right, env, retType, defined)
+		suffix, ok := opOverloadSuffix[e.Operator]
+		if !ok {
+			return e
+		}
+		lt := opExprStructType(e.Left, env, retType)
+		rt := opExprStructType(e.Right, env, retType)
+		// struct OP struct (same type): T_<op>
+		if lt != "" && lt == rt {
+			fn := lt + "_" + suffix
+			if defined[fn] {
+				return &CallExpr{Function: fn, Args: []Expression{e.Left, e.Right}}
+			}
+			return e
+		}
+		// struct * scalar  or  scalar * struct: T_scale(struct, scalar)
+		if e.Operator == "*" {
+			if lt != "" && rt == "" {
+				if fn := lt + "_scale"; defined[fn] {
+					return &CallExpr{Function: fn, Args: []Expression{e.Left, e.Right}}
+				}
+			} else if rt != "" && lt == "" {
+				if fn := rt + "_scale"; defined[fn] {
+					return &CallExpr{Function: fn, Args: []Expression{e.Right, e.Left}}
+				}
+			}
+		}
+		return e
+	case *CallExpr:
+		for i := range e.Args {
+			e.Args[i] = opDesugarExpr(e.Args[i], env, retType, defined)
+		}
+		return e
+	case *DirectCallExpr:
+		e.Callee = opDesugarExpr(e.Callee, env, retType, defined)
+		for i := range e.Args {
+			e.Args[i] = opDesugarExpr(e.Args[i], env, retType, defined)
+		}
+		return e
+	case *UnaryExpr:
+		e.Operand = opDesugarExpr(e.Operand, env, retType, defined)
+		return e
+	case *CastExpr:
+		e.Expr = opDesugarExpr(e.Expr, env, retType, defined)
+		return e
+	case *LengthExpr:
+		e.Operand = opDesugarExpr(e.Operand, env, retType, defined)
+		return e
+	case *FieldAccessExpr:
+		e.Object = opDesugarExpr(e.Object, env, retType, defined)
+		return e
+	case *IndexExpr:
+		e.List = opDesugarExpr(e.List, env, retType, defined)
+		e.Index = opDesugarExpr(e.Index, env, retType, defined)
+		return e
+	case *ListExpr:
+		for i := range e.Elements {
+			e.Elements[i] = opDesugarExpr(e.Elements[i], env, retType, defined)
+		}
+		return e
+	case *MapExpr:
+		for i := range e.Keys {
+			e.Keys[i] = opDesugarExpr(e.Keys[i], env, retType, defined)
+			e.Values[i] = opDesugarExpr(e.Values[i], env, retType, defined)
+		}
+		return e
+	case *MatchExpr:
+		e.Condition = opDesugarExpr(e.Condition, env, retType, defined)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				c.Guard = opDesugarExpr(c.Guard, env, retType, defined)
+			}
+			c.Result = opDesugarExpr(c.Result, env, retType, defined)
+		}
+		if e.DefaultExpr != nil {
+			e.DefaultExpr = opDesugarExpr(e.DefaultExpr, env, retType, defined)
+		}
+		return e
+	case *FMAExpr:
+		e.A = opDesugarExpr(e.A, env, retType, defined)
+		e.B = opDesugarExpr(e.B, env, retType, defined)
+		e.C = opDesugarExpr(e.C, env, retType, defined)
+		return e
+	case *BlockExpr:
+		// A nested lambda's body or block: process its statements with the same
+		// env (locals already collected for the enclosing function).
+		for _, s := range e.Statements {
+			opDesugarStmt(s, env, retType, defined)
+		}
+		return e
+	case *LambdaExpr:
+		// A nested lambda — process it with its own env (its typed params + the
+		// outer env, so it can still see outer struct vars it captures).
+		inner := make(map[string]string)
+		maps.Copy(inner, env)
+		maps.Copy(inner, e.ParamCStructTypes)
+		opCollectLocalTypes(e.Body, inner, retType)
+		e.Body = opDesugarExpr(e.Body, inner, retType, defined)
+		return e
+	}
+	return expr
 }

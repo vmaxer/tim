@@ -19595,6 +19595,8 @@ func getUnknownFunctions(program *Program) []string {
 		"eprint": true, "eprintln": true, "eprintf": true, // stderr printing with Result return
 		"exitln": true, "exitf": true, // stderr printing with exit(1)
 		"malloc": true, "free": true, // memory management built-ins
+		// Process/memory syscalls for fork-based parallelism (resolved from libSystem)
+		"fork": true, "waitpid": true, "mmap": true, "munmap": true, "proc_exit": true,
 		// Math functions (hardware instructions)
 		"sqrt": true, "sin": true, "cos": true, "tan": true,
 		"asin": true, "acos": true, "atan": true, "atan2": true,

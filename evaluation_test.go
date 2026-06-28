@@ -179,6 +179,220 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "fun_definition_syntax",
+			// `fun name(params) { ... }` desugars to `name = (params) -> { ... }`,
+			// with cstruct param types via `as V` or `: V`.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				fun vadd(a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				fun dotx(a: V, b: V) { a.x*b.x }
+				fun square(n) { n * n }
+				main = {
+					p = V(1.0, 2.0, 3.0)
+					q = V(10.0, 20.0, 30.0)
+					r = vadd(p, q)
+					println(r.x)
+					println(dotx(p, q))
+					println(square(6.0))
+				}
+			`,
+			expectedOutput: "11\n10\n36\n",
+			expectCompile:  true,
+		},
+		{
+			name: "typed_loop_variable",
+			// `@ v as float64 in range` and `@ b as Ball in list` — the cstruct
+			// iterator type lets the body read b.field directly.
+			code: `
+				cstruct Ball { cx as float64, cy as float64, cz as float64, R as float64 }
+				balls = [Ball(1.0,2.0,3.0,4.0), Ball(5.0,6.0,7.0,8.0)]
+				main = {
+					sum := 0.0
+					@ i as float64 in 0..<4 {
+						sum <- sum + i
+					}
+					println(sum)
+					@ b as Ball in balls {
+						println(b.cx + b.R)
+					}
+				}
+			`,
+			expectedOutput: "6\n5\n13\n",
+			expectCompile:  true,
+		},
+		{
+			name: "operator_overloading_cstruct",
+			// `a OP b` on cstruct operands desugars to the named operator function
+			// (V_add/V_sub/V_mul/V_scale) when defined; scalar arithmetic is left
+			// untouched.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				V_add   = (a: V, b: V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				V_sub   = (a: V, b: V) -> V(a.x-b.x, a.y-b.y, a.z-b.z)
+				V_mul   = (a: V, b: V) -> V(a.x*b.x, a.y*b.y, a.z*b.z)
+				V_scale = (a: V, s) -> V(a.x*s, a.y*s, a.z*s)
+				vdot    = (a: V, b: V) -> a.x*b.x + a.y*b.y + a.z*b.z
+				main = {
+					a = V(1.0, 2.0, 3.0)
+					b = V(10.0, 20.0, 30.0)
+					r = (a + b) as V
+					println(r.x)
+					s = (a - b) as V
+					println(s.y)
+					p = (a * b) as V
+					println(p.z)
+					q = (a * 2.0) as V
+					println(q.x)
+					q2 = (3.0 * a) as V
+					println(q2.y)
+					println(5.0 + 3.0 * 2.0)
+					println(vdot(a, b) + 1.0)
+				}
+			`,
+			expectedOutput: "11\n-18\n90\n2\n6\n11\n141\n",
+			expectCompile:  true,
+		},
+		{
+			name: "multiline_calls_and_lists",
+			// Function-call arguments and list elements may span multiple lines.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				add3 = (a, b, c) -> a + b + c
+				main = {
+					p = V(1.0,
+					      2.0,
+					      3.0) as V
+					println(p.y)
+					s = add3(10.0,
+					         20.0,
+					         30.0)
+					println(s)
+					lst = [4.0,
+					       5.0,
+					       6.0]
+					println(lst[2])
+				}
+			`,
+			expectedOutput: "2\n60\n6\n",
+			expectCompile:  true,
+		},
+		{
+			name: "for_loop_alias",
+			// `for` is a full alias for `@`-loops: range, typed cstruct iterator.
+			code: `
+				cstruct Ball { cx as float64, R as float64 }
+				balls = [Ball(1.0, 4.0), Ball(5.0, 8.0)]
+				main = {
+					sum := 0.0
+					for i in 0..<5 {
+						sum <- sum + i
+					}
+					println(sum)
+					for b as Ball in balls {
+						println(b.cx + b.R)
+					}
+				}
+			`,
+			expectedOutput: "10\n5\n13\n",
+			expectCompile:  true,
+		},
+		{
+			name: "colon_as_cast_alias",
+			// `:` aliases `as` in unambiguous positions: postfix cast, lambda
+			// params, and loop iterator type — while map literals keep `:`.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				balls = [V(1.0,2.0,3.0), V(4.0,5.0,6.0)]
+				addx = (a: V, b: V) -> a.x + b.x
+				main = {
+					p = balls[0] : V
+					println(p.x)
+					m = { x: 10.0, y: 20.0 }
+					println(m.x)
+					nm = { 5: 99.0 }
+					println(nm[5])
+					for b: V in balls {
+						println(b.z)
+					}
+					println(addx(balls[0] : V, balls[1] : V))
+				}
+			`,
+			expectedOutput: "1\n10\n99\n3\n6\n5\n",
+			expectCompile:  true,
+		},
+		{
+			name: "fork_mmap_shared_memory",
+			// fork-based parallelism primitives: a child writes to an mmap'd
+			// shared buffer, the parent reaps it and reads the value back. This is
+			// the basis of the metaballs' multi-process renderer.
+			code: `
+				import libc as c
+				cstruct Buf { v as uint32 }
+				main = {
+					buf = mmap(0, 64, 3, 4097, -1, 0) or! { exitf("mmap\n") }
+					write_u32(buf, 0, 42)
+					pid = fork()
+					ischild = { | pid == 0.0 => 1.0 ~> 0.0 }
+					ischild > 0.5 {
+						write_u32(buf, 0, 1234)
+						proc_exit(0)
+					}
+					waitpid(pid, 0, 0)
+					b = buf as Buf
+					println(b.v)
+				}
+			`,
+			expectedOutput: "1234\n",
+			expectCompile:  true,
+		},
+		{
+			name: "sroa_local_struct",
+			// SROA: a non-escaping local `p = Ctor(...)` used only via p.field is
+			// scalarized (no allocation). Exercises multi-level inlining collapsing
+			// to a constructor, plus a struct local read inside a loop.
+			code: `
+				cstruct V { x as float64, y as float64, z as float64 }
+				vadd   = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vscale = (a as V, s) -> V(a.x*s, a.y*s, a.z*s)
+				at     = (ro as V, rd as V, t) -> vadd(ro, vscale(rd, t))
+				fun fieldlike(ro as V, rd as V, t) {
+					p = at(ro, rd, t)
+					sum := 0.0
+					@ i in 0..<3 {
+						sum <- sum + p.x + p.y + p.z
+					}
+					sum
+				}
+				main = {
+					ro = V(1.0, 2.0, 3.0)
+					rd = V(10.0, 20.0, 30.0)
+					println(fieldlike(ro, rd, 2.0))
+				}
+			`,
+			// p = (1+20, 2+40, 3+60) = (21,42,63); sum over 3 = 3*(21+42+63)=378
+			expectedOutput: "378\n",
+			expectCompile:  true,
+		},
+		{
+			name: "small_match_helpers_inline",
+			// Tiny guard-match helpers (predicate/clamp/quintic) must inline
+			// correctly when used inside arithmetic — the hot-loop call-overhead
+			// optimization.
+			code: `
+				clampf  = (x, lo, hi) -> { | x < lo => lo | x > hi => hi ~> x }
+				ltf     = (a, b) -> { | a < b => 1.0 ~> 0.0 }
+				quintic = (x) -> { | x >= 1.0 => 0.0 | x <= 0.0 => 1.0 ~> 1.0 - x*x*x*(x*(x*6.0 - 15.0) + 10.0) }
+				main = {
+					println(clampf(0.5, 0.0, 1.0) + clampf(9.0, 0.0, 1.0))
+					println(ltf(3.0, 5.0) * 10.0 + ltf(5.0, 3.0))
+					println(quintic(0.5))
+					println(quintic(1.5))
+				}
+			`,
+			expectedOutput: "1.5\n10\n0.5\n0\n",
+			expectCompile:  true,
+		},
+		{
 			name: "expr_register_stack",
 			// Deeply nested arithmetic exercises the FP expression register stack
 			// (left operand kept in d24+ instead of a memory spill) and its

@@ -486,6 +486,10 @@ func (l *Lexer) NextToken() Token {
 			return Token{Type: TOKEN_CONTINUE, Value: value, Line: l.line, Column: tokenColumn}
 		case "foreach":
 			return Token{Type: TOKEN_FOREACH, Value: value, Line: l.line, Column: tokenColumn}
+		case "for":
+			// `for` is a full alias for `@`-loops: lexes to TOKEN_AT so every loop
+			// form (for-each, typed iterator, condition, parallel) works unchanged.
+			return Token{Type: TOKEN_AT, Value: value, Line: l.line, Column: tokenColumn}
 		case "malloc":
 			return Token{Type: TOKEN_MALLOC, Value: value, Line: l.line, Column: tokenColumn}
 		case "free":

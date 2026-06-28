@@ -375,6 +375,20 @@ func (acg *ARM64CodeGen) computeCaptures(body Expression, params []string) []str
 	return caps
 }
 
+// arm64UnaryFPOps maps single-arg math functions to the ARM64 double-precision
+// FP instruction (operating d0 -> d0) that computes them directly, avoiding a
+// libm call. Encodings: fsqrt d0,d0 / fabs d0,d0 / frint{m,p,z,n} d0,d0.
+var arm64UnaryFPOps = map[string]uint32{
+	"sqrt":  0x1e61c000, // fsqrt d0, d0
+	"fabs":  0x1e60c000, // fabs  d0, d0
+	"abs":   0x1e60c000, // fabs  d0, d0 (Tim's float abs)
+	"floor": 0x1e654000, // frintm d0, d0 (round toward -inf)
+	"ceil":  0x1e64c000, // frintp d0, d0 (round toward +inf)
+	"trunc": 0x1e65c000, // frintz d0, d0 (round toward zero)
+	// `round` is intentionally NOT here: frintn is ties-to-even while C round() is
+	// ties-away-from-zero, so it keeps using the libm call for exact semantics.
+}
+
 // emitFmovD emits `fmov d{dst}, d{src}` (register move between FP registers).
 func (acg *ARM64CodeGen) emitFmovD(dst, src uint32) {
 	instr := uint32(0x1e604000) | (src << 5) | dst
@@ -3579,6 +3593,19 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 			return acg.compileDirectCall(directCall)
 		}
 
+		// Hardware-instruction fast path: these map to a single ARM64 FP op, so
+		// emit it inline instead of a libm call (which on macOS also pays an
+		// expensive dynamic-link stub indirection — the stub cost dominated sqrt
+		// in profiles of the metaballs). Must run BEFORE the implicit-`c` libm
+		// route below, which would otherwise emit a call for sqrt/floor/etc.
+		if op, ok := arm64UnaryFPOps[call.Function]; ok && len(call.Args) == 1 {
+			if err := acg.compileExpression(call.Args[0]); err != nil { // arg in d0
+				return err
+			}
+			acg.out.out.writer.WriteBytes([]byte{byte(op), byte(op >> 8), byte(op >> 16), byte(op >> 24)})
+			return nil
+		}
+
 		// Check if it's a C function from the "c" namespace (implicit)
 		// This handles bare function names like sin(), cos(), etc. from libm
 		if constants, ok := acg.cConstants["c"]; ok {
@@ -3590,12 +3617,10 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 			}
 		}
 
-		// Fallback for standard C functions if not found in constants
 		// This is critical for macOS/ARM64 where header parsing might be flaky in tests
 		switch call.Function {
 		case "sin", "cos", "tan", "asin", "acos", "atan",
-			"sqrt", "cbrt", "exp", "exp2", "log", "log2", "log10",
-			"fabs", "floor", "ceil", "round", "trunc":
+			"cbrt", "exp", "exp2", "log", "log2", "log10":
 			// Single-argument libm functions: double f(double)
 			sig := &CFunctionSignature{
 				ReturnType: "double",
@@ -3630,6 +3655,39 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 				Params:     []CFunctionParam{{Type: "const char*", Name: "s"}},
 			}
 			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "fork", "getpid":
+			sig := &CFunctionSignature{ReturnType: "int", Params: nil}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "mmap":
+			sig := &CFunctionSignature{
+				ReturnType: "void*",
+				Params: []CFunctionParam{
+					{Type: "void*", Name: "addr"}, {Type: "size_t", Name: "len"},
+					{Type: "int", Name: "prot"}, {Type: "int", Name: "flags"},
+					{Type: "int", Name: "fd"}, {Type: "long", Name: "offset"},
+				},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "munmap":
+			sig := &CFunctionSignature{
+				ReturnType: "int",
+				Params:     []CFunctionParam{{Type: "void*", Name: "addr"}, {Type: "size_t", Name: "len"}},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "waitpid":
+			sig := &CFunctionSignature{
+				ReturnType: "int",
+				Params: []CFunctionParam{
+					{Type: "int", Name: "pid"}, {Type: "void*", Name: "status"}, {Type: "int", Name: "options"},
+				},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "proc_exit":
+			// Immediate process exit (libc _exit): no atexit handlers, no stdio
+			// flush, no framework teardown — essential for a forked worker that
+			// must not run the parent's Metal/CoreFoundation cleanup.
+			sig := &CFunctionSignature{ReturnType: "void", Params: []CFunctionParam{{Type: "int", Name: "code"}}}
+			return acg.compileCFunctionCall("_exit", call.Args, sig)
 		}
 
 		// A call to a module-level named function that isn't visible as a stack
@@ -4320,6 +4378,12 @@ func (acg *ARM64CodeGen) compileListLoop(stmt *LoopStmt) error {
 	acg.stackSize += 8
 	iterOffset := acg.stackSize
 	acg.stackVars[stmt.Iterator] = iterOffset
+
+	// A cstruct-typed iterator (`@ b as Ball in ...`) lets the body read b.field
+	// directly without a per-iteration `b = elem as Ball` cast.
+	if _, isStruct := acg.cstructs[stmt.IteratorType]; isStruct {
+		acg.varCStructType[stmt.Iterator] = stmt.IteratorType
+	}
 
 	// Loop start label
 	loopStartPos := acg.eb.text.Len()

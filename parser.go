@@ -118,6 +118,7 @@ type Parser struct {
 	inMatchBlock     bool                    // True when parsing inside a match block (prevents nested match parsing)
 	matchResultDepth int                     // >0 while parsing a match-clause result: a top-level '|' starts the next guard clause, not a pipe
 	inConditionLoop  bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
+	inMapKey         bool                    // True while parsing a map-literal key, so a ':' there is the key separator, not a `:`-as-`as` cast
 	scopes           []map[string]bool       // Stack of variable scopes for shadow detection
 	lambdaParams     []string                // Temporary storage for lambda parameters being parsed
 	pendingHoists    []Statement             // Synthesized top-level defs to inject before the current statement
@@ -1046,7 +1047,12 @@ func (p *Parser) parseStatement() Statement {
 	// Check for fun keyword (optional function definition marker)
 	if p.current.Type == TOKEN_FUN {
 		p.nextToken() // skip 'fun'
-		// Now expect identifier and assignment
+		// `fun name(params) { ... }` is a function-definition form that desugars to
+		// `name = (params) -> { ... }`. Detect it by `IDENT (`; otherwise fall back
+		// to `fun name = ...` assignment.
+		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_LPAREN {
+			return p.parseFunDefinition()
+		}
 		return p.parseAssignment()
 	}
 
@@ -1448,6 +1454,97 @@ func (p *Parser) parseFString() Expression {
 }
 
 // Confidence that this function is working: 100%
+// isCastTypeName reports whether name denotes a type usable as a cast target —
+// a declared cstruct or a built-in Tim/C type. Used to recognize the `:`-as-`as`
+// shorthand (and to keep `{ x : Type }` from being misread as a map literal).
+func (p *Parser) isCastTypeName(name string) bool {
+	if _, ok := p.cstructs[name]; ok {
+		return true
+	}
+	switch name {
+	case "int8", "int16", "int32", "int64",
+		"uint8", "uint16", "uint32", "uint64",
+		"char", "short", "int", "long", "uchar", "ushort", "uint", "ulong",
+		"size_t", "ssize_t", "ptrdiff_t",
+		"float", "float32", "float64", "double",
+		"cstr", "cptr", "cstring", "ptr", "pointer",
+		"num", "str", "number", "string", "list", "map", "addr",
+		"bool", "boolean", "cbool", "void":
+		return true
+	}
+	return false
+}
+
+// parseFunDefinition parses the `fun name(params) { body }` function-definition
+// form (the 'fun' keyword and the name being on p.current). Parameters may carry
+// a cstruct type via `name as Type` or `name: Type`. It desugars to
+// `name = (params) -> body`. An optional return-type annotation (`) as Type` /
+// `) : Type`) is accepted and ignored (the runtime type is uniform float64).
+func (p *Parser) parseFunDefinition() Statement {
+	name := p.current.Value
+	p.nextToken() // skip function name
+	p.nextToken() // skip '('
+
+	var params []string
+	paramTypes := make(map[string]string)
+	variadic := ""
+	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
+		p.skipNewlines()
+		if p.current.Type != TOKEN_IDENT {
+			p.error("expected parameter name in fun definition")
+			break
+		}
+		pname := p.current.Value
+		p.nextToken()
+
+		if p.current.Type == TOKEN_ELLIPSIS {
+			variadic = pname
+			p.nextToken()
+			break
+		}
+		params = append(params, pname)
+
+		// Optional type annotation: `name as Type` or `name: Type`.
+		if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+			p.nextToken()
+			if p.current.Type != TOKEN_IDENT {
+				p.error("expected type name after type annotation in fun parameter")
+			}
+			paramTypes[pname] = p.current.Value
+			p.nextToken()
+		}
+
+		if p.current.Type == TOKEN_COMMA {
+			p.nextToken()
+		}
+	}
+	p.nextToken() // skip ')'
+
+	// Optional, ignored return-type annotation: `) as Type` or `) : Type`.
+	if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+		p.nextToken()
+		if p.current.Type == TOKEN_IDENT {
+			p.nextToken()
+		}
+	}
+	// Optional explicit arrow before the body: `fun f() -> expr`.
+	if p.current.Type == TOKEN_ARROW {
+		p.nextToken()
+	}
+
+	p.lambdaParams = params
+	body := p.parseLambdaBody()
+	p.lambdaParams = nil
+
+	lambda := &LambdaExpr{
+		Params:            params,
+		ParamCStructTypes: paramTypes,
+		VariadicParam:     variadic,
+		Body:              body,
+	}
+	return &AssignStmt{Name: name, Value: lambda}
+}
+
 func (p *Parser) parseAssignment() *AssignStmt {
 	// Check for shadow keyword
 	hasShadow := false
@@ -1876,8 +1973,11 @@ func (p *Parser) parseMapLiteralBody() *MapExpr {
 			key = &NumberExpr{Value: float64(hashValue)}
 			p.nextToken() // move past identifier
 		} else {
-			// Numeric key or expression
+			// Numeric key or expression — suppress `:`-as-cast so the key's
+			// trailing ':' stays the map separator.
+			p.inMapKey = true
 			key = p.parseExpression()
+			p.inMapKey = false
 			p.nextToken() // move past key
 		}
 
@@ -1904,8 +2004,10 @@ func (p *Parser) parseMapLiteralBody() *MapExpr {
 				key = &NumberExpr{Value: float64(hashValue)}
 				p.nextToken() // move past identifier
 			} else {
-				// Numeric key or expression
+				// Numeric key or expression — suppress `:`-as-cast (see above).
+				p.inMapKey = true
 				key = p.parseExpression()
+				p.inMapKey = false
 				p.nextToken() // move past key
 			}
 
@@ -1979,6 +2081,12 @@ func (p *Parser) disambiguateBlock() BlockType {
 					case "num", "str", "list", "map", "bool",
 						"cstring", "cptr", "cint", "clong",
 						"cfloat", "cdouble", "cbool", "cvoid":
+						isTypeAnnotation = true
+					}
+					// Also accept a cstruct name or any cast type after `:` (the
+					// `:`-as-`as` shorthand, e.g. `{ b = g_balls[i] : Ball }`), so
+					// such a block isn't misread as a map literal.
+					if !isTypeAnnotation && p.isCastTypeName(nextTok.Value) {
 						isTypeAnnotation = true
 					}
 				} else if nextTok.Type == TOKEN_BOOL {
@@ -2660,9 +2768,12 @@ func (p *Parser) parseLoopStatement() Statement {
 			// Not an identifier, must be start of condition expression (or error)
 			isConditionLoop = true
 		} else {
-			// Have identifier - check what comes after
-			if p.peek.Type != TOKEN_IN && p.peek.Type != TOKEN_COMMA {
-				// Not followed by 'in' or ',' - must be condition loop
+			// Have identifier - check what comes after. `in` (for-each), `,`
+			// (receive loop), or a type annotation `as`/`:` (typed iterator,
+			// `@ b as Ball in ...` / `@ b: Ball in ...`) all mean a for-each/receive
+			// loop; anything else is a condition loop.
+			if p.peek.Type != TOKEN_IN && p.peek.Type != TOKEN_COMMA && p.peek.Type != TOKEN_AS && p.peek.Type != TOKEN_COLON {
+				// Not followed by 'in', ',', 'as', or ':' - must be condition loop
 				isConditionLoop = true
 			}
 		}
@@ -2755,6 +2866,19 @@ func (p *Parser) parseLoopStatement() Statement {
 		// For-each or receive loop - we have an identifier
 		firstIdent := p.current.Value
 		p.nextToken() // skip identifier
+
+		// Optional type annotation on the loop variable: `@ b as Ball in ...` or
+		// the `:` shorthand `@ b: Ball in ...`. The runtime value is still a
+		// float64; for a cstruct type this lets the body access `b.field` directly.
+		iteratorType := ""
+		if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+			p.nextToken() // skip 'as' / ':'
+			if p.current.Type != TOKEN_IDENT {
+				p.error("expected type name after type annotation in loop variable")
+			}
+			iteratorType = p.current.Value
+			p.nextToken() // skip type name
+		}
 
 		// Check if this is a receive loop: @ msg, from in ":5000"
 		if p.current.Type == TOKEN_COMMA {
@@ -2937,6 +3061,7 @@ func (p *Parser) parseLoopStatement() Statement {
 
 			return &LoopStmt{
 				Iterator:      iterator,
+				IteratorType:  iteratorType,
 				Iterable:      iterable,
 				Body:          body,
 				MaxIterations: maxIterations,
@@ -4133,11 +4258,14 @@ func (p *Parser) parsePostfix() Expression {
 			// Handle postfix length operator: xs#
 			p.nextToken() // skip to #
 			expr = &UnaryExpr{Operator: "#", Operand: expr}
-		} else if p.peek.Type == TOKEN_AS {
-			// Handle type cast: expr as type
+		} else if p.peek.Type == TOKEN_AS || (p.peek.Type == TOKEN_COLON && !p.inMapKey) {
+			// Handle type cast: `expr as Type` or the `:` shorthand `expr : Type`.
+			// The `:` form is suppressed while parsing a map key (`{5: 10}`) so the
+			// colon there stays the key separator. (Block-level disambiguation
+			// recognizes `: <TypeName>` as an annotation, not a map, separately.)
 			isRawBitcast := false
 			p.nextToken() // skip current expr
-			p.nextToken() // skip 'as'
+			p.nextToken() // skip 'as' / ':'
 
 			// Parse the cast type
 			var castType string
@@ -4503,17 +4631,20 @@ func (p *Parser) parsePrimary() Expression {
 		if p.peek.Type == TOKEN_LPAREN {
 			p.nextToken() // skip identifier
 			p.nextToken() // skip '('
+			p.skipNewlines()
 			args := []Expression{}
 
 			if p.current.Type != TOKEN_RPAREN {
 				args = append(args, p.parseExpression())
 				for p.peek.Type == TOKEN_COMMA {
-					p.nextToken() // skip current
-					p.nextToken() // skip ','
+					p.nextToken()    // skip current
+					p.nextToken()    // skip ','
+					p.skipNewlines() // allow arguments to span lines
 					args = append(args, p.parseExpression())
 				}
-				// current should be on last arg, peek should be ')'
-				p.nextToken() // move to ')'
+				// Advance past the last arg; allow newlines before ')'.
+				p.nextToken()
+				p.skipNewlines()
 			}
 			// current is now on ')', whether we had args or not
 
@@ -4653,8 +4784,8 @@ func (p *Parser) parsePrimary() Expression {
 
 			// Optional type annotation: `as Type` (if not variadic). Captured so a
 			// cstruct-typed param's fields resolve in the body without manual casts.
-			if variadicParam == "" && p.current.Type == TOKEN_AS {
-				p.nextToken() // skip 'as'
+			if variadicParam == "" && (p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON) {
+				p.nextToken() // skip 'as' / ':'
 				if p.current.Type != TOKEN_IDENT {
 					// Not a valid lambda, restore and parse as expression
 					p.restoreState(lambdaState)
@@ -4692,8 +4823,8 @@ func (p *Parser) parsePrimary() Expression {
 					params = append(params, paramName)
 
 					// Optional type annotation (captured for cstruct field access).
-					if p.current.Type == TOKEN_AS {
-						p.nextToken() // skip 'as'
+					if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+						p.nextToken() // skip 'as' / ':'
 						if p.current.Type != TOKEN_IDENT {
 							// Not a valid lambda, restore and parse as expression
 							p.restoreState(lambdaState)

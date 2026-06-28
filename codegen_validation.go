@@ -24,6 +24,7 @@ func (fc *TimCompiler) validateGeneratedCode() []string {
 	// List of common C runtime functions that are always available
 	commonCFunctions := map[string]bool{
 		"printf": true, "exit": true, "malloc": true, "free": true, "realloc": true,
+		"fork": true, "waitpid": true, "mmap": true, "munmap": true, "getpid": true, "_exit": true,
 		"getenv": true, "strlen": true, "memcpy": true, "memset": true, "pow": true,
 		"fflush": true, "ExitProcess": true, "GetProcessHeap": true, "HeapAlloc": true,
 		// Two-argument libm functions (double f(double, double)).
