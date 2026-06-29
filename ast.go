@@ -143,10 +143,11 @@ func (c *CImportStmt) statementNode() {}
 
 // CStructField represents a field in a C struct
 type CStructField struct {
-	Name   string // Field name
-	Type   string // C type (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, cstr, ptr)
-	Offset int    // Byte offset from struct start (calculated)
-	Size   int    // Size in bytes (calculated)
+	Name       string // Field name
+	Type       string // C type (i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, cstr, ptr)
+	StructName string // For a nested cstruct-valued field: the cstruct type name (Type is "ptr")
+	Offset     int    // Byte offset from struct start (calculated)
+	Size       int    // Size in bytes (calculated)
 }
 
 // CStructDecl represents a C-compatible struct definition

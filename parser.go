@@ -586,6 +586,57 @@ func (p *Parser) parseStatementBlock() []Statement {
 	return body
 }
 
+// parseIfExpression parses `if c { A } elif c2 { B } else { C }` in expression
+// position and lowers it to a guard MatchExpr (lazy: only the taken branch runs).
+// Each `{ … }` is a block whose value is its last expression. current is on `if`.
+func (p *Parser) parseIfExpression() Expression {
+	var clauses []*MatchClause
+	for p.current.Type == TOKEN_IF || p.current.Type == TOKEN_ELIF {
+		p.nextToken() // skip 'if' / 'elif'
+
+		// Parse the condition without letting the body '{' be eaten as a block arg.
+		oldCL := p.inConditionLoop
+		p.inConditionLoop = true
+		cond := p.parseExpression()
+		p.inConditionLoop = oldCL
+
+		if p.peek.Type != TOKEN_LBRACE {
+			p.error("expected '{' after if/elif condition")
+		}
+		p.nextToken()            // move to '{'
+		body := p.parsePrimary() // parse the { … } block as a BlockExpr value
+		clauses = append(clauses, &MatchClause{Guard: cond, Result: body})
+
+		for p.peek.Type == TOKEN_NEWLINE {
+			p.nextToken()
+		}
+		if p.peek.Type == TOKEN_ELIF {
+			p.nextToken() // move to 'elif'
+			continue
+		}
+		break
+	}
+
+	var defaultExpr Expression = &NumberExpr{Value: 0.0}
+	for p.peek.Type == TOKEN_NEWLINE {
+		p.nextToken()
+	}
+	if p.peek.Type == TOKEN_ELSE {
+		p.nextToken() // move to 'else'
+		if p.peek.Type != TOKEN_LBRACE {
+			p.error("expected '{' after else")
+		}
+		p.nextToken() // move to '{'
+		defaultExpr = p.parsePrimary()
+	}
+
+	return &MatchExpr{
+		Condition:   &NumberExpr{Value: 1.0},
+		Clauses:     clauses,
+		DefaultExpr: defaultExpr,
+	}
+}
+
 func (p *Parser) parseIfStatement() *IfStmt {
 	var branches []IfBranch
 
@@ -763,6 +814,34 @@ func (p *Parser) parseAliasStmt() *AliasStmt {
 	}
 }
 
+// cTypeAliases maps short type names to the canonical C type used internally.
+var cTypeAliases = map[string]string{
+	"i8": "int8", "i16": "int16", "i32": "int32", "i64": "int64",
+	"u8": "uint8", "u16": "uint16", "u32": "uint32", "u64": "uint64",
+	"f32": "float32", "f64": "float64",
+}
+
+// resolveCStructFieldType normalizes a struct field type name. It returns the
+// canonical C type and, for a nested cstruct-valued field, the cstruct's name
+// (the field is then stored as an 8-byte pointer).
+func (p *Parser) resolveCStructFieldType(name string) (ctype, structName string) {
+	if canon, ok := cTypeAliases[name]; ok {
+		name = canon
+	}
+	switch name {
+	case "int8", "int16", "int32", "int64",
+		"uint8", "uint16", "uint32", "uint64",
+		"float32", "float64", "ptr", "cstr":
+		return name, ""
+	}
+	if _, ok := p.cstructs[name]; ok {
+		// A nested cstruct value is held by pointer (8 bytes).
+		return "ptr", name
+	}
+	p.error(fmt.Sprintf("invalid field type '%s' (a primitive like f64/i32/ptr, or a cstruct name)", name))
+	return "ptr", ""
+}
+
 func (p *Parser) parseCStructDecl() *CStructDecl {
 	p.nextToken() // skip 'cstruct'
 
@@ -810,52 +889,49 @@ func (p *Parser) parseCStructDecl() *CStructDecl {
 	p.nextToken() // skip '{'
 	p.skipNewlines()
 
-	// Parse field list: field1: type1, field2: type2, ...
+	// Parse field list. A field is `name as Type` or `name: Type`; several names
+	// may share one type, `x, y, z: f64`. Type names may use short aliases
+	// (f64/u32/...) or another cstruct's name (a nested value field).
 	fields := []CStructField{}
 	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		// Parse field name
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected field name in struct definition")
+		// One or more comma-separated field names up to the `as`/`:` separator.
+		group := []string{}
+		for {
+			if p.current.Type != TOKEN_IDENT {
+				p.error("expected field name in struct definition")
+				break
+			}
+			group = append(group, p.current.Value)
+			p.nextToken() // skip field name
+			if p.current.Type == TOKEN_COMMA {
+				p.nextToken() // skip ',' between grouped names
+				p.skipNewlines()
+				continue
+			}
+			break
 		}
-		fieldName := p.current.Value
-		p.nextToken() // skip field name
 
-		// Expect 'as'
-		if p.current.Type != TOKEN_AS {
-			p.error("expected 'as' after field name")
+		// Separator: `as` or `:`.
+		if p.current.Type != TOKEN_AS && p.current.Type != TOKEN_COLON {
+			p.error("expected 'as' or ':' after field name(s)")
 		}
-		p.nextToken() // skip 'as'
+		p.nextToken() // skip 'as' / ':'
 
-		// Parse field type
 		if p.current.Type != TOKEN_IDENT {
 			p.error("expected field type")
 		}
-		fieldType := p.current.Value
+		fieldType, structName := p.resolveCStructFieldType(p.current.Value)
+		p.nextToken() // skip type name
 
-		// Validate C type
-		validTypes := map[string]bool{
-			"int8": true, "int16": true, "int32": true, "int64": true,
-			"uint8": true, "uint16": true, "uint32": true, "uint64": true,
-			"float32": true, "float64": true, "ptr": true, "cstr": true,
-		}
-		if !validTypes[fieldType] {
-			p.error(fmt.Sprintf("invalid C type '%s' (must be int8/int16/int32/int64/uint8/uint16/uint32/uint64/float32/float64/ptr/cstr)", fieldType))
+		for _, fname := range group {
+			fields = append(fields, CStructField{Name: fname, Type: fieldType, StructName: structName})
 		}
 
-		fields = append(fields, CStructField{
-			Name: fieldName,
-			Type: fieldType,
-		})
-
-		p.nextToken() // skip field type
 		p.skipNewlines()
-
-		// Comma is optional between fields (newlines separate them)
 		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip ',' if present
+			p.nextToken() // optional ',' between fields
 			p.skipNewlines()
 		}
-		// Just continue to next field or closing brace
 	}
 
 	// Expect '}'
@@ -1047,11 +1123,17 @@ func (p *Parser) parseStatement() Statement {
 	// Check for fun keyword (optional function definition marker)
 	if p.current.Type == TOKEN_FUN {
 		p.nextToken() // skip 'fun'
-		// `fun name(params) { ... }` is a function-definition form that desugars to
-		// `name = (params) -> { ... }`. Detect it by `IDENT (`; otherwise fall back
-		// to `fun name = ...` assignment.
+		// `fun name(params) { ... }` desugars to `name = (params) -> { ... }`.
+		// `fun Type.method(params) { ... }` is a method: it desugars to a function
+		// `Type_method` with an implicit `self: Type` first parameter.
+		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_DOT {
+			recvType := p.current.Value
+			p.nextToken() // skip type name
+			p.nextToken() // skip '.'
+			return p.parseFunDefinition(recvType)
+		}
 		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_LPAREN {
-			return p.parseFunDefinition()
+			return p.parseFunDefinition("")
 		}
 		return p.parseAssignment()
 	}
@@ -1480,14 +1562,22 @@ func (p *Parser) isCastTypeName(name string) bool {
 // a cstruct type via `name as Type` or `name: Type`. It desugars to
 // `name = (params) -> body`. An optional return-type annotation (`) as Type` /
 // `) : Type`) is accepted and ignored (the runtime type is uniform float64).
-func (p *Parser) parseFunDefinition() Statement {
+func (p *Parser) parseFunDefinition(recvType string) Statement {
 	name := p.current.Value
-	p.nextToken() // skip function name
+	if recvType != "" {
+		// Method `fun Type.method(...)` → function `Type_method(self: Type, ...)`.
+		name = recvType + "_" + name
+	}
+	p.nextToken() // skip function (or method) name
 	p.nextToken() // skip '('
 
 	var params []string
 	paramTypes := make(map[string]string)
 	variadic := ""
+	if recvType != "" {
+		params = append(params, "self")
+		paramTypes["self"] = recvType
+	}
 	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
 		p.skipNewlines()
 		if p.current.Type != TOKEN_IDENT {
@@ -1527,8 +1617,9 @@ func (p *Parser) parseFunDefinition() Statement {
 			p.nextToken()
 		}
 	}
-	// Optional explicit arrow before the body: `fun f() -> expr`.
-	if p.current.Type == TOKEN_ARROW {
+	// Optional arrow/equals before an expression body: `fun f() -> expr` or
+	// `fun f() = expr` (both equivalent to a single-expression body).
+	if p.current.Type == TOKEN_ARROW || p.current.Type == TOKEN_EQUALS {
 		p.nextToken()
 	}
 
@@ -2997,8 +3088,11 @@ func (p *Parser) parseLoopStatement() Statement {
 						maxIterations = max(end-start, 0)
 						needsRuntimeCheck = false
 					} else {
-						// Range bounds are not literals, require explicit max
-						p.error("loop over non-literal range requires explicit 'max' clause")
+						// Non-literal range bound (`0..<n`): the loop compares the
+						// iterator against the runtime end each step, so it always
+						// terminates — no separate safety cap needed.
+						maxIterations = math.MaxInt64
+						needsRuntimeCheck = false
 					}
 				} else if listExpr, ok := iterable.(*ListExpr); ok {
 					// List literal - known at compile time, no runtime check needed
@@ -3912,6 +4006,9 @@ func (p *Parser) parseLambdaBody() Expression {
 	for _, param := range p.lambdaParams {
 		p.declareVariable(param)
 	}
+
+	// Allow the body to begin on the next line (`f = (x) ->` / `= ` then newline).
+	p.skipNewlines()
 
 	// Check if lambda body is a block { ... }
 	if p.current.Type == TOKEN_LBRACE {
@@ -4892,6 +4989,11 @@ func (p *Parser) parsePrimary() Expression {
 		// For empty list, current is already on ']' after first nextToken()
 		return &ListExpr{Elements: elements}
 
+	case TOKEN_IF:
+		// `if c { A } elif c2 { B } else { C }` in expression position — desugars
+		// to a guard match, which already evaluates only the taken branch.
+		return p.parseIfExpression()
+
 	case TOKEN_LBRACE:
 		// Disambiguate block type: map, match, or statement block
 		blockType := p.disambiguateBlock()
@@ -5194,8 +5296,9 @@ func (p *Parser) parseLoopExpr() Expression {
 				maxIterations = max(end-start, 0)
 				needsRuntimeCheck = false
 			} else {
-				// Range bounds are not literals, require explicit max
-				p.error("loop expression over non-literal range requires explicit 'max' clause")
+				// Non-literal range bound: the iterator-vs-end check terminates it.
+				maxIterations = math.MaxInt64
+				needsRuntimeCheck = false
 			}
 		} else if listExpr, ok := iterable.(*ListExpr); ok {
 			// List literal - known at compile time, no runtime check needed

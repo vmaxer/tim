@@ -414,6 +414,19 @@ func (l *Lexer) NextToken() Token {
 				break
 			}
 		}
+		// Scientific notation: e/E, optional sign, then digits (e.g. 1e-6, 2.5E+10).
+		if l.pos < len(l.input) && (l.input[l.pos] == 'e' || l.input[l.pos] == 'E') {
+			peekPos := l.pos + 1
+			if peekPos < len(l.input) && (l.input[peekPos] == '+' || l.input[peekPos] == '-') {
+				peekPos++
+			}
+			if peekPos < len(l.input) && unicode.IsDigit(rune(l.input[peekPos])) {
+				l.pos = peekPos
+				for l.pos < len(l.input) && unicode.IsDigit(rune(l.input[l.pos])) {
+					l.pos++
+				}
+			}
+		}
 		return Token{Type: TOKEN_NUMBER, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
 	}
 
@@ -463,7 +476,7 @@ func (l *Lexer) NextToken() Token {
 		case "not":
 			return Token{Type: TOKEN_NOT, Value: value, Line: l.line, Column: tokenColumn}
 		// "me" and "cme" removed - recursive calls now use function name with mandatory max
-		case "ret":
+		case "ret", "return":
 			return Token{Type: TOKEN_RET, Value: value, Line: l.line, Column: tokenColumn}
 		case "err":
 			// Check for err?
@@ -537,9 +550,9 @@ func (l *Lexer) NextToken() Token {
 			return Token{Type: TOKEN_CLASS, Value: value, Line: l.line, Column: tokenColumn}
 		case "shadow":
 			return Token{Type: TOKEN_SHADOW, Value: value, Line: l.line, Column: tokenColumn}
-		case "yes":
+		case "yes", "true":
 			return Token{Type: TOKEN_YES, Value: value, Line: l.line, Column: tokenColumn}
-		case "no":
+		case "no", "false":
 			return Token{Type: TOKEN_NO, Value: value, Line: l.line, Column: tokenColumn}
 		case "bool":
 			return Token{Type: TOKEN_BOOL, Value: value, Line: l.line, Column: tokenColumn}
@@ -769,9 +782,13 @@ func (l *Lexer) NextToken() Token {
 					l.pos += 3
 					return Token{Type: TOKEN_ELLIPSIS, Value: "...", Line: l.line, Column: tokenColumn}
 				} else if l.input[l.pos+2] == '<' {
-					// ..<
+					// ..<  (exclusive)
 					l.pos += 3
 					return Token{Type: TOKEN_DOTDOTLT, Value: "..<", Line: l.line, Column: tokenColumn}
+				} else if l.input[l.pos+2] == '=' {
+					// ..=  (inclusive, explicit form — same as bare ..)
+					l.pos += 3
+					return Token{Type: TOKEN_DOTDOT, Value: "..=", Line: l.line, Column: tokenColumn}
 				}
 			}
 			// Just .. is inclusive range

@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"slices"
+	"strings"
 )
 
 // optimizer.go - Compiler optimization passes
@@ -2695,6 +2696,41 @@ func rewriteFieldAccessExpr(expr Expression, name string, fieldToScalar map[stri
 
 var opOverloadSuffix = map[string]string{"+": "add", "-": "sub", "*": "mul", "/": "div"}
 
+// opDesugarMethodCall rewrites a method call `recv.method(args)` to the function
+// `Type_method(recv, args)` when recv has a known cstruct type Type and that
+// function is defined. Two shapes arrive from the parser: an identifier receiver
+// encodes as `CallExpr{Function:"recv.method"}`, while a complex receiver becomes
+// `CallExpr{Function:"method", Args:[recv, ...]}` (UFCS). Args are already
+// desugared so inner method calls (and operators) have resolved to typed calls.
+func opDesugarMethodCall(e *CallExpr, env, retType map[string]string, defined map[string]bool) Expression {
+	// Identifier-receiver form: "recv.method".
+	if dot := strings.LastIndexByte(e.Function, '.'); dot > 0 {
+		recv := e.Function[:dot]
+		method := e.Function[dot+1:]
+		// recv must be a single cstruct-typed identifier (not a namespace/path).
+		if t := env[recv]; t != "" && !strings.ContainsAny(recv, ". ()") {
+			fn := t + "_" + method
+			if defined[fn] {
+				args := append([]Expression{&IdentExpr{Name: recv}}, e.Args...)
+				return &CallExpr{Function: fn, Args: args}
+			}
+		}
+		return e
+	}
+	// UFCS form: `method(recv, ...)` from a complex receiver. Only rewrite when
+	// `method` is not itself a defined function but `Type_method` is, so genuine
+	// free-function calls are left alone.
+	if !defined[e.Function] && len(e.Args) >= 1 {
+		if t := opExprStructType(e.Args[0], env, retType); t != "" {
+			fn := t + "_" + e.Function
+			if defined[fn] {
+				return &CallExpr{Function: fn, Args: e.Args}
+			}
+		}
+	}
+	return e
+}
+
 func desugarOperatorOverloads(program *Program) {
 	// Names of all defined functions, and the cstruct type each returns (if any).
 	defined := make(map[string]bool)
@@ -2708,17 +2744,19 @@ func desugarOperatorOverloads(program *Program) {
 		}
 	}
 
-	process := func(body Expression, params map[string]string) {
+	process := func(lam *LambdaExpr) {
 		env := make(map[string]string)
-		maps.Copy(env, params)
-		opCollectLocalTypes(body, env, retType)
-		opDesugarExpr(body, env, retType, defined)
+		maps.Copy(env, lam.ParamCStructTypes)
+		opCollectLocalTypes(lam.Body, env, retType)
+		// Assign back: a single-expression body whose outermost node is itself an
+		// operator or method call must be replaced, not just mutated in place.
+		lam.Body = opDesugarExpr(lam.Body, env, retType, defined)
 	}
 
 	for _, stmt := range program.Statements {
 		if as, ok := stmt.(*AssignStmt); ok {
 			if lam, ok := as.Value.(*LambdaExpr); ok {
-				process(lam.Body, lam.ParamCStructTypes)
+				process(lam)
 				continue
 			}
 		}
@@ -2868,7 +2906,7 @@ func opDesugarExpr(expr Expression, env, retType map[string]string, defined map[
 		for i := range e.Args {
 			e.Args[i] = opDesugarExpr(e.Args[i], env, retType, defined)
 		}
-		return e
+		return opDesugarMethodCall(e, env, retType, defined)
 	case *DirectCallExpr:
 		e.Callee = opDesugarExpr(e.Callee, env, retType, defined)
 		for i := range e.Args {

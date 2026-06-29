@@ -759,6 +759,8 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 		return acg.compileAssignment(s)
 	case *LoopStmt:
 		return acg.compileLoopStatement(s)
+	case *WhileStmt:
+		return acg.compileWhileStatement(s)
 	case *CStructDecl:
 		// Cstruct declarations generate no runtime code, but we record the field
 		// layout so field access (p.x) and indexed field writes (p[i] <- v) can
@@ -1461,6 +1463,14 @@ func (acg *ARM64CodeGen) compileArenaStmt(stmt *ArenaStmt) error {
 // compileExpression compiles an expression and leaves result in d0 (float64 register)
 func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 	switch e := expr.(type) {
+	case *BooleanExpr:
+		// Booleans are just 1.0 / 0.0 in Tim's uniform float64 world.
+		v := 0.0
+		if e.Value {
+			v = 1.0
+		}
+		return acg.compileExpression(&NumberExpr{Value: v})
+
 	case *NumberExpr:
 		// Tim uses float64 for all numbers
 		// For whole numbers, convert via integer; for decimals, load from .rodata
@@ -4134,6 +4144,84 @@ func (acg *ARM64CodeGen) compileLoopStatement(stmt *LoopStmt) error {
 
 	// List iteration
 	return acg.compileListLoop(stmt)
+}
+
+// compileWhileStatement compiles `while cond { body }` (and the `@ cond ! N`
+// condition-loop form): evaluate the condition each iteration, run the body while
+// it is non-zero. Supports break (`ret @`/`break`) and continue, with the same
+// sp save/restore as range loops so a break out of a partially-pushed expression
+// can't corrupt the frame.
+func (acg *ARM64CodeGen) compileWhileStatement(stmt *WhileStmt) error {
+	acg.labelCounter++
+
+	// Save sp at loop entry.
+	acg.stackSize += 8
+	spSlot := int32(16 + acg.stackSize - 8)
+	if err := acg.out.AddImm64("x16", "sp", 0); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+
+	loopStartPos := acg.eb.text.Len()
+	acg.activeLoops = append(acg.activeLoops, ARM64LoopInfo{
+		Label:           len(acg.activeLoops) + 1,
+		StartPos:        loopStartPos,
+		EndPatches:      []int{},
+		ContinuePatches: []int{},
+	})
+
+	// Evaluate the condition (result in d0); exit the loop when it is zero.
+	if err := acg.compileExpression(stmt.Condition); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+	condJumpPos := acg.eb.text.Len()
+	if err := acg.out.BranchCond("eq", 0); err != nil { // condition == 0 → end
+		return err
+	}
+	li := len(acg.activeLoops) - 1
+	acg.activeLoops[li].EndPatches = append(acg.activeLoops[li].EndPatches, condJumpPos)
+
+	// Body.
+	for _, s := range stmt.Body {
+		if err := acg.compileStatement(s); err != nil {
+			return err
+		}
+	}
+
+	// Continue target: restore sp, patch continues, branch back to the condition.
+	continuePos := acg.eb.text.Len()
+	acg.activeLoops[li].ContinuePos = continuePos
+	if err := acg.out.LdrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("sp", "x16", 0); err != nil {
+		return err
+	}
+	for _, patchPos := range acg.activeLoops[li].ContinuePatches {
+		acg.patchJumpOffset(patchPos, int32(continuePos-patchPos))
+	}
+	backPos := acg.eb.text.Len()
+	if err := acg.out.Branch(int32(loopStartPos - backPos)); err != nil {
+		return err
+	}
+
+	// End: restore sp, patch the condition-exit and any breaks.
+	loopEndPos := acg.eb.text.Len()
+	if err := acg.out.LdrImm64("x16", "x29", spSlot); err != nil {
+		return err
+	}
+	if err := acg.out.AddImm64("sp", "x16", 0); err != nil {
+		return err
+	}
+	for _, patchPos := range acg.activeLoops[li].EndPatches {
+		acg.patchJumpOffset(patchPos, int32(loopEndPos-patchPos))
+	}
+	acg.activeLoops = acg.activeLoops[:len(acg.activeLoops)-1]
+	return nil
 }
 
 // compileRangeExprLoop compiles a range expression loop (@ i in 1..<10 { ... })
