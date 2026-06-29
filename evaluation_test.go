@@ -321,6 +321,108 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "while_loop_and_if_jumps",
+			// `while cond { }` is a condition loop with no explicit bound. break and
+			// continue work inside `if` blocks (the parser leaves them on their last
+			// token so block parsing stays in sync).
+			code: `
+				main = {
+					i := 0.0
+					while i < 3.0 {
+						i <- i + 1.0
+					}
+					println(i)
+
+					j := 0.0
+					last := 0.0
+					while j < 100.0 {
+						j <- j + 1.0
+						if j > 5.0 { break }
+						last <- j
+					}
+					println(last)
+
+					k := 0.0
+					sum := 0.0
+					while k < 6.0 {
+						k <- k + 1.0
+						if k == 3.0 { continue }
+						sum <- sum + k
+					}
+					println(sum)
+				}
+			`,
+			expectedOutput: "3\n5\n18\n",
+			expectCompile:  true,
+		},
+		{
+			name: "trailing_comma_in_list",
+			// A trailing comma before ']' (common in multi-line lists) is allowed
+			// and does not introduce a phantom nil element.
+			code: `
+				main = {
+					xs := [
+						1.0,
+						2.0,
+						3.0,
+					]
+					println(xs[0])
+					println(xs[2])
+				}
+			`,
+			expectedOutput: "1\n3\n",
+			expectCompile:  true,
+		},
+		{
+			name: "nested_cstruct_field_type_inference",
+			// A cstruct field that is itself a cstruct (`Ball { c: V, r }`): under a
+			// typed iterator the optimizer infers `b.c` as V, so operators and
+			// methods on it (`p - b.c`, `d.dot(d)`) desugar to the typed functions.
+			code: `
+				cstruct V    { x, y, z: f64 }
+				cstruct Ball { c: V, r: f64 }
+				fun V.sub(o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
+				fun V.dot(o: V) = self.x*o.x + self.y*o.y + self.z*o.z
+				balls = [Ball(V(1.0, 0.0, 0.0), 2.0), Ball(V(4.0, 0.0, 0.0), 1.0)]
+				fun field(p: V) {
+					sum := 0.0
+					for b: Ball in balls {
+						d := p - b.c
+						sum += d.dot(d)
+					}
+					sum
+				}
+				main = { println(field(V(0.0, 0.0, 0.0))) }
+			`,
+			// (1-0)^2 + (4-0)^2 = 1 + 16 = 17
+			expectedOutput: "17\n",
+			expectCompile:  true,
+		},
+		{
+			name: "list_index_cstruct_field_access",
+			// Indexing a list of cstructs carries the element type, so `xs[i].field`
+			// resolves the field offset — including nested cstruct fields
+			// (`xs[i].c.x`) and lists returned from a function.
+			code: `
+				cstruct V    { x, y, z: f64 }
+				cstruct Ball { c: V, r: f64 }
+				fun make_balls() = [
+					Ball(V(1.0, 2.0, 3.0), 9.0),
+					Ball(V(4.0, 5.0, 6.0), 8.0),
+				]
+				main = {
+					xs := [Ball(V(1.0,0.0,0.0), 7.0), Ball(V(2.0,0.0,0.0), 6.0)]
+					println(xs[1].r)
+					println(xs[0].c.x)
+					bs := make_balls()
+					println(bs[1].r)
+					println(bs[1].c.y)
+				}
+			`,
+			expectedOutput: "6\n1\n8\n5\n",
+			expectCompile:  true,
+		},
+		{
 			name: "fork_mmap_shared_memory",
 			// fork-based parallelism primitives: a child writes to an mmap'd
 			// shared buffer, the parent reaps it and reads the value back. This is

@@ -2735,17 +2735,61 @@ func desugarOperatorOverloads(program *Program) {
 	// Names of all defined functions, and the cstruct type each returns (if any).
 	defined := make(map[string]bool)
 	retType := make(map[string]string)
+	var lambdas []*LambdaExpr
+	var names []string
 	for _, stmt := range program.Statements {
 		if as, ok := stmt.(*AssignStmt); ok {
 			if lam, ok := as.Value.(*LambdaExpr); ok {
 				defined[as.Name] = true
-				retType[as.Name] = opLambdaReturnType(lam)
+				lambdas = append(lambdas, lam)
+				names = append(names, as.Name)
 			}
 		}
 	}
+	// Top-level cstruct-typed variables (e.g. `sun := V(...)`, and locals defined
+	// inside the program's top-level while/arena blocks): their types must be
+	// visible so operators/methods on them resolve. opCollectLocalTypesStmt
+	// recurses into loop/while/arena/if bodies.
+	collectGlobals := func() map[string]string {
+		env := make(map[string]string)
+		for _, stmt := range program.Statements {
+			if as, ok := stmt.(*AssignStmt); ok {
+				if _, isLam := as.Value.(*LambdaExpr); isLam {
+					continue
+				}
+			}
+			opCollectLocalTypesStmt(stmt, env, retType)
+		}
+		return env
+	}
+	// First pass seeds constructor/cast-typed globals (which need no retType) so
+	// the fixpoint can resolve functions that reference them (e.g. `sun`).
+	globalEnv := collectGlobals()
+
+	// Compute return types to a fixpoint: a method like `V.norm` returns whatever
+	// `self.scale(...)` returns, so a function's result type can depend on another
+	// function's. Iterating until stable (bounded by the function count) resolves
+	// these chains regardless of definition order.
+	for pass := 0; pass <= len(lambdas); pass++ {
+		changed := false
+		for i, lam := range lambdas {
+			if t := opLambdaReturnType(lam, globalEnv, retType); t != retType[names[i]] {
+				retType[names[i]] = t
+				changed = true
+			}
+		}
+		if !changed {
+			break
+		}
+	}
+
+	// Re-collect now that retType is known, so top-level locals derived from
+	// struct-returning calls (e.g. `fwd := (a - b).norm()`) are typed too.
+	globalEnv = collectGlobals()
 
 	process := func(lam *LambdaExpr) {
 		env := make(map[string]string)
+		maps.Copy(env, globalEnv)
 		maps.Copy(env, lam.ParamCStructTypes)
 		opCollectLocalTypes(lam.Body, env, retType)
 		// Assign back: a single-expression body whose outermost node is itself an
@@ -2760,14 +2804,18 @@ func desugarOperatorOverloads(program *Program) {
 				continue
 			}
 		}
-		// Top-level non-function statement (rare): desugar with an empty env.
-		opDesugarStmt(stmt, map[string]string{}, retType, defined)
+		// Top-level non-function statement: desugar with the global env so
+		// operators on cstruct-typed globals resolve.
+		opDesugarStmt(stmt, globalEnv, retType, defined)
 	}
 }
 
 // opLambdaReturnType returns the cstruct type a lambda's body evaluates to (its
-// final expression: a constructor, cast, or call to a struct-returning func).
-func opLambdaReturnType(lam *LambdaExpr) string {
+// final expression: a constructor, cast, operator result, or call to a
+// struct-returning func). It evaluates in an env built from the lambda's typed
+// params (including the implicit `self` of a method) so receiver-typed method
+// calls and operators in the body resolve.
+func opLambdaReturnType(lam *LambdaExpr, globalEnv, retType map[string]string) string {
 	last := lam.Body
 	if b, ok := lam.Body.(*BlockExpr); ok {
 		if len(b.Statements) == 0 {
@@ -2782,11 +2830,21 @@ func opLambdaReturnType(lam *LambdaExpr) string {
 			return ""
 		}
 	}
-	return opExprStructType(last, nil, nil)
+	if last == nil {
+		return ""
+	}
+	env := make(map[string]string)
+	maps.Copy(env, globalEnv)
+	maps.Copy(env, lam.ParamCStructTypes)
+	opCollectLocalTypes(lam.Body, env, retType)
+	return opExprStructType(last, env, retType)
 }
 
 // opExprStructType infers the cstruct type of an expression given a local type
-// env and the function-return-type map (both may be nil).
+// env and the function-return-type map (both may be nil). It understands
+// constructors, casts, typed locals/params, nested cstruct fields (`b.c`),
+// operator expressions that desugar to struct-returning methods (`a + b`,
+// `v * s`), and method calls whose function returns a struct (`p.norm()`).
 func opExprStructType(expr Expression, env, retType map[string]string) string {
 	switch e := expr.(type) {
 	case *CastExpr:
@@ -2797,8 +2855,59 @@ func opExprStructType(expr Expression, env, retType map[string]string) string {
 		if optimizerCStructNames[e.Function] {
 			return e.Function // a constructor
 		}
+		// A method call still in `recv.method(...)` form: resolve the receiver's
+		// type and look up the corresponding `Type_method` return type.
+		if dot := strings.LastIndexByte(e.Function, '.'); dot > 0 && env != nil && retType != nil {
+			recv := e.Function[:dot]
+			if t := env[recv]; t != "" && !strings.ContainsAny(recv, ". ()") {
+				return retType[t+"_"+e.Function[dot+1:]]
+			}
+		}
+		// UFCS form `method(recv, ...)`: if `recv` is struct-typed, the call may
+		// resolve to `Type_method`.
+		if retType != nil && len(e.Args) >= 1 {
+			if t := opExprStructType(e.Args[0], env, retType); t != "" {
+				if rt, ok := retType[t+"_"+e.Function]; ok {
+					return rt
+				}
+			}
+		}
+		// Plain free-function call.
 		if retType != nil {
 			return retType[e.Function]
+		}
+	case *FieldAccessExpr:
+		// Nested cstruct field: `b.c` where b: Ball and Ball has `c: V`.
+		ot := e.StructName
+		if ot == "" {
+			ot = opExprStructType(e.Object, env, retType)
+		}
+		if decl := optimizerCStructDecls[ot]; decl != nil {
+			for _, f := range decl.Fields {
+				if f.Name == e.FieldName {
+					return f.StructName // "" for scalar fields
+				}
+			}
+		}
+	case *BinaryExpr:
+		// An operator that desugars to a struct-returning method. Mirror the
+		// resolution in opDesugarExpr to predict the result type.
+		suffix, ok := opOverloadSuffix[e.Operator]
+		if !ok {
+			return ""
+		}
+		lt := opExprStructType(e.Left, env, retType)
+		rt := opExprStructType(e.Right, env, retType)
+		if lt != "" && lt == rt {
+			return retType[lt+"_"+suffix]
+		}
+		if e.Operator == "*" {
+			if lt != "" && rt == "" {
+				return retType[lt+"_scale"]
+			}
+			if rt != "" && lt == "" {
+				return retType[rt+"_scale"]
+			}
 		}
 	case *IdentExpr:
 		if env != nil {
@@ -2841,6 +2950,19 @@ func opCollectLocalTypesStmt(stmt Statement, env, retType map[string]string) {
 		for _, b := range s.Body {
 			opCollectLocalTypesStmt(b, env, retType)
 		}
+	case *ArenaStmt:
+		for _, b := range s.Body {
+			opCollectLocalTypesStmt(b, env, retType)
+		}
+	case *IfStmt:
+		for _, br := range s.Branches {
+			for _, b := range br.Body {
+				opCollectLocalTypesStmt(b, env, retType)
+			}
+		}
+		for _, b := range s.ElseBody {
+			opCollectLocalTypesStmt(b, env, retType)
+		}
 	}
 }
 
@@ -2867,6 +2989,20 @@ func opDesugarStmt(stmt Statement, env, retType map[string]string, defined map[s
 	case *MapUpdateStmt:
 		s.Index = opDesugarExpr(s.Index, env, retType, defined)
 		s.Value = opDesugarExpr(s.Value, env, retType, defined)
+	case *ArenaStmt:
+		for _, b := range s.Body {
+			opDesugarStmt(b, env, retType, defined)
+		}
+	case *IfStmt:
+		for i := range s.Branches {
+			s.Branches[i].Condition = opDesugarExpr(s.Branches[i].Condition, env, retType, defined)
+			for _, b := range s.Branches[i].Body {
+				opDesugarStmt(b, env, retType, defined)
+			}
+		}
+		for _, b := range s.ElseBody {
+			opDesugarStmt(b, env, retType, defined)
+		}
 	}
 }
 

@@ -13,35 +13,37 @@ import (
 
 // ARM64CodeGen handles ARM64 code generation for macOS
 type ARM64CodeGen struct {
-	out                *ARM64Out
-	eb                 *ExecutableBuilder
-	stackVars          map[string]int               // variable name -> stack offset from fp
-	mutableVars        map[string]bool              // variable name -> is mutable
-	lambdaVars         map[string]bool              // variable name -> is callable function (has signature)
-	varTypes           map[string]string            // variable name -> type (for type tracking)
-	stackSize          int                          // current stack size
-	stackFrameSize     uint64                       // total stack frame size allocated in prologue
-	stringCounter      int                          // counter for string labels
-	stringInterns      map[string]string            // string value -> label (for string interning)
-	labelCounter       int                          // counter for jump labels
-	activeLoops        []ARM64LoopInfo              // stack of active loops for break/continue
-	lambdaFuncs        []ARM64LambdaFunc            // list of lambda functions to generate
-	lambdaCounter      int                          // counter for lambda names
-	currentLambda      *ARM64LambdaFunc             // current lambda being compiled (for recursion)
-	cConstants         map[string]*CHeaderConstants // C constants from imports
-	currentArena       int                          // Arena depth (0=none, 1=first arena, 2=nested, etc.)
-	usesArenas         bool                         // Track if program uses any arena blocks
-	currentAssignName  string                       // Name of variable being assigned (for lambda self-reference)
-	deferredExprs      [][]Expression               // Stack of deferred expressions per scope (LIFO order)
-	globalSlots        map[string]int               // module-global var name -> slot index in the x28 globals array
-	globalMutable      map[string]bool              // module-global var name -> is mutable
-	cstructs           map[string]*CStructDecl      // cstruct name -> declaration (field layout)
-	varCStructType     map[string]string            // variable name -> cstruct type it points at
-	closurePtrOffset   int32                        // frame offset where the current lambda's closure pointer (x9) is saved
-	boxedVars          map[string]bool              // names that live in a heap cell in the current scope (captured-and-mutated locals)
-	returnsClosure     map[string]bool              // lambda-var name -> its body evaluates to a closure (so `g = f(x); g()` invokes it)
-	funcReturnsCStruct map[string]string            // lambda-var name -> cstruct type its body returns (so `p = vadd(a,b)` is typed)
-	fpDepth            int                          // expression-stack depth: BinaryExpr keeps its left operand in d24+fpDepth instead of spilling to memory, when the right operand has no call
+	out                 *ARM64Out
+	eb                  *ExecutableBuilder
+	stackVars           map[string]int               // variable name -> stack offset from fp
+	mutableVars         map[string]bool              // variable name -> is mutable
+	lambdaVars          map[string]bool              // variable name -> is callable function (has signature)
+	varTypes            map[string]string            // variable name -> type (for type tracking)
+	stackSize           int                          // current stack size
+	stackFrameSize      uint64                       // total stack frame size allocated in prologue
+	stringCounter       int                          // counter for string labels
+	stringInterns       map[string]string            // string value -> label (for string interning)
+	labelCounter        int                          // counter for jump labels
+	activeLoops         []ARM64LoopInfo              // stack of active loops for break/continue
+	lambdaFuncs         []ARM64LambdaFunc            // list of lambda functions to generate
+	lambdaCounter       int                          // counter for lambda names
+	currentLambda       *ARM64LambdaFunc             // current lambda being compiled (for recursion)
+	cConstants          map[string]*CHeaderConstants // C constants from imports
+	currentArena        int                          // Arena depth (0=none, 1=first arena, 2=nested, etc.)
+	usesArenas          bool                         // Track if program uses any arena blocks
+	currentAssignName   string                       // Name of variable being assigned (for lambda self-reference)
+	deferredExprs       [][]Expression               // Stack of deferred expressions per scope (LIFO order)
+	globalSlots         map[string]int               // module-global var name -> slot index in the x28 globals array
+	globalMutable       map[string]bool              // module-global var name -> is mutable
+	cstructs            map[string]*CStructDecl      // cstruct name -> declaration (field layout)
+	varCStructType      map[string]string            // variable name -> cstruct type it points at
+	varListElemType     map[string]string            // list-variable name -> cstruct type of its elements (so `xs[i].field` works)
+	funcReturnsListElem map[string]string            // lambda-var name -> cstruct elem type of the list its body returns
+	closurePtrOffset    int32                        // frame offset where the current lambda's closure pointer (x9) is saved
+	boxedVars           map[string]bool              // names that live in a heap cell in the current scope (captured-and-mutated locals)
+	returnsClosure      map[string]bool              // lambda-var name -> its body evaluates to a closure (so `g = f(x); g()` invokes it)
+	funcReturnsCStruct  map[string]string            // lambda-var name -> cstruct type its body returns (so `p = vadd(a,b)` is typed)
+	fpDepth             int                          // expression-stack depth: BinaryExpr keeps its left operand in d24+fpDepth instead of spilling to memory, when the right operand has no call
 }
 
 // ARM64LambdaFunc represents a lambda function for ARM64
@@ -79,24 +81,26 @@ type ARM64LoopInfo struct {
 func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConstants) *ARM64CodeGen {
 	// Use the target from ExecutableBuilder (which has the correct OS)
 	return &ARM64CodeGen{
-		out:                &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
-		eb:                 eb,
-		stackVars:          make(map[string]int),
-		mutableVars:        make(map[string]bool),
-		lambdaVars:         make(map[string]bool),
-		varTypes:           make(map[string]string),
-		stackSize:          0,
-		stringCounter:      0,
-		stringInterns:      make(map[string]string),
-		labelCounter:       0,
-		cConstants:         cConstants,
-		globalSlots:        make(map[string]int),
-		globalMutable:      make(map[string]bool),
-		cstructs:           make(map[string]*CStructDecl),
-		varCStructType:     make(map[string]string),
-		boxedVars:          make(map[string]bool),
-		returnsClosure:     make(map[string]bool),
-		funcReturnsCStruct: make(map[string]string),
+		out:                 &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
+		eb:                  eb,
+		stackVars:           make(map[string]int),
+		mutableVars:         make(map[string]bool),
+		lambdaVars:          make(map[string]bool),
+		varTypes:            make(map[string]string),
+		stackSize:           0,
+		stringCounter:       0,
+		stringInterns:       make(map[string]string),
+		labelCounter:        0,
+		cConstants:          cConstants,
+		globalSlots:         make(map[string]int),
+		globalMutable:       make(map[string]bool),
+		cstructs:            make(map[string]*CStructDecl),
+		varCStructType:      make(map[string]string),
+		boxedVars:           make(map[string]bool),
+		returnsClosure:      make(map[string]bool),
+		funcReturnsCStruct:  make(map[string]string),
+		varListElemType:     make(map[string]string),
+		funcReturnsListElem: make(map[string]string),
 	}
 }
 
@@ -136,6 +140,63 @@ func (acg *ARM64CodeGen) cStructTypeOf(expr Expression) string {
 		}
 	}
 	return ""
+}
+
+// listElemCStructTypeOf infers the cstruct type of the ELEMENTS of a list-valued
+// expression, or "". This lets `xs[i].field` resolve the field offset when xs is
+// a list of cstructs (`[Ball(...), Ball(...)]`, a list-returning call, or a
+// variable holding one).
+func (acg *ARM64CodeGen) listElemCStructTypeOf(expr Expression) string {
+	switch e := expr.(type) {
+	case *ListExpr:
+		if len(e.Elements) > 0 {
+			return acg.cStructTypeOf(e.Elements[0])
+		}
+	case *IdentExpr:
+		if t, ok := acg.varListElemType[e.Name]; ok {
+			return t
+		}
+	case *CallExpr:
+		if t, ok := acg.funcReturnsListElem[e.Function]; ok {
+			return t
+		}
+	case *BlockExpr:
+		if n := len(e.Statements); n > 0 {
+			switch s := e.Statements[n-1].(type) {
+			case *ExpressionStmt:
+				return acg.listElemCStructTypeOf(s.Expr)
+			case *JumpStmt:
+				if s.Value != nil {
+					return acg.listElemCStructTypeOf(s.Value)
+				}
+			}
+		}
+	}
+	return ""
+}
+
+// lambdaReturnsListElemType returns the cstruct element type of the list a lambda
+// body evaluates to, or "" — so `f = () -> [Ball(...), ...]` lets `bs = f()` know
+// `bs[i]` is a Ball.
+func (acg *ARM64CodeGen) lambdaReturnsListElemType(body Expression) string {
+	last := body
+	if b, ok := body.(*BlockExpr); ok {
+		if len(b.Statements) == 0 {
+			return ""
+		}
+		switch s := b.Statements[len(b.Statements)-1].(type) {
+		case *ExpressionStmt:
+			last = s.Expr
+		case *JumpStmt:
+			last = s.Value
+		default:
+			return ""
+		}
+	}
+	if last == nil {
+		return ""
+	}
+	return acg.listElemCStructTypeOf(last)
 }
 
 // lambdaReturnCStructType returns the cstruct type a lambda body evaluates to
@@ -201,6 +262,9 @@ func (acg *ARM64CodeGen) markIfClosure(name string, value Expression) {
 		acg.returnsClosure[name] = lambdaBodyReturnsClosure(v.Body)
 		if ct := acg.lambdaReturnCStructType(v.Body); ct != "" {
 			acg.funcReturnsCStruct[name] = ct
+		}
+		if et := acg.lambdaReturnsListElemType(v.Body); et != "" {
+			acg.funcReturnsListElem[name] = et
 		}
 	case *PatternLambdaExpr, *MultiLambdaExpr:
 		acg.lambdaVars[name] = true
@@ -1005,6 +1069,23 @@ func (acg *ARM64CodeGen) cstructForExpr(expr Expression) *CStructDecl {
 	case *CastExpr:
 		if decl, ok := acg.cstructs[e.Type]; ok {
 			return decl
+		}
+	case *IndexExpr:
+		// `xs[i]` where xs is a known list of cstructs: the element is a pointer to
+		// that cstruct, so `xs[i].field` reads at the field offset.
+		if t := acg.listElemCStructTypeOf(e.List); t != "" {
+			return acg.cstructs[t]
+		}
+	case *FieldAccessExpr:
+		// A nested cstruct-valued field used as a receiver: `b.c.x` where `b.c` is
+		// itself a cstruct (V). Resolve the outer object's struct, find the field,
+		// and return the field's own struct declaration.
+		if decl := acg.cstructForExpr(e.Object); decl != nil {
+			for i := range decl.Fields {
+				if decl.Fields[i].Name == e.FieldName && decl.Fields[i].StructName != "" {
+					return acg.cstructs[decl.Fields[i].StructName]
+				}
+			}
 		}
 	}
 	return nil
@@ -3064,6 +3145,10 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 			if ct := acg.cStructTypeOf(assign.Value); ct != "" {
 				acg.varCStructType[assign.Name] = ct
 			}
+			// Track lists of cstructs so `xs[i].field` resolves the element layout.
+			if et := acg.listElemCStructTypeOf(assign.Value); et != "" {
+				acg.varListElemType[assign.Name] = et
+			}
 			// x29 points to saved fp location, variables start at offset 16
 			offset = int32(16 + acg.stackSize - 8)
 
@@ -3535,6 +3620,9 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 	case "write_i8", "write_i16", "write_i32", "write_i64",
 		"write_u8", "write_u16", "write_u32", "write_u64", "write_f64":
 		return acg.compileMemoryWrite(call)
+	case "read_i8", "read_i16", "read_i32", "read_i64",
+		"read_u8", "read_u16", "read_u32", "read_u64", "read_f64":
+		return acg.compileMemoryRead(call)
 	case "dlopen":
 		// dlopen(path, flags)
 		sig := &CFunctionSignature{
@@ -8297,6 +8385,96 @@ func (acg *ARM64CodeGen) compileMemoryWrite(call *CallExpr) error {
 	// fmov d0, xzr
 	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x67, 0x9e})
 
+	return nil
+}
+
+// compileMemoryRead compiles memory read helpers (read_i32, read_u32, read_f64,
+// …): read_TYPE(ptr, index) loads the index-th element of the given width and
+// leaves it in d0 (sign- or zero-extended for ints, raw for f64).
+func (acg *ARM64CodeGen) compileMemoryRead(call *CallExpr) error {
+	if len(call.Args) != 2 {
+		return fmt.Errorf("%s() requires exactly 2 arguments (ptr, index)", call.Function)
+	}
+
+	var typeSize int
+	switch call.Function {
+	case "read_i8", "read_u8":
+		typeSize = 1
+	case "read_i16", "read_u16":
+		typeSize = 2
+	case "read_i32", "read_u32":
+		typeSize = 4
+	case "read_i64", "read_u64", "read_f64":
+		typeSize = 8
+	}
+	isSigned := strings.HasPrefix(call.Function, "read_i")
+
+	// Pointer (arg 0) -> x9 (numeric C-FFI pointer convention: fcvtzs x9, d0).
+	if err := acg.compileExpression(call.Args[0]); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x78, 0x9e})
+
+	// Save pointer to stack.
+	if err := acg.out.SubImm64("sp", "sp", 16); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0xe9, 0x03, 0x00, 0xf9}) // str x9, [sp]
+
+	// Index (arg 1) -> x10 (fcvtzs x10, d0).
+	if err := acg.compileExpression(call.Args[1]); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x0a, 0x00, 0x78, 0x9e})
+
+	// x10 = x10 * typeSize.
+	if typeSize > 1 {
+		if err := acg.out.MovImm64("x11", uint64(typeSize)); err != nil {
+			return err
+		}
+		acg.out.out.writer.WriteBytes([]byte{0x4a, 0x7d, 0x0b, 0x9b}) // mul x10, x10, x11
+	}
+
+	// Effective address: x9 = ptr + offset.
+	acg.out.out.writer.WriteBytes([]byte{0xe9, 0x03, 0x40, 0xf9}) // ldr x9, [sp]
+	acg.out.out.writer.WriteBytes([]byte{0x29, 0x01, 0x0a, 0x8b}) // add x9, x9, x10
+
+	if call.Function == "read_f64" {
+		acg.out.out.writer.WriteBytes([]byte{0x20, 0x01, 0x40, 0xfd}) // ldr d0, [x9]
+	} else {
+		switch typeSize {
+		case 1:
+			if isSigned {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x81, 0x80, 0x39}) // ldrsb x10, [x9]
+			} else {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x01, 0x40, 0x39}) // ldrb w10, [x9]
+			}
+		case 2:
+			if isSigned {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x81, 0x80, 0x79}) // ldrsh x10, [x9]
+			} else {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x01, 0x40, 0x79}) // ldrh w10, [x9]
+			}
+		case 4:
+			if isSigned {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x81, 0x80, 0xb9}) // ldrsw x10, [x9]
+			} else {
+				acg.out.out.writer.WriteBytes([]byte{0x2a, 0x01, 0x40, 0xb9}) // ldr w10, [x9]
+			}
+		case 8:
+			acg.out.out.writer.WriteBytes([]byte{0x2a, 0x01, 0x40, 0xf9}) // ldr x10, [x9]
+		}
+		// Convert integer to double.
+		if isSigned || typeSize == 8 {
+			acg.out.out.writer.WriteBytes([]byte{0x40, 0x01, 0x62, 0x9e}) // scvtf d0, x10
+		} else {
+			acg.out.out.writer.WriteBytes([]byte{0x40, 0x01, 0x63, 0x9e}) // ucvtf d0, x10
+		}
+	}
+
+	if err := acg.out.AddImm64("sp", "sp", 16); err != nil {
+		return err
+	}
 	return nil
 }
 

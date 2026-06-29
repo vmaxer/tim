@@ -1161,6 +1161,12 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseForeachStatement()
 	}
 
+	// Check for while keyword: `while cond { body }` is a condition loop with no
+	// explicit iteration bound (runs until the condition is false).
+	if p.current.Type == TOKEN_WHILE {
+		return p.parseWhileStatement()
+	}
+
 	// Check for use keyword (imports)
 	if p.current.Type == TOKEN_USE {
 		p.nextToken() // skip 'use'
@@ -3418,18 +3424,19 @@ handleJump:
 // ret @N - exit loop N and all inner loops
 // ret @N value - exit loop N and return value
 func (p *Parser) parseJumpStatement() Statement {
-	p.nextToken() // skip 'ret'
-
+	// current is on 'ret'. Like every other statement parser, leave current on the
+	// LAST token of the statement so block parsers (which advance past it) stay in
+	// sync — otherwise `if c { ret @ }` over-consumes the brace and corrupts the
+	// scope stack. Peek-based lookahead keeps the cursor in place.
 	label := 0 // 0 means return from function
 	var value Expression
 
-	// Check for optional @ or @N label (for loop exit)
-	if p.current.Type == TOKEN_AT {
-		p.nextToken() // skip '@'
-
-		// Check if followed by number (ret @N) or not (ret @)
-		if p.current.Type == TOKEN_NUMBER {
+	// Optional @ or @N label (loop exit).
+	if p.peek.Type == TOKEN_AT {
+		p.nextToken() // move onto '@'
+		if p.peek.Type == TOKEN_NUMBER {
 			// ret @N - exit specific loop N
+			p.nextToken() // move onto the number
 			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
 			if err != nil {
 				p.error("invalid loop label number")
@@ -3438,15 +3445,17 @@ func (p *Parser) parseJumpStatement() Statement {
 			if label < 1 {
 				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
 			}
-			p.nextToken() // skip number
 		} else {
 			// ret @ - exit current loop (label -1 means "current loop")
 			label = -1
 		}
 	}
 
-	// Check for optional value
-	if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
+	// Optional return/break value: present when the next token starts an
+	// expression (not a statement terminator).
+	if p.peek.Type != TOKEN_NEWLINE && p.peek.Type != TOKEN_RBRACE &&
+		p.peek.Type != TOKEN_EOF && p.peek.Type != TOKEN_SEMICOLON {
+		p.nextToken() // move onto the first token of the value
 		value = p.parseExpression()
 	}
 
@@ -3458,39 +3467,30 @@ func (p *Parser) parseJumpStatement() Statement {
 }
 
 func (p *Parser) parseBreakStatement() Statement {
-	p.nextToken() // skip 'break'
-
-	label := -1 // -1 means current loop
-
-	// Check for optional @N label
-	if p.current.Type == TOKEN_AT {
-		p.nextToken() // skip '@'
-		if p.current.Type == TOKEN_NUMBER {
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
-			p.nextToken() // skip number
-		}
-	}
-
+	// Like other statement parsers, leave p.current on the LAST token of the
+	// statement so block parsers (which advance past it) stay in sync. With no
+	// label that last token is `break` itself; with a label it's the number.
+	label := p.parseOptionalLoopLabel()
 	// break is translated to: ret @ (exit loop without value)
 	return &JumpStmt{IsBreak: true, Label: label, Value: nil}
 }
 
 func (p *Parser) parseContinueStatement() Statement {
-	p.nextToken() // skip 'continue'
+	label := p.parseOptionalLoopLabel()
+	// continue is translated to: @N (continue loop N)
+	return &JumpStmt{IsBreak: false, Label: label, Value: nil}
+}
 
-	label := -1 // -1 means current loop
-
-	// Check for optional @N label
-	if p.current.Type == TOKEN_AT {
-		p.nextToken() // skip '@'
-		if p.current.Type == TOKEN_NUMBER {
+// parseOptionalLoopLabel reads an optional `@N` label that may follow a `break`
+// or `continue` keyword. current must be on the keyword on entry; on exit it is
+// left on the last consumed token (the keyword, or the label number). Returns
+// -1 when there is no explicit label (meaning the innermost loop).
+func (p *Parser) parseOptionalLoopLabel() int {
+	label := -1 // -1 means current (innermost) loop
+	if p.peek.Type == TOKEN_AT {
+		p.nextToken() // move onto '@'
+		if p.peek.Type == TOKEN_NUMBER {
+			p.nextToken() // move onto the number
 			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
 			if err != nil {
 				p.error("invalid loop label number")
@@ -3499,12 +3499,9 @@ func (p *Parser) parseContinueStatement() Statement {
 			if label < 1 {
 				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
 			}
-			p.nextToken() // skip number
 		}
 	}
-
-	// continue is translated to: @N (continue loop N)
-	return &JumpStmt{IsBreak: false, Label: label, Value: nil}
+	return label
 }
 
 func (p *Parser) parseForeachStatement() Statement {
@@ -3597,6 +3594,62 @@ func (p *Parser) parseForeachStatement() Statement {
 		MaxIterations: maxIterations,
 		NeedsMaxCheck: needsMaxCheck,
 		Body:          body,
+	}
+}
+
+// parseWhileStatement parses `while cond { body }`: a condition loop with no
+// explicit iteration bound. It desugars to a WhileStmt with MaxIterations set
+// to "unbounded" (the loop terminates when the condition becomes false).
+func (p *Parser) parseWhileStatement() Statement {
+	p.nextToken() // skip 'while'
+
+	// Parse the condition with parseComparison (not parseExpression) so a match
+	// block's '{' isn't consumed as part of the condition. Set inConditionLoop
+	// so a stray '!' isn't read as a recursion bound.
+	oldInConditionLoop := p.inConditionLoop
+	p.inConditionLoop = true
+	condition := p.parseComparison()
+	p.inConditionLoop = oldInConditionLoop
+
+	// Skip newlines before '{'
+	for p.peek.Type == TOKEN_NEWLINE {
+		p.nextToken()
+	}
+
+	if p.peek.Type != TOKEN_LBRACE {
+		p.error("expected '{' after while condition")
+		return nil
+	}
+	p.nextToken() // move to '{'
+
+	// Track loop depth for nested loops / break / continue.
+	label := p.loopDepth + 1
+	oldDepth := p.loopDepth
+	p.loopDepth = label
+	defer func() { p.loopDepth = oldDepth }()
+
+	// Parse loop body
+	var body []Statement
+	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
+		p.nextToken()
+		if p.current.Type == TOKEN_NEWLINE {
+			continue
+		}
+		stmt := p.parseStatement()
+		if stmt != nil {
+			body = append(body, stmt)
+		}
+	}
+
+	// Consume closing brace
+	if p.peek.Type == TOKEN_RBRACE {
+		p.nextToken() // move to '}'
+	}
+
+	return &WhileStmt{
+		Condition:     condition,
+		Body:          body,
+		MaxIterations: math.MaxInt64,
 	}
 }
 
@@ -4980,6 +5033,10 @@ func (p *Parser) parsePrimary() Expression {
 				p.nextToken() // skip current
 				p.nextToken() // skip ','
 				p.skipNewlines()
+				// Allow a trailing comma before ']' (common in multi-line lists).
+				if p.current.Type == TOKEN_RBRACKET {
+					return &ListExpr{Elements: elements}
+				}
 				elements = append(elements, p.parseExpression())
 			}
 			// current should be on last element

@@ -85,6 +85,7 @@ const (
 	TOKEN_BREAK      // break keyword (alias for ret @)
 	TOKEN_CONTINUE   // continue keyword (alias for ret @ [])
 	TOKEN_FOREACH    // foreach keyword (alias for @ ... in)
+	TOKEN_WHILE      // while keyword (condition loop without explicit bound)
 	TOKEN_MALLOC     // malloc keyword (arena allocator sugar)
 	TOKEN_FREE       // free keyword (no-op, arena cleanup)
 	TOKEN_AT_FIRST   // @first (first iteration)
@@ -499,6 +500,8 @@ func (l *Lexer) NextToken() Token {
 			return Token{Type: TOKEN_CONTINUE, Value: value, Line: l.line, Column: tokenColumn}
 		case "foreach":
 			return Token{Type: TOKEN_FOREACH, Value: value, Line: l.line, Column: tokenColumn}
+		case "while":
+			return Token{Type: TOKEN_WHILE, Value: value, Line: l.line, Column: tokenColumn}
 		case "for":
 			// `for` is a full alias for `@`-loops: lexes to TOKEN_AT so every loop
 			// form (for-each, typed iterator, condition, parallel) works unchanged.
