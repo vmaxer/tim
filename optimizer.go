@@ -1545,6 +1545,22 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 				if s.Value != nil {
 					collectCapturedVarsExpr(s.Value, localParamSet, captured)
 				}
+			case *IfStmt:
+				// Each branch's condition is evaluated in the enclosing scope; its
+				// body runs in a nested scope. Without recursing here, a variable
+				// read only inside an `if` body (e.g. a global written via
+				// write_u32 under `if mine { ... }`) was never detected as captured,
+				// so it never got a global slot and codegen failed.
+				for _, br := range s.Branches {
+					collectCapturedVarsExpr(br.Condition, localParamSet, captured)
+					collectCapturedVarsExpr(&BlockExpr{Statements: br.Body}, localParamSet, captured)
+				}
+				collectCapturedVarsExpr(&BlockExpr{Statements: s.ElseBody}, localParamSet, captured)
+			case *WhileStmt:
+				collectCapturedVarsExpr(s.Condition, localParamSet, captured)
+				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
+			case *ArenaStmt:
+				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
 			}
 		}
 	}
@@ -2816,28 +2832,40 @@ func desugarOperatorOverloads(program *Program) {
 // params (including the implicit `self` of a method) so receiver-typed method
 // calls and operators in the body resolve.
 func opLambdaReturnType(lam *LambdaExpr, globalEnv, retType map[string]string) string {
-	last := lam.Body
-	if b, ok := lam.Body.(*BlockExpr); ok {
-		if len(b.Statements) == 0 {
-			return ""
-		}
-		switch s := b.Statements[len(b.Statements)-1].(type) {
-		case *ExpressionStmt:
-			last = s.Expr
-		case *JumpStmt:
-			last = s.Value
-		default:
-			return ""
-		}
-	}
-	if last == nil {
-		return ""
-	}
 	env := make(map[string]string)
 	maps.Copy(env, globalEnv)
 	maps.Copy(env, lam.ParamCStructTypes)
 	opCollectLocalTypes(lam.Body, env, retType)
-	return opExprStructType(last, env, retType)
+	if b, ok := lam.Body.(*BlockExpr); ok {
+		return opBlockReturnType(b.Statements, env, retType)
+	}
+	return opExprStructType(lam.Body, env, retType)
+}
+
+// opBlockReturnType returns the cstruct type a statement block evaluates to: the
+// type of its final statement's value. A trailing `if`/`elif`/`else` (which the
+// parser lowers to an IfStmt, not an expression) is followed into each arm, since
+// a struct-returning function may end in one (e.g. `V.norm`'s normalize-or-self).
+func opBlockReturnType(stmts []Statement, env, retType map[string]string) string {
+	if len(stmts) == 0 {
+		return ""
+	}
+	switch s := stmts[len(stmts)-1].(type) {
+	case *ExpressionStmt:
+		return opExprStructType(s.Expr, env, retType)
+	case *JumpStmt:
+		if s.Value != nil {
+			return opExprStructType(s.Value, env, retType)
+		}
+	case *IfStmt:
+		for _, br := range s.Branches {
+			if t := opBlockReturnType(br.Body, env, retType); t != "" {
+				return t
+			}
+		}
+		return opBlockReturnType(s.ElseBody, env, retType)
+	}
+	return ""
 }
 
 // opExprStructType infers the cstruct type of an expression given a local type
@@ -2909,12 +2937,56 @@ func opExprStructType(expr Expression, env, retType map[string]string) string {
 				return retType[rt+"_scale"]
 			}
 		}
+	case *MatchExpr:
+		// `if c { a } else { b }` / guard match: every arm evaluates to the same
+		// type, so the result type is that of any arm that resolves to a cstruct.
+		for _, c := range e.Clauses {
+			if c.Result != nil {
+				if t := opExprStructType(c.Result, env, retType); t != "" {
+					return t
+				}
+			}
+		}
+		if e.DefaultExpr != nil {
+			return opExprStructType(e.DefaultExpr, env, retType)
+		}
+	case *BlockExpr:
+		// A block evaluates to its final expression.
+		if len(e.Statements) > 0 {
+			if es, ok := e.Statements[len(e.Statements)-1].(*ExpressionStmt); ok {
+				return opExprStructType(es.Expr, env, retType)
+			}
+		}
+	case *FMAExpr:
+		// Pass 1 may fuse `a*b + c` into an FMAExpr before operator overloading
+		// runs. If any operand is cstruct-typed this is really a chain of method
+		// calls (`a.scale(b).add(c)` etc.); infer its type from the equivalent
+		// `(a*b) <op> c` BinaryExpr so the desugar can later un-fuse it.
+		return opExprStructType(fmaToBinary(e), env, retType)
 	case *IdentExpr:
 		if env != nil {
 			return env[e.Name]
 		}
 	}
 	return ""
+}
+
+// fmaToBinary reconstructs the `(A*B) <op> C` BinaryExpr an FMAExpr was fused
+// from, so the operator-overload machinery can treat it like any other operator
+// expression (for cstruct type inference and un-fusing into method calls).
+func fmaToBinary(e *FMAExpr) Expression {
+	mul := &BinaryExpr{Left: e.A, Operator: "*", Right: e.B}
+	switch {
+	case !e.IsNegMul && !e.IsSub: // A*B + C
+		return &BinaryExpr{Left: mul, Operator: "+", Right: e.C}
+	case !e.IsNegMul && e.IsSub: // A*B - C
+		return &BinaryExpr{Left: mul, Operator: "-", Right: e.C}
+	case e.IsNegMul && !e.IsSub: // C - A*B
+		return &BinaryExpr{Left: e.C, Operator: "-", Right: mul}
+	default: // -A*B - C  ==  (0 - C) - A*B
+		zero := &NumberExpr{Value: 0}
+		return &BinaryExpr{Left: &BinaryExpr{Left: zero, Operator: "-", Right: e.C}, Operator: "-", Right: mul}
+	}
 }
 
 // opCollectLocalTypes scans a function body (recursing into nested control flow
@@ -3089,6 +3161,13 @@ func opDesugarExpr(expr Expression, env, retType map[string]string, defined map[
 		}
 		return e
 	case *FMAExpr:
+		// If this fused multiply-add is really a cstruct operator chain (the FMA
+		// pass ran before operator overloading), un-fuse it back to `(a*b) <op> c`
+		// and desugar that into method calls. Float FMA on cstruct pointer bits
+		// would be silently wrong, so this must fire whenever a cstruct is involved.
+		if opExprStructType(e, env, retType) != "" {
+			return opDesugarExpr(fmaToBinary(e), env, retType, defined)
+		}
 		e.A = opDesugarExpr(e.A, env, retType, defined)
 		e.B = opDesugarExpr(e.B, env, retType, defined)
 		e.C = opDesugarExpr(e.C, env, retType, defined)

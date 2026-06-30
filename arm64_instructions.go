@@ -1243,8 +1243,98 @@ func (a *ARM64Out) FcmpScalar64(op1, op2 string) error {
 	return nil
 }
 
+// --- NEON (Advanced SIMD) vector instructions, 2×f64 lanes (.2D) --------------
+// These operate on 128-bit vector registers holding two doubles. Used to process
+// the x/y pair of a vec3 cstruct in one instruction (z stays scalar). Vector reg
+// numbers are the same as the d-register numbers, so "d0".."d31" / "v0".."v31"
+// both index arm64FPRegs.
+
+// LdrQ loads a 128-bit vector from [base + offset] (offset scaled by 16, must be
+// 16-byte aligned and non-negative): LDR Qt, [Xn, #offset].
+func (a *ARM64Out) LdrQ(dest, base string, offset int32) error {
+	rt, ok := arm64FPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", dest)
+	}
+	rn, ok := arm64GPRegs[base]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", base)
+	}
+	if offset < 0 || offset%16 != 0 || offset >= (1<<12)*16 {
+		return fmt.Errorf("LDR Q offset invalid: %d", offset)
+	}
+	imm12 := uint32(offset / 16)
+	a.encodeInstr(0x3dc00000 | (imm12 << 10) | (rn << 5) | rt)
+	return nil
+}
+
+// StrQ stores a 128-bit vector to [base + offset]: STR Qt, [Xn, #offset].
+func (a *ARM64Out) StrQ(src, base string, offset int32) error {
+	rt, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", src)
+	}
+	rn, ok := arm64GPRegs[base]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 register: %s", base)
+	}
+	if offset < 0 || offset%16 != 0 || offset >= (1<<12)*16 {
+		return fmt.Errorf("STR Q offset invalid: %d", offset)
+	}
+	imm12 := uint32(offset / 16)
+	a.encodeInstr(0x3d800000 | (imm12 << 10) | (rn << 5) | rt)
+	return nil
+}
+
+// vecThreeSame2D encodes a three-register same-type Advanced SIMD op on .2D.
+func (a *ARM64Out) vecThreeSame2D(base uint32, dest, op1, op2 string) error {
+	rd, ok := arm64FPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[op1]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", op1)
+	}
+	rm, ok := arm64FPRegs[op2]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", op2)
+	}
+	a.encodeInstr(base | (rm << 16) | (rn << 5) | rd)
+	return nil
+}
+
+// FaddV2D: FADD Vd.2D, Vn.2D, Vm.2D
+func (a *ARM64Out) FaddV2D(dest, op1, op2 string) error {
+	return a.vecThreeSame2D(0x4e60d400, dest, op1, op2)
+}
+
+// FsubV2D: FSUB Vd.2D, Vn.2D, Vm.2D
+func (a *ARM64Out) FsubV2D(dest, op1, op2 string) error {
+	return a.vecThreeSame2D(0x4ee0d400, dest, op1, op2)
+}
+
+// FmulV2D: FMUL Vd.2D, Vn.2D, Vm.2D
+func (a *ARM64Out) FmulV2D(dest, op1, op2 string) error {
+	return a.vecThreeSame2D(0x6e60dc00, dest, op1, op2)
+}
+
+// DupV2D broadcasts lane 0 of a (d-register) source across both .2D lanes:
+// DUP Vd.2D, Vn.D[0].
+func (a *ARM64Out) DupV2D(dest, src string) error {
+	rd, ok := arm64FPRegs[dest]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", dest)
+	}
+	rn, ok := arm64FPRegs[src]
+	if !ok {
+		return fmt.Errorf("invalid ARM64 vector register: %s", src)
+	}
+	a.encodeInstr(0x4e080400 | (rn << 5) | rd)
+	return nil
+}
+
 // Future enhancements:
-// - SIMD/NEON vector instructions (for parallel operations)
 // - Advanced addressing modes (pre/post-index)
 // - Atomic operations (LDXR, STXR, CAS, etc.)
 // - More conversion instructions (FCVT between precisions)

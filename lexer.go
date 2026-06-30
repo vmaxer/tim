@@ -105,6 +105,7 @@ const (
 	TOKEN_LTLTLT_B   // <<<b (rotate left)
 	TOKEN_GTGTGT_B   // >>>b (rotate right)
 	TOKEN_QUESTION_B // ?b (bit test)
+	TOKEN_QUESTION   // ? (ternary conditional: cond ? a : b)
 	TOKEN_AS         // as (type casting)
 	// Integer type keywords (signed)
 	TOKEN_I8   // i8
@@ -750,8 +751,9 @@ func (l *Lexer) NextToken() Token {
 			l.pos += 2
 			return Token{Type: TOKEN_RANDOM, Value: "??", Line: l.line, Column: tokenColumn}
 		}
-		// Single ? is not a valid token in Tim
-		return Token{Type: TOKEN_EOF, Value: "", Line: l.line, Column: tokenColumn}
+		// Standalone ? is the ternary conditional operator (cond ? a : b)
+		l.pos++
+		return Token{Type: TOKEN_QUESTION, Value: "?", Line: l.line, Column: tokenColumn}
 	case '~':
 		// Check for ~> first, then ~b
 		if l.peek() == '>' {

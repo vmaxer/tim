@@ -136,10 +136,75 @@ func (acg *ARM64CodeGen) cStructTypeOf(expr Expression) string {
 				if s.Value != nil {
 					return acg.cStructTypeOf(s.Value)
 				}
+			case *IfStmt:
+				return acg.ifStmtCStructType(s)
 			}
+		}
+	case *MatchExpr:
+		// `if c { a } else { b }` / guard match: every arm yields the same type,
+		// so the result is that of any arm that evaluates to a cstruct.
+		for _, c := range e.Clauses {
+			if c.Result != nil {
+				if t := acg.cStructTypeOf(c.Result); t != "" {
+					return t
+				}
+			}
+		}
+		if e.DefaultExpr != nil {
+			return acg.cStructTypeOf(e.DefaultExpr)
+		}
+	case *FieldAccessExpr:
+		// A nested cstruct-valued field, e.g. `b.c` where Ball has `c: V`.
+		if decl := acg.cstructForExpr(e); decl != nil {
+			return decl.Name
 		}
 	}
 	return ""
+}
+
+// ifStmtToMatchExpr lowers an `if`/`elif`/`else` statement to the value-producing
+// MatchExpr the parser would have built for the same condition in expression
+// position. Used to give a trailing `if` (the last statement of a value block) its
+// value, instead of falling through to a 0 result. Each branch body becomes a
+// BlockExpr (evaluating to its last expression); the `else` becomes the default.
+func ifStmtToMatchExpr(s *IfStmt) *MatchExpr {
+	clauses := make([]*MatchClause, 0, len(s.Branches))
+	for _, br := range s.Branches {
+		clauses = append(clauses, &MatchClause{Guard: br.Condition, Result: &BlockExpr{Statements: br.Body}})
+	}
+	var def Expression = &NumberExpr{Value: 0.0}
+	if len(s.ElseBody) > 0 {
+		def = &BlockExpr{Statements: s.ElseBody}
+	}
+	return &MatchExpr{Condition: &NumberExpr{Value: 1.0}, Clauses: clauses, DefaultExpr: def}
+}
+
+// ifStmtCStructType returns the cstruct type a trailing `if`/`elif`/`else`
+// statement evaluates to (the type of any arm's final value). A struct-returning
+// function may end in such a statement (e.g. `V.norm`'s normalize-or-self), and
+// without this its callers wouldn't know the result is a cstruct pointer.
+func (acg *ARM64CodeGen) ifStmtCStructType(s *IfStmt) string {
+	blockType := func(body []Statement) string {
+		if n := len(body); n > 0 {
+			switch st := body[n-1].(type) {
+			case *ExpressionStmt:
+				return acg.cStructTypeOf(st.Expr)
+			case *JumpStmt:
+				if st.Value != nil {
+					return acg.cStructTypeOf(st.Value)
+				}
+			case *IfStmt:
+				return acg.ifStmtCStructType(st)
+			}
+		}
+		return ""
+	}
+	for _, br := range s.Branches {
+		if t := blockType(br.Body); t != "" {
+			return t
+		}
+	}
+	return blockType(s.ElseBody)
 }
 
 // listElemCStructTypeOf infers the cstruct type of the ELEMENTS of a list-valued
@@ -208,11 +273,23 @@ func (acg *ARM64CodeGen) lambdaReturnCStructType(body Expression) string {
 		if len(b.Statements) == 0 {
 			return ""
 		}
+		// Pre-register the body's local cstruct types so a returned local
+		// identifier (`r = …; r`) resolves even though the body has not been
+		// compiled yet. Restore afterward so these locals don't leak globally.
+		added := acg.registerBlockLocalCStructTypes(b.Statements)
+		defer func() {
+			for _, k := range added {
+				delete(acg.varCStructType, k)
+			}
+		}()
 		switch s := b.Statements[len(b.Statements)-1].(type) {
 		case *ExpressionStmt:
 			last = s.Expr
 		case *JumpStmt:
 			last = s.Value
+		case *IfStmt:
+			// A function may end in a bare `if`/`else` whose arms yield a cstruct.
+			return acg.ifStmtCStructType(s)
 		default:
 			return ""
 		}
@@ -221,6 +298,39 @@ func (acg *ARM64CodeGen) lambdaReturnCStructType(body Expression) string {
 		return ""
 	}
 	return acg.cStructTypeOf(last)
+}
+
+// registerBlockLocalCStructTypes scans a block's statements in order and records
+// the cstruct type of each struct-valued local into varCStructType (so later
+// statements — and a trailing `return local` — can resolve it). It only adds names
+// not already tracked, and returns the list of names it added so the caller can
+// restore the map. It descends into `arena { … }` blocks, which wrap most
+// struct-temporary scopes, but not control flow (a conditionally-defined local has
+// no single static type).
+func (acg *ARM64CodeGen) registerBlockLocalCStructTypes(stmts []Statement) []string {
+	var added []string
+	var scan func(ss []Statement)
+	scan = func(ss []Statement) {
+		for _, stmt := range ss {
+			switch s := stmt.(type) {
+			case *AssignStmt:
+				if s.IsUpdate {
+					continue
+				}
+				if _, exists := acg.varCStructType[s.Name]; exists {
+					continue
+				}
+				if ct := acg.cStructTypeOf(s.Value); ct != "" {
+					acg.varCStructType[s.Name] = ct
+					added = append(added, s.Name)
+				}
+			case *ArenaStmt:
+				scan(s.Body)
+			}
+		}
+	}
+	scan(stmts)
+	return added
 }
 
 // isLambdaValue reports whether expr is a lambda literal in any of its forms.
@@ -1087,6 +1197,17 @@ func (acg *ARM64CodeGen) cstructForExpr(expr Expression) *CStructDecl {
 				}
 			}
 		}
+	case *CallExpr:
+		// A call result used directly as a receiver: `mk(...).x`. A constructor
+		// yields its own struct; any other call yields the struct its function is
+		// known to return. This is what lets `f(...).field` work without first
+		// binding the result to a typed local.
+		if decl, ok := acg.cstructs[e.Function]; ok {
+			return decl
+		}
+		if t, ok := acg.funcReturnsCStruct[e.Function]; ok {
+			return acg.cstructs[t]
+		}
 	}
 	return nil
 }
@@ -1245,6 +1366,225 @@ func (acg *ARM64CodeGen) emitBumpAlloc(size int) error {
 	return nil
 }
 
+// pureBaseExprEqual reports whether two expressions are syntactically equal AND
+// side-effect-free (so one may be compiled in place of the other, or compiled
+// once and reused). Only the shapes that appear as a vec-arithmetic operand base
+// are handled — identifiers, nested field reads, numeric/`self` literals.
+func pureBaseExprEqual(a, b Expression) bool {
+	switch ae := a.(type) {
+	case *IdentExpr:
+		be, ok := b.(*IdentExpr)
+		return ok && ae.Name == be.Name
+	case *FieldAccessExpr:
+		be, ok := b.(*FieldAccessExpr)
+		return ok && ae.FieldName == be.FieldName && pureBaseExprEqual(ae.Object, be.Object)
+	case *NumberExpr:
+		be, ok := b.(*NumberExpr)
+		return ok && ae.Value == be.Value
+	}
+	return false
+}
+
+// isPureVecBase reports whether an expression is a side-effect-free struct-valued
+// operand base (safe to compile to a pointer without double-evaluating a call).
+func isPureVecBase(e Expression) bool {
+	switch e.(type) {
+	case *IdentExpr, *FieldAccessExpr:
+		return true
+	}
+	return false
+}
+
+// tryCompileNEONVec3 recognizes a 3-field f64 cstruct constructor whose arguments
+// are an element-wise binary op over the fields of one or two operand structs and
+// emits NEON: the x/y lanes are computed with a single .2D op, z stays scalar.
+// Returns (true, _) when it emitted code; (false, nil) to fall back to the scalar
+// constructor. It only fires when operand layouts are statically known to match
+// `decl` (so the 128-bit load of lanes x,y is sound).
+func (acg *ARM64CodeGen) tryCompileNEONVec3(decl *CStructDecl, args []Expression) (bool, error) {
+	// Exactly three contiguous f64 fields at offsets 0, 8, 16.
+	if len(decl.Fields) != 3 {
+		return false, nil
+	}
+	for i, f := range decl.Fields {
+		if (f.Type != "float64" && f.Type != "f64") || f.Offset != i*8 {
+			return false, nil
+		}
+	}
+
+	// Every argument must be `<recv>.field_i <op> <rhs_i>` with the same operator.
+	op := ""
+	lefts := make([]*FieldAccessExpr, 3)
+	rights := make([]Expression, 3)
+	for i, a := range args {
+		be, ok := a.(*BinaryExpr)
+		if !ok || (be.Operator != "+" && be.Operator != "-" && be.Operator != "*") {
+			return false, nil
+		}
+		if op == "" {
+			op = be.Operator
+		} else if be.Operator != op {
+			return false, nil
+		}
+		fa, ok := be.Left.(*FieldAccessExpr)
+		if !ok || fa.FieldName != decl.Fields[i].Name || !isPureVecBase(fa.Object) {
+			// `*` may also be written `s * v.field`; try the mirrored shape.
+			fa, ok = be.Right.(*FieldAccessExpr)
+			if op != "*" || !ok || fa.FieldName != decl.Fields[i].Name || !isPureVecBase(fa.Object) {
+				return false, nil
+			}
+			lefts[i], rights[i] = fa, be.Left
+		} else {
+			lefts[i], rights[i] = fa, be.Right
+		}
+	}
+
+	// The left operand base (the receiver) must be identical across lanes and have
+	// `decl`'s layout, so loading lanes x,y as one 128-bit vector is correct.
+	baseA := lefts[0].Object
+	for i := 1; i < 3; i++ {
+		if !pureBaseExprEqual(baseA, lefts[i].Object) {
+			return false, nil
+		}
+	}
+	if acg.cStructTypeOf(baseA) != decl.Name {
+		return false, nil
+	}
+
+	// Determine the right-hand side: either element-wise (`b.field_i`, base B of
+	// `decl`'s type) or a broadcast scalar (the same value across all lanes).
+	rhsIsField := false
+	if rfa, ok := rights[0].(*FieldAccessExpr); ok && rfa.FieldName == decl.Fields[0].Name && isPureVecBase(rfa.Object) {
+		rhsIsField = true
+	}
+	var baseB Expression
+	var scalarS Expression
+	if rhsIsField {
+		for i := range 3 {
+			rfa, ok := rights[i].(*FieldAccessExpr)
+			if !ok || rfa.FieldName != decl.Fields[i].Name || !isPureVecBase(rfa.Object) {
+				return false, nil
+			}
+		}
+		baseB = rights[0].(*FieldAccessExpr).Object
+		for i := 1; i < 3; i++ {
+			if !pureBaseExprEqual(baseB, rights[i].(*FieldAccessExpr).Object) {
+				return false, nil
+			}
+		}
+		if acg.cStructTypeOf(baseB) != decl.Name {
+			return false, nil
+		}
+	} else {
+		// Broadcast-scalar (scale): only valid for `*`, with the same scalar value
+		// on every lane and the scalar not itself a struct field of decl.
+		if op != "*" {
+			return false, nil
+		}
+		scalarS = rights[0]
+		for i := 1; i < 3; i++ {
+			if !pureBaseExprEqual(scalarS, rights[i]) {
+				return false, nil
+			}
+		}
+	}
+
+	return true, acg.emitNEONVec3(decl, op, baseA, baseB, scalarS)
+}
+
+// emitNEONVec3 emits the NEON body recognized by tryCompileNEONVec3: it allocates
+// the result struct, computes lanes x,y with one .2D op and lane z scalar, and
+// leaves the result pointer (as a numeric double) in d0.
+func (acg *ARM64CodeGen) emitNEONVec3(decl *CStructDecl, op string, baseA, baseB, scalarS Expression) error {
+	vecOp := map[string]func(d, a, b string) error{
+		"+": acg.out.FaddV2D, "-": acg.out.FsubV2D, "*": acg.out.FmulV2D,
+	}[op]
+	sclOp := map[string]func(d, a, b string) error{
+		"+": acg.out.FaddScalar64, "-": acg.out.FsubScalar64, "*": acg.out.FmulScalar64,
+	}[op]
+
+	// Reserve a 16-byte spill slot for operand pointers / the scalar.
+	acg.out.SubImm64("sp", "sp", 16)
+
+	// ptrA = &baseA, spilled to [sp, 0].
+	if err := acg.compileExpression(baseA); err != nil { // d0 = pointer (float bits)
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x9", "d0"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x9", "sp", 0); err != nil {
+		return err
+	}
+
+	if baseB != nil {
+		if err := acg.compileExpression(baseB); err != nil { // d0 = pointer
+			return err
+		}
+		if err := acg.out.FcvtzsDoubleToInt64("x9", "d0"); err != nil {
+			return err
+		}
+		if err := acg.out.StrImm64("x9", "sp", 8); err != nil {
+			return err
+		}
+	} else {
+		if err := acg.compileExpression(scalarS); err != nil { // d0 = scalar value
+			return err
+		}
+		if err := acg.out.StrImm64Double("d0", "sp", 8); err != nil {
+			return err
+		}
+	}
+
+	// Allocate the result struct (pointer in x0); may call malloc, so operands are
+	// reloaded from the spill slot afterward.
+	if err := acg.emitBumpAlloc(decl.Size); err != nil {
+		return err
+	}
+	if err := acg.out.LdrImm64("x9", "sp", 0); err != nil { // x9 = ptrA
+		return err
+	}
+	if err := acg.out.LdrQ("v0", "x9", 0); err != nil { // A.x, A.y
+		return err
+	}
+	if err := acg.out.LdrImm64Double("d3", "x9", 16); err != nil { // A.z
+		return err
+	}
+	if baseB != nil {
+		if err := acg.out.LdrImm64("x10", "sp", 8); err != nil { // x10 = ptrB
+			return err
+		}
+		if err := acg.out.LdrQ("v1", "x10", 0); err != nil { // B.x, B.y
+			return err
+		}
+		if err := acg.out.LdrImm64Double("d4", "x10", 16); err != nil { // B.z
+			return err
+		}
+	} else {
+		if err := acg.out.LdrImm64Double("d4", "sp", 8); err != nil { // scalar
+			return err
+		}
+		if err := acg.out.DupV2D("v1", "d4"); err != nil { // broadcast to both lanes
+			return err
+		}
+	}
+	if err := vecOp("v2", "v0", "v1"); err != nil {
+		return err
+	}
+	if err := acg.out.StrQ("v2", "x0", 0); err != nil { // result.x, result.y
+		return err
+	}
+	if err := sclOp("d3", "d3", "d4"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d3", "x0", 16); err != nil { // result.z
+		return err
+	}
+	acg.out.AddImm64("sp", "sp", 16)
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0 (numeric ptr)
+	return nil
+}
+
 // compileCStructConstructor compiles a cstruct value constructor, e.g.
 // `Point(3.0, 4.0)`: allocate the struct, store each argument into its field,
 // and yield a numeric pointer to the value (the convention cstruct field access
@@ -1253,6 +1593,13 @@ func (acg *ARM64CodeGen) emitBumpAlloc(size int) error {
 func (acg *ARM64CodeGen) compileCStructConstructor(decl *CStructDecl, args []Expression) error {
 	if len(args) != len(decl.Fields) {
 		return fmt.Errorf("%s constructor expects %d arguments, got %d", decl.Name, len(decl.Fields), len(args))
+	}
+	// NEON fast path for element-wise vec3 arithmetic (`V(a.x±b.x, ...)`,
+	// `V(a.x*s, ...)`): processes the x/y pair with one .2D instruction.
+	if handled, err := acg.tryCompileNEONVec3(decl, args); err != nil {
+		return err
+	} else if handled {
+		return nil
 	}
 	size := decl.Size
 	if size <= 0 {
@@ -2932,6 +3279,10 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 						return err
 					}
 					return acg.compileExpression(&IdentExpr{Name: assignStmt.Name})
+				} else if ifStmt, ok := stmt.(*IfStmt); ok {
+					// A trailing `if`/`else` is the block's value: compile it as the
+					// equivalent value-producing match so its arm result lands in d0.
+					return acg.compileExpression(ifStmtToMatchExpr(ifStmt))
 				}
 			}
 

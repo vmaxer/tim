@@ -119,6 +119,7 @@ type Parser struct {
 	matchResultDepth int                     // >0 while parsing a match-clause result: a top-level '|' starts the next guard clause, not a pipe
 	inConditionLoop  bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
 	inMapKey         bool                    // True while parsing a map-literal key, so a ':' there is the key separator, not a `:`-as-`as` cast
+	inTernaryThen    bool                    // True while parsing a ternary then-branch, so a ':' there is the ternary separator, not a `:`-as-`as` cast
 	scopes           []map[string]bool       // Stack of variable scopes for shadow detection
 	lambdaParams     []string                // Temporary storage for lambda parameters being parsed
 	pendingHoists    []Statement             // Synthesized top-level defs to inject before the current statement
@@ -2148,6 +2149,7 @@ func (p *Parser) disambiguateBlock() BlockType {
 	foundColon := false
 	foundArrow := false
 	foundAssign := false // an assignment (= := <-) at depth 1 before the first arrow
+	pendingTernary := 0  // unmatched `?` at depth 1: the next ':' is a ternary separator, not a map colon
 
 	// Scan tokens within this block
 	for range maxBlockIterations {
@@ -2167,7 +2169,13 @@ func (p *Parser) disambiguateBlock() BlockType {
 			}
 		} else if braceDepth == 1 {
 			// At top level of this block
-			if tok.Type == TOKEN_COLON && !foundArrow {
+			if tok.Type == TOKEN_QUESTION {
+				// A ternary `cond ? a : b`: remember it so its ':' isn't read as a
+				// map-key separator below.
+				pendingTernary++
+			} else if tok.Type == TOKEN_COLON && pendingTernary > 0 {
+				pendingTernary--
+			} else if tok.Type == TOKEN_COLON && !foundArrow {
 				// Check if this is a type annotation (x: num = ...) vs map literal (x: value)
 				// Type annotations have a type keyword (as identifier) after the colon
 				nextTok := tempLexer.NextToken()
@@ -3803,9 +3811,40 @@ func (p *Parser) parseExpression() Expression {
 		debug.PrintStack()
 		p.error(fmt.Sprintf("infinite recursion in parseExpression: depth=%d, token type=%v value='%v' line=%d", globalParseCallCount, p.current.Type, p.current.Value, p.current.Line))
 	}
-	result := p.parsePipe()
+	result := p.parseTernary()
 	globalParseCallCount--
 	return result
+}
+
+// parseTernary handles the C-style conditional `cond ? then : else` (lowest
+// precedence, right-associative so `a ? b : c ? d : e` nests on the right). It
+// lowers to the same MatchExpr an `if`-expression produces, so it shares all the
+// if-expression codegen and type inference.
+func (p *Parser) parseTernary() Expression {
+	cond := p.parsePipe()
+	if p.peek.Type != TOKEN_QUESTION {
+		return cond
+	}
+	p.nextToken() // move onto '?'
+	p.nextToken() // move to first token of the then-branch
+	// Suppress the `:`-as-`as` cast shorthand inside the then-branch so the colon
+	// is recognized as the ternary separator (`a ? b : c`, not `a ? (b as c)`).
+	savedTernary := p.inTernaryThen
+	p.inTernaryThen = true
+	thenExpr := p.parsePipe()
+	p.inTernaryThen = savedTernary
+	if p.peek.Type != TOKEN_COLON {
+		p.error("expected ':' in ternary conditional (cond ? a : b)")
+		return cond
+	}
+	p.nextToken() // move onto ':'
+	p.nextToken() // move to first token of the else-branch
+	elseExpr := p.parseTernary()
+	return &MatchExpr{
+		Condition:   &NumberExpr{Value: 1.0},
+		Clauses:     []*MatchClause{{Guard: cond, Result: thenExpr}},
+		DefaultExpr: elseExpr,
+	}
 }
 
 // parsePipe handles | and || operators (lowest precedence)
@@ -4408,7 +4447,7 @@ func (p *Parser) parsePostfix() Expression {
 			// Handle postfix length operator: xs#
 			p.nextToken() // skip to #
 			expr = &UnaryExpr{Operator: "#", Operand: expr}
-		} else if p.peek.Type == TOKEN_AS || (p.peek.Type == TOKEN_COLON && !p.inMapKey) {
+		} else if p.peek.Type == TOKEN_AS || (p.peek.Type == TOKEN_COLON && !p.inMapKey && !p.inTernaryThen) {
 			// Handle type cast: `expr as Type` or the `:` shorthand `expr : Type`.
 			// The `:` form is suppressed while parsing a map key (`{5: 10}`) so the
 			// colon there stays the key separator. (Block-level disambiguation

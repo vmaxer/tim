@@ -423,6 +423,185 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "cstruct_operator_through_fma",
+			// `ro + rd * t` matches the FMA pattern, which the optimizer fuses
+			// before operator overloading runs. The fused node must still desugar
+			// to V_add/V_scale (a float FMA on cstruct pointer bits would be
+			// silently wrong), and the function's return type must be inferred as V
+			// through the FMA so `p.dot(p)` resolves.
+			code: `
+				cstruct V { x, y, z: f64 }
+				fun V.add(o: V)  = V(self.x+o.x, self.y+o.y, self.z+o.z)
+				fun V.scale(s)   = V(self.x*s, self.y*s, self.z*s)
+				fun V.dot(o: V)  = self.x*o.x + self.y*o.y + self.z*o.z
+				fun at(ro as V, rd as V, t) = ro + rd * t
+				main = {
+					p = at(V(1.0,2.0,3.0), V(1.0,0.0,0.0), 2.0)
+					println(p.dot(p))
+				}
+			`,
+			// at = (3,2,3); dot = 9+4+9 = 22
+			expectedOutput: "22\n",
+			expectCompile:  true,
+		},
+		{
+			name: "cstruct_returned_through_if",
+			// A function whose value flows through a conditional (an if-expression,
+			// a trailing if-statement, or a guard match) returns a cstruct. The
+			// codegen must infer this so callers treat the result as a pointer, and
+			// a trailing `if` statement must yield its arm's value (not 0).
+			code: `
+				cstruct V { x, y, z: f64 }
+				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+				fun pick_expr(a as V, f) = if f > 0.0 { a * 2.0 } else { a }
+				fun pick_stmt(a as V, f) {
+					if f > 0.0 { a * 2.0 } else { a }
+				}
+				fun pick_local(a as V, f) {
+					r = if f > 0.0 { a * 2.0 } else { a }
+					r
+				}
+				main = {
+					e = pick_expr(V(1.0,2.0,3.0), 1.0)
+					s = pick_stmt(V(1.0,2.0,3.0), 1.0)
+					l = pick_local(V(1.0,2.0,3.0), 0.0)
+					println(e.x)
+					println(s.y)
+					println(l.z)
+				}
+			`,
+			// e.x = 1*2 = 2; s.y = 2*2 = 4; l (f=0) = a, l.z = 3
+			expectedOutput: "2\n4\n3\n",
+			expectCompile:  true,
+		},
+		{
+			name: "global_referenced_only_in_if_body",
+			// A module global referenced only inside an `if` body within a function
+			// must be detected as captured so it gets a global slot; otherwise
+			// codegen fails with "undefined variable".
+			code: `
+				g_buf := 0.0
+				fun fill(flag) {
+					for i in 0..<4 {
+						if flag > 0.5 {
+							write_u32(g_buf, i, 7.0)
+						}
+					}
+					1.0
+				}
+				main = {
+					g_buf <- malloc(64)
+					fill(1.0)
+					println(read_u32(g_buf, 2))
+				}
+			`,
+			expectedOutput: "7\n",
+			expectCompile:  true,
+		},
+		{
+			name: "trailing_if_statement_returns_value",
+			// A bare `if`/`else` as a function's last statement is the function's
+			// value (it must not fall through to 0).
+			code: `
+				fun classify(x) {
+					y = x + 1.0
+					if y > 10.0 { y * 2.0 } elif y > 5.0 { y } else { 0.0 }
+				}
+				main = {
+					println(classify(10.0))
+					println(classify(5.0))
+					println(classify(1.0))
+				}
+			`,
+			// classify(10): y=11 >10 -> 22; classify(5): y=6 ->6; classify(1): y=2 ->0
+			expectedOutput: "22\n6\n0\n",
+			expectCompile:  true,
+		},
+		{
+			name: "field_access_on_call_result",
+			// `f(...).field` reads a field directly off a call result without first
+			// binding it to a typed local — including method-call results and a
+			// nested cstruct field on a call result (`mkball().c.z`).
+			code: `
+				cstruct V { x, y, z: f64 }
+				cstruct Ball { c: V, r: f64 }
+				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+				fun mk(a as V) = V(a.x+1.0, a.y, a.z)
+				fun mkball() = Ball(V(3.0, 4.0, 5.0), 9.0)
+				main = {
+					println(mk(V(1.0, 2.0, 3.0)).x)
+					a := V(2.0, 3.0, 4.0)
+					println(a.scale(10.0).y)
+					println(mkball().r)
+					println(mkball().c.z)
+				}
+			`,
+			expectedOutput: "2\n30\n9\n5\n",
+			expectCompile:  true,
+		},
+		{
+			name: "ternary_conditional_operator",
+			// `cond ? a : b` lowers to the if-expression MatchExpr. Covers nesting
+			// (right-associative), cstruct-valued arms, and coexistence with map
+			// literals and the `?b` bit-test inside the same block.
+			code: `
+				cstruct V { x, y, z: f64 }
+				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+				fun sign(x) = x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0)
+				fun pick(a as V, f) = f > 0.5 ? a.scale(2.0) : a
+				main = {
+					println(sign(7.0))
+					println(sign(-2.0))
+					println(sign(0.0))
+					p = pick(V(1.0, 2.0, 3.0), 1.0)
+					println(p.x)
+					q = pick(V(1.0, 2.0, 3.0), 0.0)
+					println(q.z)
+					m = { a: 5, b: 6 }
+					println(m.a)
+					println(12.0 ?b 2.0)
+				}
+			`,
+			expectedOutput: "1\n-1\n0\n2\n3\n5\n1\n",
+			expectCompile:  true,
+		},
+		{
+			name: "neon_vec3_elementwise_and_scale",
+			// The NEON fast path for 3×f64 cstruct constructors must produce exactly
+			// the same values as the scalar path for element-wise +/-/* and scalar
+			// scale (both `v*s` and `s*v`). A struct whose fields aren't a plain
+			// 3×f64-at-0/8/16 layout must NOT take the path (correctness, not perf).
+			code: `
+				cstruct V { x, y, z: f64 }
+				cstruct P { a: f64, v: V, b: f64 }
+				fun V.add(o: V) = V(self.x+o.x, self.y+o.y, self.z+o.z)
+				fun V.sub(o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
+				fun V.mul(o: V) = V(self.x*o.x, self.y*o.y, self.z*o.z)
+				fun V.scl(s)    = V(self.x*s, self.y*s, self.z*s)
+				fun V.scl2(s)   = V(s*self.x, s*self.y, s*self.z)
+				main = {
+					a := V(1.0, 2.0, 3.0)
+					b := V(10.0, 20.0, 30.0)
+					s  = a.add(b)
+					d  = a.sub(b)
+					m  = a.mul(b)
+					c1 = a.scl(2.0)
+					c2 = a.scl2(3.0)
+					println(s.x + s.y + s.z)
+					println(d.x + d.y + d.z)
+					println(m.x + m.y + m.z)
+					println(c1.x + c1.y + c1.z)
+					println(c2.x + c2.y + c2.z)
+					p := P(7.0, V(4.0, 5.0, 6.0), 9.0)
+					println(p.v.x + p.v.y + p.v.z)
+				}
+			`,
+			// s=11+22+33=66; d=-9-18-27=-54; m=10+40+90=140;
+			// c1=2+4+6=12; c2=3+6+9=18; p.v=4+5+6=15
+			expectedOutput: "66\n-54\n140\n12\n18\n15\n",
+			expectCompile:  true,
+		},
+		{
 			name: "fork_mmap_shared_memory",
 			// fork-based parallelism primitives: a child writes to an mmap'd
 			// shared buffer, the parent reaps it and reads the value back. This is
