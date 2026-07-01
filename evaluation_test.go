@@ -735,6 +735,38 @@ func TestEvaluation(t *testing.T) {
 			expectedOutput: "11\n101\n12\n",
 			expectCompile:  true,
 		},
+		{
+			name: "with_block_prepends_subject",
+			// `with <subj> { f(); g(x) }` prepends subj as the first argument of
+			// each direct call statement in the body, so f(5) becomes f(subj, 5).
+			code: `
+				show = (subj, n) -> println(subj + n)
+				main = {
+					with 100.0 {
+						show(5.0)
+						show(7.0)
+					}
+				}
+			`,
+			expectedOutput: "105\n107\n",
+			expectCompile:  true,
+		},
+		{
+			name: "with_block_identifier_subject_zero_arg",
+			// The subject can be an identifier and the body calls can be zero-arg;
+			// `emit()` inside `with base` becomes `emit(base)`.
+			code: `
+				emit = (tag) -> println(tag)
+				main = {
+					base = 42.0
+					with base {
+						emit()
+					}
+				}
+			`,
+			expectedOutput: "42\n",
+			expectCompile:  true,
+		},
 	}
 
 	for _, tt := range tests {

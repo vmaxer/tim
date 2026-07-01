@@ -563,6 +563,52 @@ func (p *Parser) parseArenaStmt() *ArenaStmt {
 	return &ArenaStmt{Body: body}
 }
 
+// parseWithStmt parses a subject-injection block: with <subject> { statements }.
+// The subject expression is prepended as the first argument of every direct call
+// statement in the body, so `with ren { clear(); draw(t) }` desugars to
+// `clear(ren); draw(ren, t)`. Injection happens here at parse time; the resulting
+// WithStmt just carries the already-injected body (see WithStmt in ast.go).
+func (p *Parser) parseWithStmt() *WithStmt {
+	p.nextToken() // skip 'with'
+
+	// Parse the subject. Set inConditionLoop so the body's opening '{' is not
+	// eaten as a block/struct argument of the subject (same guard if/while use).
+	oldCL := p.inConditionLoop
+	p.inConditionLoop = true
+	subject := p.parseExpression()
+	p.inConditionLoop = oldCL
+
+	if p.peek.Type != TOKEN_LBRACE {
+		p.error("expected '{' after 'with <subject>'")
+	}
+	p.nextToken() // move to '{'
+	body := p.parseStatementBlock()
+
+	// Inject the subject as the first argument of each direct call statement.
+	for _, stmt := range body {
+		injectWithSubject(stmt, subject)
+	}
+
+	return &WithStmt{Subject: subject, Body: body}
+}
+
+// injectWithSubject prepends the with-block subject as the first argument of a
+// body statement when that statement is a direct call (a bare `f(...)` or a
+// dotted `ns.f(...)`). Non-call statements are left untouched, so `with`
+// bodies can still hold assignments or other statements without surprise.
+func injectWithSubject(stmt Statement, subject Expression) {
+	es, ok := stmt.(*ExpressionStmt)
+	if !ok {
+		return
+	}
+	switch call := es.Expr.(type) {
+	case *CallExpr:
+		call.Args = append([]Expression{subject}, call.Args...)
+	case *DirectCallExpr:
+		call.Args = append([]Expression{subject}, call.Args...)
+	}
+}
+
 func (p *Parser) parseStatementBlock() []Statement {
 	if p.current.Type != TOKEN_LBRACE {
 		p.error("expected '{' to start block")
@@ -1201,6 +1247,11 @@ func (p *Parser) parseStatement() Statement {
 	// Check for arena keyword
 	if p.current.Type == TOKEN_ARENA {
 		return p.parseArenaStmt()
+	}
+
+	// Check for with keyword (subject-injection block)
+	if p.current.Type == TOKEN_WITH {
+		return p.parseWithStmt()
 	}
 
 	// Check for defer keyword

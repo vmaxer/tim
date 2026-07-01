@@ -1561,6 +1561,9 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
 			case *ArenaStmt:
 				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
+			case *WithStmt:
+				collectCapturedVarsExpr(s.Subject, localParamSet, captured)
+				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
 			}
 		}
 	}
@@ -3026,6 +3029,10 @@ func opCollectLocalTypesStmt(stmt Statement, env, retType map[string]string) {
 		for _, b := range s.Body {
 			opCollectLocalTypesStmt(b, env, retType)
 		}
+	case *WithStmt:
+		for _, b := range s.Body {
+			opCollectLocalTypesStmt(b, env, retType)
+		}
 	case *IfStmt:
 		for _, br := range s.Branches {
 			for _, b := range br.Body {
@@ -3062,6 +3069,11 @@ func opDesugarStmt(stmt Statement, env, retType map[string]string, defined map[s
 		s.Index = opDesugarExpr(s.Index, env, retType, defined)
 		s.Value = opDesugarExpr(s.Value, env, retType, defined)
 	case *ArenaStmt:
+		for _, b := range s.Body {
+			opDesugarStmt(b, env, retType, defined)
+		}
+	case *WithStmt:
+		s.Subject = opDesugarExpr(s.Subject, env, retType, defined)
 		for _, b := range s.Body {
 			opDesugarStmt(b, env, retType, defined)
 		}

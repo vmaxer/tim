@@ -1551,6 +1551,13 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 
 		// Restore arena depth
 		fc.currentArena = previousArena
+	case *WithStmt:
+		// Transparent block: collect symbols from the (already-injected) body.
+		for _, bodyStmt := range s.Body {
+			if err := fc.collectSymbols(bodyStmt); err != nil {
+				return err
+			}
+		}
 	case *CStructDecl:
 		// Cstruct declarations don't allocate runtime stack space
 		// Constants are already registered in parser (Name_SIZEOF, Name_field_OFFSET)
@@ -2183,6 +2190,13 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 
 	case *ArenaStmt:
 		fc.compileArenaStmt(s)
+
+	case *WithStmt:
+		// Transparent block: subject already injected into body calls at parse
+		// time, so just emit the body statements in order.
+		for _, bodyStmt := range s.Body {
+			fc.compileStatement(bodyStmt)
+		}
 
 	case *DeferStmt:
 		if len(fc.deferredExprs) == 0 {

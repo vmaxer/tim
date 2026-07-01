@@ -167,6 +167,7 @@ const (
 	TOKEN_UNSAFE   // unsafe (architecture-specific code blocks)
 	TOKEN_SYSCALL  // syscall (system call in unsafe blocks)
 	TOKEN_ARENA    // arena (arena memory blocks)
+	TOKEN_WITH     // with (subject-injection block: with x { f() } => f(x))
 	TOKEN_DEFER    // defer (deferred execution)
 	TOKEN_INF      // inf (infinity, for unlimited iterations or numeric infinity)
 	TOKEN_CSTRUCT  // cstruct (C-compatible struct definition)
@@ -532,6 +533,8 @@ func (l *Lexer) NextToken() Token {
 			return Token{Type: TOKEN_SYSCALL, Value: value, Line: l.line, Column: tokenColumn}
 		case "arena":
 			return Token{Type: TOKEN_ARENA, Value: value, Line: l.line, Column: tokenColumn}
+		case "with":
+			return Token{Type: TOKEN_WITH, Value: value, Line: l.line, Column: tokenColumn}
 		case "defer":
 			return Token{Type: TOKEN_DEFER, Value: value, Line: l.line, Column: tokenColumn}
 		case "inf":

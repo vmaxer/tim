@@ -1087,6 +1087,34 @@ func (a *ArenaStmt) String() string {
 }
 func (a *ArenaStmt) statementNode() {}
 
+// WithStmt represents a subject-injection block: with <subject> { f(); g(x) }
+// The subject is prepended as the first argument of every direct call statement
+// in the body (done at parse time), so `with ren { clear(); draw(t) }` becomes
+// `clear(ren); draw(ren, t)`. It has no runtime scoping semantics of its own —
+// the body statements run in the enclosing scope, in order. Subject is retained
+// for String()/debugging; Body already holds the injected statements.
+type WithStmt struct {
+	Subject Expression  // the value prepended as first arg (e.g. `ren`)
+	Body    []Statement // body statements, with Subject already injected
+}
+
+func (w *WithStmt) String() string {
+	var out strings.Builder
+	out.WriteString("with ")
+	if w.Subject != nil {
+		out.WriteString(w.Subject.String())
+	}
+	out.WriteString(" {\n")
+	for _, stmt := range w.Body {
+		out.WriteString("  ")
+		out.WriteString(stmt.String())
+		out.WriteString("\n")
+	}
+	out.WriteString("}")
+	return out.String()
+}
+func (w *WithStmt) statementNode() {}
+
 // ArenaExpr represents an arena block used as an expression
 type ArenaExpr struct {
 	Body []Statement // Statements executed within the arena

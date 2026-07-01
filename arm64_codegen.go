@@ -326,6 +326,8 @@ func (acg *ARM64CodeGen) registerBlockLocalCStructTypes(stmts []Statement) []str
 				}
 			case *ArenaStmt:
 				scan(s.Body)
+			case *WithStmt:
+				scan(s.Body)
 			}
 		}
 	}
@@ -947,6 +949,15 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 		return nil
 	case *ArenaStmt:
 		return acg.compileArenaStmt(s)
+	case *WithStmt:
+		// A with-block is transparent at runtime: the subject was already
+		// injected into each body call at parse time, so just run the body.
+		for _, bodyStmt := range s.Body {
+			if err := acg.compileStatement(bodyStmt); err != nil {
+				return err
+			}
+		}
+		return nil
 	case *DeferStmt:
 		// Defer statement: collect for execution at scope exit
 		if len(acg.deferredExprs) == 0 {
