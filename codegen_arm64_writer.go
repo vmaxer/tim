@@ -20,57 +20,20 @@ func (fc *TimCompiler) writeELFARM64(outputPath string) error {
 	textBytes := fc.eb.text.Bytes()
 	rodataBytes := fc.eb.rodata.Bytes()
 
-	// Build pltFunctions list from all called functions
-	pltFunctions := []string{"printf", "exit", "malloc", "free", "realloc", "strlen", "pow", "fflush"}
-
-	// Add all functions from usedFunctions
-	pltSet := make(map[string]bool)
-	for _, f := range pltFunctions {
-		pltSet[f] = true
-	}
-
-	// Add functions from eb.neededFunctions (populated by ARM64 codegen)
-	for _, funcName := range fc.eb.neededFunctions {
-		if !pltSet[funcName] {
-			pltFunctions = append(pltFunctions, funcName)
-			pltSet[funcName] = true
-		}
-	}
-
-	// Build set of lambda function names to exclude from PLT
+	// Build set of lambda function names to exclude from PLT (they are internal).
 	lambdaSet := make(map[string]bool)
 	for _, lambda := range fc.lambdaFuncs {
 		lambdaSet[lambda.Name] = true
 	}
 
-	for funcName := range fc.usedFunctions {
-		// Skip lambda functions - they are internal, not external PLT functions
-		if lambdaSet[funcName] {
-			continue
-		}
-		// Skip internal runtime functions
-		if strings.HasPrefix(funcName, "_tim") || strings.HasPrefix(funcName, "tim_") {
-			continue
-		}
-		if !pltSet[funcName] {
-			pltFunctions = append(pltFunctions, funcName)
-			pltSet[funcName] = true
-		}
-	}
-
-	// Set up dynamic sections
-	ds := NewDynamicSections(fc.eb.target.Arch())
-	fc.dynamicSymbols = ds
-
-	// Add NEEDED libraries
-	ds.AddNeeded("libc.so.6")
-
-	// Check if pthread functions are used
-	if fc.usedFunctions["pthread_create"] || fc.usedFunctions["pthread_join"] {
-		ds.AddNeeded("libpthread.so.0")
-	}
-
-	// Check if any libm functions are called
+	// Determine whether the program actually calls anything external. println,
+	// print and the _tim_malloc allocator are syscall/internal, so a pure-Tim
+	// program needs no shared library at all — and must link none, so libc is
+	// pulled in strictly on a need-to-use basis (executable-size optimization).
+	// External needs are: C-FFI calls (recorded in eb.neededFunctions and
+	// fc.cFunctionLibs / fc.cLibHandles) and any libc/libm functions used
+	// directly. Only libm math functions computed via a call (not the inline
+	// ARM64 FP ops) matter here.
 	libmFunctions := map[string]bool{
 		"sqrt": true, "sin": true, "cos": true, "tan": true,
 		"asin": true, "acos": true, "atan": true, "atan2": true,
@@ -78,22 +41,98 @@ func (fc *TimCompiler) writeELFARM64(outputPath string) error {
 		"log": true, "log10": true, "exp": true, "pow": true,
 		"fabs": true, "fmod": true, "ceil": true, "floor": true,
 	}
-	needsLibm := false
-	for funcName := range fc.usedFunctions {
-		if libmFunctions[funcName] {
-			needsLibm = true
-			break
+	externalUsed := func(funcName string) bool {
+		if lambdaSet[funcName] {
+			return false
 		}
+		if strings.HasPrefix(funcName, "_tim") || strings.HasPrefix(funcName, "tim_") {
+			return false
+		}
+		return true
 	}
-	if needsLibm {
-		ds.AddNeeded("libm.so.6")
-	}
-
-	// Add C library dependencies from imports
+	hasExternal := len(fc.eb.neededFunctions) > 0 || len(fc.cFunctionLibs) > 0
 	for libName := range fc.cLibHandles {
 		if libName != "linked" && libName != "c" {
-			ds.AddNeeded(libName)
+			hasExternal = true
 		}
+	}
+	if !hasExternal {
+		for funcName := range fc.usedFunctions {
+			if externalUsed(funcName) {
+				hasExternal = true
+				break
+			}
+		}
+	}
+
+	// Set up dynamic sections
+	ds := NewDynamicSections(fc.eb.target.Arch())
+	fc.dynamicSymbols = ds
+
+	// pltFunctions and DT_NEEDED entries are populated only when the program
+	// actually calls something external. A self-contained program leaves both
+	// empty, so WriteCompleteDynamicELF emits no PLT/GOT and no library
+	// dependency — no libc is linked.
+	var pltFunctions []string
+	if hasExternal {
+		// Baseline libc PLT plus everything the program actually calls.
+		pltFunctions = []string{"printf", "exit", "malloc", "free", "realloc", "strlen", "pow", "fflush"}
+		pltSet := make(map[string]bool)
+		for _, f := range pltFunctions {
+			pltSet[f] = true
+		}
+
+		// Add functions from eb.neededFunctions (populated by ARM64 codegen)
+		for _, funcName := range fc.eb.neededFunctions {
+			if !pltSet[funcName] {
+				pltFunctions = append(pltFunctions, funcName)
+				pltSet[funcName] = true
+			}
+		}
+
+		for funcName := range fc.usedFunctions {
+			// Skip lambda functions - they are internal, not external PLT functions
+			if lambdaSet[funcName] {
+				continue
+			}
+			// Skip internal runtime functions
+			if strings.HasPrefix(funcName, "_tim") || strings.HasPrefix(funcName, "tim_") {
+				continue
+			}
+			if !pltSet[funcName] {
+				pltFunctions = append(pltFunctions, funcName)
+				pltSet[funcName] = true
+			}
+		}
+
+		// Add NEEDED libraries
+		ds.AddNeeded("libc.so.6")
+
+		// Check if pthread functions are used
+		if fc.usedFunctions["pthread_create"] || fc.usedFunctions["pthread_join"] {
+			ds.AddNeeded("libpthread.so.0")
+		}
+
+		// Check if any libm functions are called
+		needsLibm := false
+		for funcName := range fc.usedFunctions {
+			if libmFunctions[funcName] {
+				needsLibm = true
+				break
+			}
+		}
+		if needsLibm {
+			ds.AddNeeded("libm.so.6")
+		}
+
+		// Add C library dependencies from imports
+		for libName := range fc.cLibHandles {
+			if libName != "linked" && libName != "c" {
+				ds.AddNeeded(libName)
+			}
+		}
+	} else if VerboseMode {
+		fmt.Fprintln(os.Stderr, "ARM64 ELF: no external functions — linking no shared libraries")
 	}
 
 	// Add symbols to dynamic sections (STB_GLOBAL = 1, STT_FUNC = 2)

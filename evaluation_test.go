@@ -768,6 +768,22 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "variable_named_c_shadows_cffi_namespace",
+			// A local variable named `c` (or `C`) must shadow the always-registered
+			// C-FFI namespace, so `c.x` is a struct-field access — not a `c.`
+			// namespace reference that silently compiles to a wild memory read.
+			code: `
+				cstruct V { x: float64, y: float64, z: float64 }
+				main = {
+					c = V(10.0, 20.0, 30.0)
+					println(c.x)
+					println(c.z)
+				}
+			`,
+			expectedOutput: "10\n30\n",
+			expectCompile:  true,
+		},
+		{
 			name: "cstruct_value_type_end_to_end",
 			// Exercises the cstruct value-type paths that must behave identically
 			// on every backend: constructor to a local + field read, a method that

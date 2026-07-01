@@ -484,7 +484,7 @@ func (acg *ARM64CodeGen) emitBoxedDeclaration(slotOffset int32) error {
 	if err := acg.out.MovImm64("x0", 8); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
@@ -584,6 +584,27 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 		return err
 	}
 
+	// General-purpose heap backing store, reserved with a raw mmap syscall so no
+	// libc/libSystem allocator is linked. _tim_malloc bump-allocates from this
+	// region for lists, closures, boxed vars and the like. x25 = current top,
+	// x24 = limit; both callee-saved so they survive every libc/SDL/lambda call.
+	// libc is pulled in only for genuine C-FFI (c.malloc, SDL, ...), keeping a
+	// pure-Tim program free of any dynamic dependency. Emitted unconditionally so
+	// _tim_malloc is always safe to call; the reservation is overcommitted (pages
+	// are lazy) so an unused heap costs nothing.
+	if err := acg.emitMmapReserve(genHeapSize); err != nil {
+		return err
+	}
+	if err := acg.out.MovReg64("x25", "x0"); err != nil { // top = base
+		return err
+	}
+	if err := acg.out.MovImm64("x9", genHeapSize); err != nil {
+		return err
+	}
+	if err := acg.out.AddReg64("x24", "x25", "x9"); err != nil { // limit = base + size
+		return err
+	}
+
 	// Identify module-level globals captured by lambdas and, if any, allocate a
 	// heap array for them whose base lives in x28 (callee-saved, so it survives
 	// every call and is visible from lambda bodies). See collectGlobals.
@@ -592,7 +613,7 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 		if err := acg.out.MovImm64("x0", uint64(len(acg.globalSlots)*8)); err != nil {
 			return err
 		}
-		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 			return err
 		}
 		if err := acg.out.MovReg64("x28", "x0"); err != nil {
@@ -607,10 +628,7 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 	// survive every libc/SDL/lambda call. Only set up when the program uses
 	// cstructs (the only bump-arena consumer).
 	if len(program.CStructs) > 0 {
-		if err := acg.out.MovImm64("x0", arenaBumpSize); err != nil {
-			return err
-		}
-		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		if err := acg.emitMmapReserve(arenaBumpSize); err != nil {
 			return err
 		}
 		if err := acg.out.MovReg64("x27", "x0"); err != nil { // top = base
@@ -1126,6 +1144,58 @@ func (acg *ARM64CodeGen) emitCStructFieldStore(f *CStructField) error {
 // must comfortably hold the live allocations of one `arena { }` scope.
 const arenaBumpSize = 0x40000000
 
+// genHeapSize is the size of the general-purpose _tim_malloc heap region reserved
+// at startup (1 GiB, overcommitted). Lists, closures, boxed vars and other heap
+// allocations bump-allocate from it; when a region is exhausted _tim_malloc mmaps
+// a fresh one, so this is a working-set hint, not a hard cap.
+const genHeapSize = 0x40000000
+
+// emitMmapSyscall emits a raw mmap(2) syscall reserving anonymous, private,
+// read/write memory. The length must already be in x1; the base address is
+// returned in x0. Using a direct syscall (rather than libc malloc) is what keeps
+// a pure-Tim program free of any dynamic-library dependency — libSystem/libc is
+// linked only when the program makes a genuine C-FFI call. Errors are not checked
+// (a 1 GiB overcommit effectively never fails); clobbers x0-x5 and x8/x16.
+func (acg *ARM64CodeGen) emitMmapSyscall() error {
+	if err := acg.out.MovImm64("x0", 0); err != nil { // addr = NULL
+		return err
+	}
+	if err := acg.out.MovImm64("x2", 3); err != nil { // prot = PROT_READ|PROT_WRITE
+		return err
+	}
+	flags := uint64(0x22) // Linux: MAP_ANONYMOUS|MAP_PRIVATE
+	if acg.eb.target.OS() == OSDarwin {
+		flags = 0x1002 // macOS: MAP_ANON|MAP_PRIVATE
+	}
+	if err := acg.out.MovImm64("x3", flags); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x04, 0x00, 0x80, 0x92}) // movn x4, #0  (fd = -1)
+	if err := acg.out.MovImm64("x5", 0); err != nil {             // offset = 0
+		return err
+	}
+	if acg.eb.target.OS() == OSDarwin {
+		if err := acg.out.MovImm64("x16", 0x2000000|197); err != nil { // mmap
+			return err
+		}
+		acg.out.out.writer.WriteBytes([]byte{0x01, 0x10, 0x00, 0xd4}) // svc #0x80
+	} else {
+		if err := acg.out.MovImm64("x8", 222); err != nil { // mmap
+			return err
+		}
+		acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0xd4}) // svc #0
+	}
+	return nil
+}
+
+// emitMmapReserve reserves `size` bytes via emitMmapSyscall, leaving the base in x0.
+func (acg *ARM64CodeGen) emitMmapReserve(size uint64) error {
+	if err := acg.out.MovImm64("x1", size); err != nil {
+		return err
+	}
+	return acg.emitMmapSyscall()
+}
+
 // emitBumpAlloc allocates `size` bytes (rounded up to 16) from the x27 bump arena,
 // leaving the pointer in x0. On overflow it falls back to malloc (so correctness
 // never depends on the arena being large enough — only memory reuse does).
@@ -1165,7 +1235,7 @@ func (acg *ARM64CodeGen) emitBumpAlloc(size int) error {
 	if err := acg.out.MovImm64("x0", uint64(size)); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	donePos := acg.eb.text.Len()
@@ -2445,7 +2515,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			if err := acg.out.MovImm64("x0", uint64((n+1)*8)); err != nil {
 				return err
 			}
-			if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+			if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 				return err
 			}
 			// Spill the base pointer across element evaluation.
@@ -2662,7 +2732,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		if err := acg.out.MovImm64("x0", uint64(8+len(caps)*8)); err != nil {
 			return err
 		}
-		if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+		if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 			return err
 		}
 		acg.out.MovReg64("x10", "x0") // x10 = closure object pointer
@@ -6701,7 +6771,7 @@ func (acg *ARM64CodeGen) compileErrorCodeExtract(call *CallExpr) error {
 	if err := acg.out.MovImm64("x0", 8); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	if err := acg.out.MovImm64("x1", 0); err != nil {
@@ -6748,7 +6818,7 @@ func (acg *ARM64CodeGen) compileErrorCodeExtract(call *CallExpr) error {
 	if err := acg.out.MovImm64("x0", 56); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	// count = 3.0 (0x4008000000000000)
@@ -6813,7 +6883,7 @@ func (acg *ARM64CodeGen) emitListAlloc(countReg string) error {
 		return err
 	}
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
-	return acg.eb.GenerateCallInstruction("malloc")
+	return acg.eb.GenerateCallInstruction("_tim_malloc")
 }
 
 // emitListCopyLoop copies `countReg` float64 elements from src to dst (both
@@ -6995,7 +7065,7 @@ func (acg *ARM64CodeGen) generateListBuiltinHelpers() error {
 	if err := acg.out.MovImm64("x0", 32); err != nil { // 24 bytes, 16-aligned
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	if err := acg.out.MovImm64("x9", 0x4000000000000000); err != nil { // 2.0
@@ -7113,7 +7183,106 @@ func (acg *ARM64CodeGen) generateStringEqHelper() error {
 }
 
 // generateRuntimeHelpers generates ARM64 runtime helper functions
+// generateTimMalloc emits the _tim_malloc(x0 = size) -> x0 = ptr runtime helper:
+// a bump allocator over the mmap-reserved general heap (x25 = top, x24 = limit).
+// It never frees (matching the old libc-malloc-without-free semantics) and, on
+// exhaustion of the current region, mmaps a fresh one — so it is a drop-in
+// replacement for malloc that pulls in no dynamic allocator. It clobbers only
+// x0/x1/x9 (caller-saved) plus its own x24/x25 state on the fast path; the grow
+// path additionally uses the syscall-clobbered scratch registers.
+func (acg *ARM64CodeGen) generateTimMalloc() error {
+	acg.eb.MarkLabel("_tim_malloc")
+
+	// Round the request up to 16 bytes so the top stays 16-aligned (malloc ABI).
+	if err := acg.out.AddImm64("x0", "x0", 15); err != nil {
+		return err
+	}
+	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
+
+	// x9 = new top = current top + size.
+	if err := acg.out.AddReg64("x9", "x25", "x0"); err != nil {
+		return err
+	}
+	// If new top > limit, grow; otherwise commit and return the old top.
+	if err := acg.out.CmpReg64("x9", "x24"); err != nil {
+		return err
+	}
+	growJump := acg.eb.text.Len()
+	if err := acg.out.BranchCond("hi", 0); err != nil {
+		return err
+	}
+	if err := acg.out.MovReg64("x0", "x25"); err != nil { // return ptr = old top
+		return err
+	}
+	if err := acg.out.MovReg64("x25", "x9"); err != nil { // commit new top
+		return err
+	}
+	if err := acg.out.Return("x30"); err != nil {
+		return err
+	}
+
+	// Grow path: reserve a fresh region of max(genHeapSize, size) bytes. The size
+	// (x0) is saved across the syscall (the kernel may clobber caller-saved regs).
+	growPos := acg.eb.text.Len()
+	acg.patchJumpOffset(growJump, int32(growPos-growJump))
+	if err := acg.out.MovImm64("x1", genHeapSize); err != nil { // x1 = default region len
+		return err
+	}
+	if err := acg.out.CmpReg64("x1", "x0"); err != nil { // if genHeapSize >= size, keep it
+		return err
+	}
+	useDefaultJump := acg.eb.text.Len()
+	if err := acg.out.BranchCond("hs", 0); err != nil {
+		return err
+	}
+	if err := acg.out.MovReg64("x1", "x0"); err != nil { // else region len = size (kernel page-rounds)
+		return err
+	}
+	useDefaultPos := acg.eb.text.Len()
+	acg.patchJumpOffset(useDefaultJump, int32(useDefaultPos-useDefaultJump))
+
+	// Save size (x0) and region len (x1) across the mmap syscall.
+	if err := acg.out.SubImm64("sp", "sp", 16); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x1", "sp", 8); err != nil {
+		return err
+	}
+	if err := acg.emitMmapSyscall(); err != nil { // x1 = len already set; -> x0 = base
+		return err
+	}
+	if err := acg.out.MovReg64("x25", "x0"); err != nil { // top = base
+		return err
+	}
+	if err := acg.out.LdrImm64("x1", "sp", 8); err != nil { // reload region len
+		return err
+	}
+	if err := acg.out.AddReg64("x24", "x25", "x1"); err != nil { // limit = base + len
+		return err
+	}
+	if err := acg.out.LdrImm64("x9", "sp", 0); err != nil { // reload size
+		return err
+	}
+	if err := acg.out.AddImm64("sp", "sp", 16); err != nil {
+		return err
+	}
+	if err := acg.out.MovReg64("x0", "x25"); err != nil { // return ptr = base
+		return err
+	}
+	if err := acg.out.AddReg64("x25", "x25", "x9"); err != nil { // commit new top
+		return err
+	}
+	return acg.out.Return("x30")
+}
+
 func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
+	if err := acg.generateTimMalloc(); err != nil {
+		return err
+	}
+
 	// Generate _tim_list_concat(left_ptr, right_ptr) -> new_ptr
 	// Arguments: x0 = left_ptr, x1 = right_ptr
 	// Returns: x0 = pointer to new concatenated list
@@ -7160,7 +7329,7 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc(x0)
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	// x0 now contains result pointer, save it to x9
@@ -7297,7 +7466,7 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc(x0)
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	acg.out.out.writer.WriteBytes([]byte{0xe9, 0x03, 0x00, 0xaa}) // mov x9, x0
@@ -7623,7 +7792,7 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
 
 	// Call malloc
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	// x0 = map pointer
@@ -8438,7 +8607,7 @@ func (acg *ARM64CodeGen) compileAlloc(call *CallExpr) error {
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
 
 	// Call malloc(size)
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 
@@ -8667,7 +8836,7 @@ func (acg *ARM64CodeGen) generateArenaRuntimeARM64() error {
 	if err := acg.out.MovImm64("x0", 4096); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	// Restore link register and return
@@ -8689,7 +8858,7 @@ func (acg *ARM64CodeGen) generateArenaRuntimeARM64() error {
 	if err := acg.out.MovReg64("x0", "x1"); err != nil {
 		return err
 	}
-	if err := acg.eb.GenerateCallInstruction("malloc"); err != nil {
+	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
 		return err
 	}
 	// Restore link register and return

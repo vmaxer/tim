@@ -362,6 +362,20 @@ func (p *Parser) wouldShadow(name string) bool {
 	return false
 }
 
+// isDeclaredVariable reports whether name is a variable declared in any
+// currently-visible scope. A declared variable shadows an implicit C-import
+// namespace: e.g. a local `c = V(...)` makes `c.x` a struct-field access rather
+// than a `c.`-namespace / C-FFI reference (the `c` and `C` namespaces are always
+// registered, so without this any variable named `c`/`C` would be unusable).
+func (p *Parser) isDeclaredVariable(name string) bool {
+	for i := len(p.scopes) - 1; i >= 0; i-- {
+		if p.scopes[i][name] {
+			return true
+		}
+	}
+	return false
+}
+
 func (p *Parser) skipNewlines() {
 	for p.current.Type == TOKEN_NEWLINE || p.current.Type == TOKEN_SEMICOLON {
 		p.nextToken()
@@ -4600,8 +4614,9 @@ func (p *Parser) parsePostfix() Expression {
 						}
 					}
 				} else if p.peek.Type == TOKEN_LPAREN {
-					// Check if this is a C import namespace (e.g., sdl, c) or a method call (e.g., xs.append)
-					if p.cImports[ident.Name] {
+					// Check if this is a C import namespace (e.g., sdl, c) or a method call (e.g., xs.append).
+					// A declared variable shadows the namespace, so `c.foo(...)` on a local `c` is a method call.
+					if p.cImports[ident.Name] && !p.isDeclaredVariable(ident.Name) {
 						// Namespaced function call - combine identifiers
 						namespacedName := ident.Name + "." + fieldName
 						p.nextToken() // skip second identifier
@@ -4648,8 +4663,9 @@ func (p *Parser) parsePostfix() Expression {
 					}
 				} else {
 					// Not a function call - could be field access or constant access
-					// Check if this is a C import namespace (namespace.CONSTANT)
-					if p.cImports[ident.Name] {
+					// Check if this is a C import namespace (namespace.CONSTANT).
+					// A declared variable shadows the namespace, so `c.x` on a local `c` is field access.
+					if p.cImports[ident.Name] && !p.isDeclaredVariable(ident.Name) {
 						// C import constant access (e.g., sdl.SDL_INIT_VIDEO)
 						if fieldName == "error" {
 							// .error property - extract error code from Result type

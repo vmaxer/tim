@@ -6687,6 +6687,18 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				fc.inTailPosition = savedTailPosition
 			}
 
+			// A trailing `if`/`else` statement is the block's value (matching
+			// ARM64): compile it as the equivalent value-producing match so its
+			// taken-arm result lands in xmm0, instead of running it as a plain
+			// statement and falling through to the implicit 1.0 below.
+			if i == len(e.Statements)-1 {
+				if ifStmt, ok := stmt.(*IfStmt); ok {
+					fc.compileExpression(ifStmtToMatchExpr(ifStmt))
+					fc.inTailPosition = savedTailPosition
+					break
+				}
+			}
+
 			fc.compileStatement(stmt)
 			// If it's not the last statement and it's an expression statement,
 			// the value is already in xmm0 but will be overwritten by the next statement
