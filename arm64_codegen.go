@@ -43,6 +43,7 @@ type ARM64CodeGen struct {
 	boxedVars           map[string]bool              // names that live in a heap cell in the current scope (captured-and-mutated locals)
 	returnsClosure      map[string]bool              // lambda-var name -> its body evaluates to a closure (so `g = f(x); g()` invokes it)
 	funcReturnsCStruct  map[string]string            // lambda-var name -> cstruct type its body returns (so `p = vadd(a,b)` is typed)
+	ctypes              *CStructTypes                // shared, platform-independent cstruct type oracle (over the maps above)
 	fpDepth             int                          // expression-stack depth: BinaryExpr keeps its left operand in d24+fpDepth instead of spilling to memory, when the right operand has no call
 }
 
@@ -80,7 +81,7 @@ type ARM64LoopInfo struct {
 // NewARM64CodeGen creates a new ARM64 code generator
 func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConstants) *ARM64CodeGen {
 	// Use the target from ExecutableBuilder (which has the correct OS)
-	return &ARM64CodeGen{
+	acg := &ARM64CodeGen{
 		out:                 &ARM64Out{out: NewOut(eb.target, eb.TextWriter(), eb)},
 		eb:                  eb,
 		stackVars:           make(map[string]int),
@@ -102,64 +103,23 @@ func NewARM64CodeGen(eb *ExecutableBuilder, cConstants map[string]*CHeaderConsta
 		varListElemType:     make(map[string]string),
 		funcReturnsListElem: make(map[string]string),
 	}
+	// The cstruct type oracle reads/writes the same map instances (maps are
+	// references), so registrations by either side are mutually visible.
+	acg.ctypes = &CStructTypes{
+		Decls:               acg.cstructs,
+		VarType:             acg.varCStructType,
+		FuncReturns:         acg.funcReturnsCStruct,
+		VarListElem:         acg.varListElemType,
+		FuncReturnsListElem: acg.funcReturnsListElem,
+	}
+	return acg
 }
 
-// cStructTypeOf returns the cstruct type name that an expression evaluates to, or
-// "" if it is not a (known) cstruct value. Recognizes `as Struct` casts, struct
-// constructors `Struct(...)`, calls to functions known to return a struct, and
-// identifiers already tracked as struct-typed.
+// cStructTypeOf returns the cstruct type name that an expression evaluates to,
+// or "". It delegates to the shared, platform-independent oracle (CStructTypes)
+// so ARM64 and every other backend infer identical types.
 func (acg *ARM64CodeGen) cStructTypeOf(expr Expression) string {
-	switch e := expr.(type) {
-	case *CastExpr:
-		if _, ok := acg.cstructs[e.Type]; ok {
-			return e.Type
-		}
-	case *CallExpr:
-		if _, ok := acg.cstructs[e.Function]; ok {
-			return e.Function
-		}
-		if t, ok := acg.funcReturnsCStruct[e.Function]; ok {
-			return t
-		}
-	case *IdentExpr:
-		if t, ok := acg.varCStructType[e.Name]; ok {
-			return t
-		}
-	case *BlockExpr:
-		// A block (e.g. an inlined function body) evaluates to its last
-		// expression — look through it so `r = { …; V(…) }` is typed as V.
-		if n := len(e.Statements); n > 0 {
-			switch s := e.Statements[n-1].(type) {
-			case *ExpressionStmt:
-				return acg.cStructTypeOf(s.Expr)
-			case *JumpStmt:
-				if s.Value != nil {
-					return acg.cStructTypeOf(s.Value)
-				}
-			case *IfStmt:
-				return acg.ifStmtCStructType(s)
-			}
-		}
-	case *MatchExpr:
-		// `if c { a } else { b }` / guard match: every arm yields the same type,
-		// so the result is that of any arm that evaluates to a cstruct.
-		for _, c := range e.Clauses {
-			if c.Result != nil {
-				if t := acg.cStructTypeOf(c.Result); t != "" {
-					return t
-				}
-			}
-		}
-		if e.DefaultExpr != nil {
-			return acg.cStructTypeOf(e.DefaultExpr)
-		}
-	case *FieldAccessExpr:
-		// A nested cstruct-valued field, e.g. `b.c` where Ball has `c: V`.
-		if decl := acg.cstructForExpr(e); decl != nil {
-			return decl.Name
-		}
-	}
-	return ""
+	return acg.ctypes.TypeOf(expr)
 }
 
 // ifStmtToMatchExpr lowers an `if`/`elif`/`else` statement to the value-producing
@@ -180,159 +140,33 @@ func ifStmtToMatchExpr(s *IfStmt) *MatchExpr {
 }
 
 // ifStmtCStructType returns the cstruct type a trailing `if`/`elif`/`else`
-// statement evaluates to (the type of any arm's final value). A struct-returning
-// function may end in such a statement (e.g. `V.norm`'s normalize-or-self), and
-// without this its callers wouldn't know the result is a cstruct pointer.
+// statement evaluates to. Delegates to the shared oracle.
 func (acg *ARM64CodeGen) ifStmtCStructType(s *IfStmt) string {
-	blockType := func(body []Statement) string {
-		if n := len(body); n > 0 {
-			switch st := body[n-1].(type) {
-			case *ExpressionStmt:
-				return acg.cStructTypeOf(st.Expr)
-			case *JumpStmt:
-				if st.Value != nil {
-					return acg.cStructTypeOf(st.Value)
-				}
-			case *IfStmt:
-				return acg.ifStmtCStructType(st)
-			}
-		}
-		return ""
-	}
-	for _, br := range s.Branches {
-		if t := blockType(br.Body); t != "" {
-			return t
-		}
-	}
-	return blockType(s.ElseBody)
+	return acg.ctypes.ifStmtType(s)
 }
 
 // listElemCStructTypeOf infers the cstruct type of the ELEMENTS of a list-valued
-// expression, or "". This lets `xs[i].field` resolve the field offset when xs is
-// a list of cstructs (`[Ball(...), Ball(...)]`, a list-returning call, or a
-// variable holding one).
+// expression, or "". Delegates to the shared oracle.
 func (acg *ARM64CodeGen) listElemCStructTypeOf(expr Expression) string {
-	switch e := expr.(type) {
-	case *ListExpr:
-		if len(e.Elements) > 0 {
-			return acg.cStructTypeOf(e.Elements[0])
-		}
-	case *IdentExpr:
-		if t, ok := acg.varListElemType[e.Name]; ok {
-			return t
-		}
-	case *CallExpr:
-		if t, ok := acg.funcReturnsListElem[e.Function]; ok {
-			return t
-		}
-	case *BlockExpr:
-		if n := len(e.Statements); n > 0 {
-			switch s := e.Statements[n-1].(type) {
-			case *ExpressionStmt:
-				return acg.listElemCStructTypeOf(s.Expr)
-			case *JumpStmt:
-				if s.Value != nil {
-					return acg.listElemCStructTypeOf(s.Value)
-				}
-			}
-		}
-	}
-	return ""
+	return acg.ctypes.listElemTypeOf(expr)
 }
 
 // lambdaReturnsListElemType returns the cstruct element type of the list a lambda
-// body evaluates to, or "" — so `f = () -> [Ball(...), ...]` lets `bs = f()` know
-// `bs[i]` is a Ball.
+// body evaluates to, or "". Delegates to the shared oracle.
 func (acg *ARM64CodeGen) lambdaReturnsListElemType(body Expression) string {
-	last := body
-	if b, ok := body.(*BlockExpr); ok {
-		if len(b.Statements) == 0 {
-			return ""
-		}
-		switch s := b.Statements[len(b.Statements)-1].(type) {
-		case *ExpressionStmt:
-			last = s.Expr
-		case *JumpStmt:
-			last = s.Value
-		default:
-			return ""
-		}
-	}
-	if last == nil {
-		return ""
-	}
-	return acg.listElemCStructTypeOf(last)
+	return acg.ctypes.LambdaReturnsListElem(body)
 }
 
 // lambdaReturnCStructType returns the cstruct type a lambda body evaluates to
-// (its last expression), or "" — used so `vadd = (a,b)->{...Point(...)}` lets
-// `p = vadd(a,b)` know p is a Point.
+// (its last expression), or "". Delegates to the shared oracle.
 func (acg *ARM64CodeGen) lambdaReturnCStructType(body Expression) string {
-	last := body
-	if b, ok := body.(*BlockExpr); ok {
-		if len(b.Statements) == 0 {
-			return ""
-		}
-		// Pre-register the body's local cstruct types so a returned local
-		// identifier (`r = …; r`) resolves even though the body has not been
-		// compiled yet. Restore afterward so these locals don't leak globally.
-		added := acg.registerBlockLocalCStructTypes(b.Statements)
-		defer func() {
-			for _, k := range added {
-				delete(acg.varCStructType, k)
-			}
-		}()
-		switch s := b.Statements[len(b.Statements)-1].(type) {
-		case *ExpressionStmt:
-			last = s.Expr
-		case *JumpStmt:
-			last = s.Value
-		case *IfStmt:
-			// A function may end in a bare `if`/`else` whose arms yield a cstruct.
-			return acg.ifStmtCStructType(s)
-		default:
-			return ""
-		}
-	}
-	if last == nil {
-		return ""
-	}
-	return acg.cStructTypeOf(last)
+	return acg.ctypes.LambdaReturnType(body)
 }
 
-// registerBlockLocalCStructTypes scans a block's statements in order and records
-// the cstruct type of each struct-valued local into varCStructType (so later
-// statements — and a trailing `return local` — can resolve it). It only adds names
-// not already tracked, and returns the list of names it added so the caller can
-// restore the map. It descends into `arena { … }` blocks, which wrap most
-// struct-temporary scopes, but not control flow (a conditionally-defined local has
-// no single static type).
+// registerBlockLocalCStructTypes records the cstruct type of each struct-valued
+// local in a block into the shared type map. Delegates to the shared oracle.
 func (acg *ARM64CodeGen) registerBlockLocalCStructTypes(stmts []Statement) []string {
-	var added []string
-	var scan func(ss []Statement)
-	scan = func(ss []Statement) {
-		for _, stmt := range ss {
-			switch s := stmt.(type) {
-			case *AssignStmt:
-				if s.IsUpdate {
-					continue
-				}
-				if _, exists := acg.varCStructType[s.Name]; exists {
-					continue
-				}
-				if ct := acg.cStructTypeOf(s.Value); ct != "" {
-					acg.varCStructType[s.Name] = ct
-					added = append(added, s.Name)
-				}
-			case *ArenaStmt:
-				scan(s.Body)
-			case *WithStmt:
-				scan(s.Body)
-			}
-		}
-	}
-	scan(stmts)
-	return added
+	return acg.ctypes.RegisterBlockLocals(stmts)
 }
 
 // isLambdaValue reports whether expr is a lambda literal in any of its forms.
@@ -1180,47 +1014,9 @@ func (acg *ARM64CodeGen) compileMapUpdate(stmt *MapUpdateStmt) error {
 }
 
 // cstructForExpr returns the cstruct declaration for an expression that holds a
-// pointer to one (a cstruct-typed variable, or an `as Struct` cast), else nil.
+// pointer to one, else nil. Delegates to the shared, platform-independent oracle.
 func (acg *ARM64CodeGen) cstructForExpr(expr Expression) *CStructDecl {
-	switch e := expr.(type) {
-	case *IdentExpr:
-		if name, ok := acg.varCStructType[e.Name]; ok {
-			return acg.cstructs[name]
-		}
-	case *CastExpr:
-		if decl, ok := acg.cstructs[e.Type]; ok {
-			return decl
-		}
-	case *IndexExpr:
-		// `xs[i]` where xs is a known list of cstructs: the element is a pointer to
-		// that cstruct, so `xs[i].field` reads at the field offset.
-		if t := acg.listElemCStructTypeOf(e.List); t != "" {
-			return acg.cstructs[t]
-		}
-	case *FieldAccessExpr:
-		// A nested cstruct-valued field used as a receiver: `b.c.x` where `b.c` is
-		// itself a cstruct (V). Resolve the outer object's struct, find the field,
-		// and return the field's own struct declaration.
-		if decl := acg.cstructForExpr(e.Object); decl != nil {
-			for i := range decl.Fields {
-				if decl.Fields[i].Name == e.FieldName && decl.Fields[i].StructName != "" {
-					return acg.cstructs[decl.Fields[i].StructName]
-				}
-			}
-		}
-	case *CallExpr:
-		// A call result used directly as a receiver: `mk(...).x`. A constructor
-		// yields its own struct; any other call yields the struct its function is
-		// known to return. This is what lets `f(...).field` work without first
-		// binding the result to a typed local.
-		if decl, ok := acg.cstructs[e.Function]; ok {
-			return decl
-		}
-		if t, ok := acg.funcReturnsCStruct[e.Function]; ok {
-			return acg.cstructs[t]
-		}
-	}
-	return nil
+	return acg.ctypes.DeclForExpr(expr)
 }
 
 // emitLDST emits a single scaled load/store with base register x9 and Rt=0

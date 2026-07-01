@@ -74,6 +74,10 @@ type TimCompiler struct {
 	varTypeInfo          map[string]*TimType           // variable name -> type annotation (new type system)
 	varCStructType       map[string]string             // variable name -> cstruct type name
 	cstructs             map[string]*CStructDecl       // cstruct name -> declaration
+	varListElemType      map[string]string             // list-variable name -> cstruct element type (so `xs[i].field` resolves)
+	funcReturnsCStruct   map[string]string             // function name -> cstruct type its body returns
+	funcReturnsListElem  map[string]string             // function name -> cstruct element type of the list it returns
+	ctypes               *CStructTypes                 // shared, platform-independent cstruct type oracle (over the maps above)
 	functionSignatures   map[string]*FunctionSignature // function name -> signature (params, variadic)
 	sourceCode           string                        // Store source for recompilation
 	sourceDir            string                        // Directory of the source file being compiled
@@ -159,14 +163,15 @@ type FunctionSignature struct {
 }
 
 type LambdaFunc struct {
-	Name             string
-	Params           []string
-	VariadicParam    string // Name of variadic parameter (empty if none)
-	Body             Expression
-	CapturedVars     []string          // Variables captured from outer scope
-	CapturedVarTypes map[string]string // Types of captured variables
-	IsNested         bool              // True if this lambda is nested inside another
-	IsPure           bool              // True if function has no side effects (eligible for memoization)
+	Name              string
+	Params            []string
+	VariadicParam     string // Name of variadic parameter (empty if none)
+	Body              Expression
+	CapturedVars      []string          // Variables captured from outer scope
+	CapturedVarTypes  map[string]string // Types of captured variables
+	IsNested          bool              // True if this lambda is nested inside another
+	IsPure            bool              // True if function has no side effects (eligible for memoization)
+	ParamCStructTypes map[string]string // param name -> cstruct type from `(a as V)` / `self: V` annotations
 }
 
 type PatternLambdaFunc struct {
@@ -208,7 +213,7 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 	// Check if debug mode is enabled
 	debugEnabled := envBool("DEBUG")
 
-	return &TimCompiler{
+	fc := &TimCompiler{
 		compilerState:       compilerState, // NEW
 		eb:                  eb,
 		out:                 out,
@@ -219,6 +224,9 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 		varTypeInfo:         make(map[string]*TimType),
 		varCStructType:      make(map[string]string),
 		cstructs:            make(map[string]*CStructDecl),
+		varListElemType:     make(map[string]string),
+		funcReturnsCStruct:  make(map[string]string),
+		funcReturnsListElem: make(map[string]string),
 		functionSignatures:  make(map[string]*FunctionSignature),
 		usedFunctions:       make(map[string]bool),
 		unknownFunctions:    make(map[string]bool),
@@ -250,7 +258,20 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 
 		// Initialize all runtime function emission flags to true (full compatibility mode)
 
-	}, nil
+	}
+
+	// The cstruct type oracle reads/writes the same map instances the backend
+	// fills during compilation (maps are references), so both stay in sync. This
+	// is the shared, platform-independent inference — identical to ARM64's.
+	fc.ctypes = &CStructTypes{
+		Decls:               fc.cstructs,
+		VarType:             fc.varCStructType,
+		FuncReturns:         fc.funcReturnsCStruct,
+		VarListElem:         fc.varListElemType,
+		FuncReturnsListElem: fc.funcReturnsListElem,
+	}
+
+	return fc, nil
 }
 
 // addSemanticError adds a semantic error to the error collector
@@ -1306,6 +1327,9 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 					fc.varCStructType[s.Name] = castExpr.Type
 				}
 			}
+			// Track cstruct types via the shared oracle (constructors, calls to
+			// struct-returning functions, lambda return types).
+			fc.registerAssignCStructTypes(s.Name, s.Value)
 
 			// Track type if we can determine it from the expression
 			exprType := fc.getExprType(s.Value)
@@ -1377,6 +1401,9 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 						fc.varCStructType[s.Name] = castExpr.Type
 					}
 				}
+				// Track cstruct types via the shared oracle (constructors, calls to
+				// struct-returning functions, lambda return types).
+				fc.registerAssignCStructTypes(s.Name, s.Value)
 
 				// Track type if we can determine it from the expression
 				exprType := fc.getExprType(s.Value)
@@ -1559,8 +1586,11 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 			}
 		}
 	case *CStructDecl:
-		// Cstruct declarations don't allocate runtime stack space
-		// Constants are already registered in parser (Name_SIZEOF, Name_field_OFFSET)
+		// Cstruct declarations don't allocate runtime stack space, but we must
+		// register the (layout-computed) declaration so value constructors
+		// `Struct(...)` and field access resolve — mirrors ARM64. Without this
+		// fc.cstructs stays empty and `Struct(...)` links as an undefined symbol.
+		fc.cstructs[s.Name] = s
 	case *ExpressionStmt:
 		// No symbols to collect from expression statements
 	}
@@ -4197,17 +4227,32 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 
 // getCStructForExpr returns the CStructDecl for an expression if it's known to be a cstruct pointer.
 func (fc *TimCompiler) getCStructForExpr(expr Expression) *CStructDecl {
-	switch e := expr.(type) {
-	case *IdentExpr:
-		if typeName, ok := fc.varCStructType[e.Name]; ok {
-			return fc.cstructs[typeName]
+	return fc.ctypes.DeclForExpr(expr)
+}
+
+// registerAssignCStructTypes records, during symbol collection, the cstruct type
+// information implied by `name = value`, so later field access and constructor
+// calls resolve — mirroring the ARM64 backend (arm64_codegen.go markIfClosure +
+// assignment tracking). It uses the shared, platform-independent type oracle.
+// For a lambda value it records the cstruct type (or list-element type) its body
+// returns, so `p = f(...)` is typed and `f(...).field` works; otherwise it
+// records the cstruct type of the value itself (a constructor, a call to a
+// struct-returning function, an `as Struct` cast, a nested field, …). Without
+// this, x86 only recognized `as Struct` casts and field access on a struct-typed
+// local silently read 0.
+func (fc *TimCompiler) registerAssignCStructTypes(name string, value Expression) {
+	if lam, ok := value.(*LambdaExpr); ok {
+		if ct := fc.ctypes.LambdaReturnType(lam.Body); ct != "" {
+			fc.funcReturnsCStruct[name] = ct
 		}
-	case *CastExpr:
-		if decl, ok := fc.cstructs[e.Type]; ok {
-			return decl
+		if et := fc.ctypes.LambdaReturnsListElem(lam.Body); et != "" {
+			fc.funcReturnsListElem[name] = et
 		}
+		return
 	}
-	return nil
+	if ct := fc.ctypes.TypeOf(value); ct != "" {
+		fc.varCStructType[name] = ct
+	}
 }
 
 // emitCStructFieldRead emits code to read a cstruct field from [rdi + offset] into xmm0.
@@ -4388,6 +4433,63 @@ func (fc *TimCompiler) emitCStructFieldWrite(ptrReg string, field *CStructField)
 		fc.out.Write(0x11)
 		emitModRM(0, dispMod)
 	}
+}
+
+// compileCStructConstructor compiles a cstruct value constructor, e.g.
+// `Point(3.0, 4.0)`: allocate the struct from the current arena, store each
+// argument into its field, and yield a numeric pointer to the value (the same
+// value-form pointer convention cstruct field access expects). This mirrors the
+// ARM64 implementation (arm64_codegen.go) so both backends behave identically;
+// without it, x86 fell through to a plain `call <StructName>` and the struct
+// name became an undefined external symbol at link time.
+//
+// Field values arrive in xmm0. Non-float fields (including a nested cstruct,
+// which is held by pointer → Type "ptr") are converted float→int with cvttsd2si
+// to match the field-READ path (which uses cvtsi2sd), so the value-form pointer
+// round-trips exactly.
+func (fc *TimCompiler) compileCStructConstructor(decl *CStructDecl, args []Expression) {
+	if len(args) != len(decl.Fields) {
+		compilerError("%s constructor expects %d arguments, got %d", decl.Name, len(decl.Fields), len(args))
+	}
+	size := decl.Size
+	if size <= 0 {
+		size = len(decl.Fields) * 8
+	}
+
+	// Allocate the struct value from the current arena (rax = pointer).
+	fc.out.MovImmToReg("rdi", fmt.Sprintf("%d", size))
+	fc.callArenaAlloc()
+
+	// Spill the struct pointer so it survives compiling each field value
+	// (compileExpression is stack-balanced, so [rsp] stays valid across it).
+	fc.out.SubImmFromReg("rsp", 16)
+	fc.out.MovRegToMem("rax", "rsp", 0)
+
+	for i := range decl.Fields {
+		fc.compileExpression(args[i])       // value in xmm0
+		fc.out.MovMemToReg("rdi", "rsp", 0) // struct pointer
+		field := &decl.Fields[i]
+		switch field.Type {
+		case "float64":
+			fc.emitCStructFieldWrite("rdi", field) // stores xmm0 directly
+		case "float32":
+			fc.out.Write(0xF2) // cvtsd2ss xmm0, xmm0
+			fc.out.Write(0x0F)
+			fc.out.Write(0x5A)
+			fc.out.Write(0xC0)
+			fc.emitCStructFieldWrite("rdi", field)
+		default:
+			// int*/uint*/ptr/cstr (a nested cstruct is held as a ptr): convert the
+			// value-form float to an integer, matching the field-read convention.
+			fc.out.Cvttsd2si("rax", "xmm0")
+			fc.emitCStructFieldWrite("rdi", field) // stores rax
+		}
+	}
+
+	// Return the pointer as a numeric (value-form) pointer in xmm0.
+	fc.out.MovMemToReg("rax", "rsp", 0)
+	fc.out.AddImmToReg("rsp", 16)
+	fc.out.Cvtsi2sd("xmm0", "rax")
 }
 
 // Confidence that this function is working: 95%
@@ -6414,14 +6516,15 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 
 		// Store lambda for later code generation
 		fc.lambdaFuncs = append(fc.lambdaFuncs, LambdaFunc{
-			Name:             funcName,
-			Params:           e.Params,
-			VariadicParam:    e.VariadicParam,
-			Body:             e.Body,
-			CapturedVars:     e.CapturedVars,
-			CapturedVarTypes: capturedVarTypes,
-			IsNested:         e.IsNestedLambda,
-			IsPure:           isPure,
+			Name:              funcName,
+			Params:            e.Params,
+			VariadicParam:     e.VariadicParam,
+			Body:              e.Body,
+			CapturedVars:      e.CapturedVars,
+			CapturedVarTypes:  capturedVarTypes,
+			IsNested:          e.IsNestedLambda,
+			IsPure:            isPure,
+			ParamCStructTypes: e.ParamCStructTypes,
 		})
 
 		// For closures with captured variables, we need runtime allocation
@@ -8022,7 +8125,7 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 
 		// Store parameters from xmm registers at fixed offsets
 		// Parameters come in xmm0, xmm1, xmm2, ...
-		xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"}
+		xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 		baseParamOffset := 24 // First param at rbp-24
 
 		// CRITICAL: If variadic, save ALL xmm registers immediately
@@ -8037,7 +8140,7 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 
 		for i, paramName := range lambda.Params {
 			if i >= len(xmmRegs) {
-				compilerError("lambda has too many parameters (max 6)")
+				compilerError("lambda has too many parameters (max 8)")
 			}
 
 			// Calculate fixed offset for this parameter
@@ -8049,6 +8152,16 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 			// Mark parameter type as "number" by default (all values are float64 in Tim)
 			// This prevents x + y from being interpreted as list append when x and y are parameters
 			fc.varTypes[paramName] = "number"
+
+			// A cstruct-typed param (`(a as V)` or a method's implicit `self: V`):
+			// record the type so `a.x` inside the body reads the field directly.
+			// Without this, field access on a struct param falls through to a map
+			// lookup and reads 0 (mirrors ARM64 arm64_codegen.go).
+			if ct, ok := lambda.ParamCStructTypes[paramName]; ok {
+				if _, isStruct := fc.cstructs[ct]; isStruct {
+					fc.varCStructType[paramName] = ct
+				}
+			}
 
 			// Store parameter at fixed offset
 			if lambda.VariadicParam != "" {
@@ -8284,7 +8397,7 @@ func (fc *TimCompiler) generatePatternLambdaFunctions() {
 		numParams := len(patternLambda.Clauses[0].Patterns)
 
 		// Store parameters from xmm0, xmm1, ... to stack
-		xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"}
+		xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 		paramOffsets := make([]int, numParams)
 		for i := range numParams {
 			fc.stackOffset += 16
@@ -11724,9 +11837,9 @@ func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
 	}
 
 	// Compile arguments and put them in xmm registers
-	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"}
+	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 	if len(call.Args) > len(xmmRegs) {
-		compilerError("too many arguments to stored function (max 6)")
+		compilerError("too many arguments to stored function (max 8)")
 	}
 
 	// Save function pointer and environment to stack (will be clobbered during arg evaluation)
@@ -11776,7 +11889,7 @@ func (fc *TimCompiler) compileLambdaDirectCall(call *CallExpr) {
 
 	// Direct call to a lambda by name (for recursion)
 	// Compile arguments and put them in xmm registers
-	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"}
+	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 
 	// Check if function is variadic
 	var isVariadic bool
@@ -11792,7 +11905,7 @@ func (fc *TimCompiler) compileLambdaDirectCall(call *CallExpr) {
 	} else {
 
 		if len(call.Args) > len(xmmRegs) {
-			compilerError("too many arguments to lambda function (max 6)")
+			compilerError("too many arguments to lambda function (max 8)")
 		}
 	}
 
@@ -12280,9 +12393,9 @@ func (fc *TimCompiler) compileDirectCall(call *DirectCallExpr) {
 	fc.out.AddImmToReg("rsp", StackSlotSize)
 
 	// Compile arguments and put them in xmm registers
-	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5"}
+	xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
 	if len(call.Args) > len(xmmRegs) {
-		compilerError("too many arguments to direct call (max 6)")
+		compilerError("too many arguments to direct call (max 8)")
 	}
 
 	// Save function pointer to stack (rax might get clobbered)
@@ -13752,6 +13865,12 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 	if VerboseMode {
 		debugf("DEBUG compileCall: function='%s'\n", call.Function)
 		debugf("DEBUG compileCall: variables=%v\n", fc.variables)
+	}
+
+	// CStruct value constructor: Point(x, y, ...) allocates the struct value.
+	if decl, ok := fc.cstructs[call.Function]; ok {
+		fc.compileCStructConstructor(decl, call.Args)
+		return
 	}
 
 	// Check if this is a recursive call (function name matches current lambda)

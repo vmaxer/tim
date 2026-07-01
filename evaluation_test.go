@@ -767,6 +767,30 @@ func TestEvaluation(t *testing.T) {
 			expectedOutput: "42\n",
 			expectCompile:  true,
 		},
+		{
+			name: "cstruct_value_type_end_to_end",
+			// Exercises the cstruct value-type paths that must behave identically
+			// on every backend: constructor to a local + field read, a method that
+			// reads its `self` fields to a scalar, `func(...).field` on a plain
+			// function, and `recv.method(...).field` chained on a method result.
+			code: `
+				cstruct V { x: float64, y: float64, z: float64 }
+				fun V.dot(o: V) = self.x*o.x + self.y*o.y + self.z*o.z
+				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+				mk = (a) -> V(a, a*2.0, a*3.0)
+				main = {
+					a = V(1.0, 2.0, 3.0)
+					b = V(4.0, 5.0, 6.0)
+					println(a.x)
+					println(a.z)
+					println(a.dot(b))
+					println(mk(2.0).z)
+					println(a.scale(10.0).y)
+				}
+			`,
+			expectedOutput: "1\n3\n32\n6\n20\n",
+			expectCompile:  true,
+		},
 	}
 
 	for _, tt := range tests {

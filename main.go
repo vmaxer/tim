@@ -1173,12 +1173,18 @@ func (eb *ExecutableBuilder) patchTextInELF() {
 	debugf("DEBUG patchTextInELF: Before copy, elfBuf[0x309b:0x30a3] = %x\n", elfBuf[0x309b:0x30a3])
 	debugf("DEBUG patchTextInELF: Before copy, newText[0x9b:0xa3] = %x\n", newText[0x9b:0xa3])
 
-	// CRITICAL: The dynamic section starts 4 pages after text section
-	// Text section is pre-allocated 8 pages (32KB) at offset 0x3000
-	// Dynamic section starts at 0xB000
-	// Check if text exceeds the reserved space
+	// The dynamic section starts right after the .text reservation. That
+	// reservation is NOT a fixed 32KB — WriteCompleteDynamicELF (elf_complete.go)
+	// sizes it from the actual code size with the exact same formula used here:
+	//   textReservedSize = pageAlign(codeSize) + one guard page
+	// with .text based at 0x3000. So the end of the reserved text region — and
+	// thus the first byte we must not overwrite — is computed identically here.
+	// (The old code hardcoded 0xB000, a stale 32KB cap that falsely rejected any
+	// program whose code exceeded 32KB even though the buffer had room for it.)
+	const pageSize = 0x1000
+	textReservedSize := ((textSize + pageSize - 1) & ^(pageSize - 1)) + pageSize
 	textEndAligned := (textOffset + textSize + 7) & ^7
-	textReservedEnd := 0xB000 // End of 32KB text reservation
+	textReservedEnd := textOffset + textReservedSize
 
 	// Check if we would overflow past the reserved text space
 	if textEndAligned > textReservedEnd {
