@@ -97,3 +97,4 @@ examples/vls
 # podman registry-auth stub (bypasses gcloud credsStore)
 empty_auth.json
 _tmptest/
+_tmptest_*
