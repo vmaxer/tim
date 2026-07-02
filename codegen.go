@@ -1343,10 +1343,13 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 				}
 			}
 		} else {
-			// = - Define immutable variable (can shadow existing immutable, but not mutable)
-			if exists && fc.mutableVars[s.Name] {
-				// Allow updating existing mutable variable with =
-				// Don't create new variable, reuse existing offset
+			// = assignment. If the name already exists in scope, reuse its slot
+			// (update in place) rather than allocating a fresh shadow slot, so
+			// reassignment — including inside a loop body — persists across
+			// iterations. This gives `=` the mutable-by-default reassignment
+			// semantics idiomatic Tim expects, and keeps x86 in step with arm64.
+			if exists {
+				// Reuse existing variable's offset (update, don't shadow).
 				s.IsReuseMutable = true
 			} else {
 				// Create new immutable variable

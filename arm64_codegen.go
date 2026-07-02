@@ -3307,11 +3307,14 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 			return fmt.Errorf("variable '%s' already defined (use <- to update)", assign.Name)
 		}
 	} else {
-		// = Define immutable variable (can shadow existing immutable, but not mutable)
-		// HOWEVER: if variable exists and is mutable, allow update (don't create new variable)
-		if exists && isMutable {
-			// Allow updating existing mutable variable with =
-			// Don't need to create new variable, just proceed with code generation
+		// = assignment. If the name already exists in this function's scope, update
+		// it IN PLACE (reuse its slot) instead of allocating a fresh shadow slot.
+		// Shadowing a live variable mid-body is what silently broke reassignment
+		// inside a loop: `lo = m` allocated a new slot, but the loop-top read of
+		// `lo` had already been compiled against the original slot, so the write
+		// never fed back. Reusing the slot gives `=` the mutable-by-default
+		// reassignment semantics idiomatic Tim expects (e.g. bisect/march loops).
+		if exists {
 			assign.IsReuseMutable = true
 		}
 	}
@@ -3979,6 +3982,33 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 			sig := &CFunctionSignature{
 				ReturnType: "size_t",
 				Params:     []CFunctionParam{{Type: "const char*", Name: "s"}},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "fopen":
+			sig := &CFunctionSignature{
+				ReturnType: "void*",
+				Params:     []CFunctionParam{{Type: "const char*", Name: "path"}, {Type: "const char*", Name: "mode"}},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "fwrite":
+			sig := &CFunctionSignature{
+				ReturnType: "size_t",
+				Params: []CFunctionParam{
+					{Type: "void*", Name: "ptr"}, {Type: "size_t", Name: "size"},
+					{Type: "size_t", Name: "nmemb"}, {Type: "void*", Name: "stream"},
+				},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "fputc":
+			sig := &CFunctionSignature{
+				ReturnType: "int",
+				Params:     []CFunctionParam{{Type: "int", Name: "c"}, {Type: "void*", Name: "stream"}},
+			}
+			return acg.compileCFunctionCall(call.Function, call.Args, sig)
+		case "fclose":
+			sig := &CFunctionSignature{
+				ReturnType: "int",
+				Params:     []CFunctionParam{{Type: "void*", Name: "stream"}},
 			}
 			return acg.compileCFunctionCall(call.Function, call.Args, sig)
 		case "fork", "getpid":

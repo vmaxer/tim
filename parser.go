@@ -382,6 +382,18 @@ func (p *Parser) skipNewlines() {
 	}
 }
 
+// skipExprNewlines skips newline tokens in the MIDDLE of an expression. It is
+// called right after consuming a binary operator, where the expression is
+// definitionally incomplete, so a following newline is a line continuation
+// rather than a statement terminator (e.g. `a +\n    b` parses as `a + b`).
+// This only fires for a *trailing* operator (`a +` at end of line); `a\n + b`
+// is unaffected because the operator loop never starts (peek is a newline).
+func (p *Parser) skipExprNewlines() {
+	for p.current.Type == TOKEN_NEWLINE {
+		p.nextToken()
+	}
+}
+
 func (p *Parser) ParseProgram() *Program {
 	globalParseCallCount = 0 // Reset for each program parse
 	composeGensymCounter = 0 // Reset for deterministic composition desugaring
@@ -4082,6 +4094,7 @@ func (p *Parser) parseLogicalOr() Expression {
 		p.nextToken() // skip current
 		op := p.current.Value
 		p.nextToken() // skip operator
+		p.skipExprNewlines()
 		right := p.parseLogicalAnd()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
@@ -4096,6 +4109,7 @@ func (p *Parser) parseLogicalAnd() Expression {
 		p.nextToken() // skip current
 		op := p.current.Value
 		p.nextToken() // skip 'and'
+		p.skipExprNewlines()
 		right := p.parseComparison()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
@@ -4120,6 +4134,7 @@ func (p *Parser) parseComparison() Expression {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
+		p.skipExprNewlines()
 		right := p.parseRange()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
@@ -4272,6 +4287,7 @@ func (p *Parser) parseAdditive() Expression {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
+		p.skipExprNewlines()
 		right := p.parseBitwise()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
@@ -4289,6 +4305,7 @@ func (p *Parser) parseBitwise() Expression {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
+		p.skipExprNewlines()
 		right := p.parseMultiplicative()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
@@ -4303,6 +4320,7 @@ func (p *Parser) parseMultiplicative() Expression {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
+		p.skipExprNewlines()
 		right := p.parsePower()
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}

@@ -812,6 +812,46 @@ func TestEvaluation(t *testing.T) {
 			expectedOutput: "1\n3\n32\n6\n20\n",
 			expectCompile:  true,
 		},
+		{
+			name: "assign_reassignment_persists_in_loop",
+			// `=` reassignment of an existing variable must update it in place so
+			// the write persists across loop iterations, rather than allocating a
+			// fresh shadow slot (which used to make only the first step "stick").
+			code: `
+				main = {
+					acc = 0.0
+					for i in 1..=5 { acc = acc + i }
+					lo = 0.0
+					hi = 10.0
+					for k in 0..<6 {
+						m = 0.5 * (lo + hi)
+						if m < 5.0 { lo = m } else { hi = m }
+					}
+					println(acc)
+					println(lo + hi)
+				}
+			`,
+			expectedOutput: "15\n9.84375\n",
+			expectCompile:  true,
+		},
+		{
+			name: "multiline_operator_continuation",
+			// A binary operator at end of line continues the expression onto the
+			// next line; a leading operator does not (that stays a new statement).
+			code: `
+				main = {
+					a = 10.0 +
+						20.0 +
+						30.0
+					b = 2.0 *
+						(3.0 + 4.0)
+					println(a)
+					println(b)
+				}
+			`,
+			expectedOutput: "60\n14\n",
+			expectCompile:  true,
+		},
 	}
 
 	for _, tt := range tests {
