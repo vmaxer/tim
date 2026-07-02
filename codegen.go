@@ -12773,6 +12773,13 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	fc.out.JumpConditional(JumpEqual, 0) // Jump if frac == 0
 	fracZeroEnd := fc.eb.text.Len()
 
+	// Bias the fraction by half of the last printed place (0.5e-6) so the
+	// digit-by-digit extraction below rounds to nearest instead of truncating.
+	// Without this, 3.14159 (stored as 3.14158999...) prints as 3.141589; the
+	// arm64 formatter rounds via fcvtns, so this keeps the backends consistent.
+	fc.loadFloatConstant("xmm4", 0.0000005)
+	fc.out.AddsdXmm("xmm0", "xmm4")
+
 	// Print up to 6 decimal digits
 	fc.out.MovImmToReg("r11", "6") // digit counter
 	fc.loadFloatConstant("xmm3", 10.0)
@@ -12828,10 +12835,21 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	// Not a '0', so advance back to position after this character
 	fc.out.AddImmToReg("rsi", 1)
 
+	// Non-zero fractional path is finished. Skip the decimal-point removal
+	// below (that step is only for the frac==0 case) and go straight to the
+	// newline; otherwise it would clobber the last significant digit.
+	nonZeroDoneJump := fc.eb.text.Len()
+	fc.out.JumpUnconditional(0)
+	nonZeroDoneEnd := fc.eb.text.Len()
+
 	// Fractional part was zero - remove the decimal point we added
 	fracZeroPos := fc.eb.text.Len()
 	fc.patchJumpImmediate(fracZeroJump+2, int32(fracZeroPos-fracZeroEnd))
 	fc.out.SubImmFromReg("rsi", 1) // Remove the '.' we added
+
+	// Newline target shared by both paths
+	nonZeroDonePos := fc.eb.text.Len()
+	fc.patchJumpImmediate(nonZeroDoneJump+1, int32(nonZeroDonePos-nonZeroDoneEnd))
 
 	// Add newline
 	fc.out.MovImmToReg("r10", "10") // '\n'
@@ -14463,23 +14481,18 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			// xmm0 contains float64 value
 
 			if fc.eb.target.OS() == OSLinux {
-				// Convert to int64 and use _tim_itoa + write syscall
-				fc.out.Cvttsd2si("rdi", "xmm0")
-
-				// Allocate stack buffer
-				fc.out.SubImmFromReg("rsp", 32)
+				// Full float formatting (integer AND fractional part) via a direct
+				// write syscall. Previously truncated to int64 with cvttsd2si, so
+				// fractional numbers printed only their integer part. print adds no
+				// newline, so drop the trailing '\n' compileFloatToString appends.
+				fc.out.SubImmFromReg("rsp", 48) // buffer (scratch float stored at +24)
 				fc.out.MovRegToReg("r15", "rsp")
-
-				// Call _tim_itoa
-				fc.callFunction("_tim_itoa", "")
-
-				// Write to stdout
-				fc.out.MovImmToReg("rax", "1")
-				fc.out.MovImmToReg("rdi", "1")
+				fc.compileFloatToString("xmm0", "r15") // rsi=start, rdx=length incl '\n'
+				fc.out.SubImmFromReg("rdx", 1)         // drop the trailing newline
+				fc.out.MovImmToReg("rax", "1")         // sys_write
+				fc.out.MovImmToReg("rdi", "1")         // stdout
 				fc.out.Syscall()
-
-				// Clean up
-				fc.out.AddImmToReg("rsp", 32)
+				fc.out.AddImmToReg("rsp", 48)
 			} else {
 				// Windows - use printf
 				fmtLabel := fmt.Sprintf("print_fmt_%d", fc.stringCounter)
@@ -14719,26 +14732,20 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 				// xmm0 contains float64 value
 
 				if fc.eb.target.OS() == OSLinux {
-					// Convert to int64 and use _tim_itoa + write syscall
-					fc.out.Cvttsd2si("rdi", "xmm0") // Convert float to int64
-
-					// Allocate stack buffer for number string
-					fc.out.SubImmFromReg("rsp", 32)
-					fc.out.MovRegToReg("r15", "rsp") // Save buffer pointer
-
-					// Call _tim_itoa(rdi=number)
-					fc.callFunction("_tim_itoa", "")
-					// Returns: rsi=string start, rdx=length
-
-					// Write to stdout: write(1, rsi, rdx)
-					fc.out.MovImmToReg("rax", "1") // sys_write
-					fc.out.MovImmToReg("rdi", "1") // stdout
-					// rsi already has buffer pointer
-					// rdx already has length
+					// Full float formatting (integer AND fractional part) via a
+					// direct write syscall (no libc). Previously this truncated the
+					// value to int64 with cvttsd2si before _tim_itoa, so every
+					// fractional number printed only its integer part (9.84375 -> 9).
+					// compileFloatToString appends a trailing '\n'; exclude it here
+					// because println adds its own newline after all arguments.
+					fc.out.SubImmFromReg("rsp", 48) // buffer (scratch float stored at +24)
+					fc.out.MovRegToReg("r15", "rsp")
+					fc.compileFloatToString("xmm0", "r15") // rsi=start, rdx=length incl '\n'
+					fc.out.SubImmFromReg("rdx", 1)         // drop the trailing newline
+					fc.out.MovImmToReg("rax", "1")         // sys_write
+					fc.out.MovImmToReg("rdi", "1")         // stdout
 					fc.out.Syscall()
-
-					// Clean up stack
-					fc.out.AddImmToReg("rsp", 32)
+					fc.out.AddImmToReg("rsp", 48)
 				} else {
 					// Windows - use printf
 					fmtLabel := fmt.Sprintf("println_fmt_%d", fc.stringCounter)

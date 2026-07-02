@@ -4161,11 +4161,13 @@ func (acg *ARM64CodeGen) compilePrintLibc(arg Expression) error {
 		}
 		return acg.emitWriteTimString(1)
 	}
-	// Numbers print as their integer value (print() has no fractional form).
+	// Numbers: Tim's own smart float format (libc-free), same as println but
+	// without the trailing newline. (Previously print() truncated to the integer
+	// value, so print(1.5) emitted "1" — inconsistent with println.)
 	if err := acg.compileExpression(arg); err != nil {
 		return err
 	}
-	return acg.emitWriteInteger(1)
+	return acg.emitWriteFloatSmart(1)
 }
 
 func (acg *ARM64CodeGen) compilePrint(call *CallExpr) error {
