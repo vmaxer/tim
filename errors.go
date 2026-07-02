@@ -14,6 +14,20 @@ import (
 // second, redundant, context-free copy of the same failure.
 var ErrAlreadyReported = errors.New("compilation aborted (diagnostics already reported)")
 
+// reportedError is an error that has already been printed to stderr in full. It
+// still carries the plain-text diagnostic so programmatic callers (and tests)
+// can inspect err.Error(), while matching ErrAlreadyReported via errors.Is so
+// the top-level CLI knows not to print it a second time.
+type reportedError struct{ msg string }
+
+func (e *reportedError) Error() string { return e.msg }
+
+// Is lets errors.Is(err, ErrAlreadyReported) succeed for any reportedError.
+func (e *reportedError) Is(target error) bool { return target == ErrAlreadyReported }
+
+// newReportedError builds an already-reported error carrying the given message.
+func newReportedError(msg string) error { return &reportedError{msg: msg} }
+
 // ErrorLevel indicates the severity of an error
 type ErrorLevel int
 

@@ -242,12 +242,12 @@ func (p *Parser) error(msg string) {
 	// For backwards compatibility during transition: if we hit max errors, panic
 	// This will be removed once all error handling is converted
 	if p.errors.ShouldStop() {
-		// Print all collected errors before aborting quietly (see ErrAlreadyReported).
-		report := p.errors.Report(true) // Use color
-		if report != "" {
+		// Print all collected errors before aborting (see ErrAlreadyReported); the
+		// panic still carries the plain text so callers can inspect the message.
+		if report := p.errors.Report(true); report != "" {
 			fmt.Fprintln(os.Stderr, report)
 		}
-		panic(ErrAlreadyReported)
+		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
 }
 
@@ -259,12 +259,12 @@ func (p *Parser) parseError(msg string, loc SourceLocation) {
 	err := SyntaxError(msg, loc)
 	p.errors.AddError(err)
 	if p.errors.ShouldStop() {
-		// Print all collected errors before aborting quietly (see ErrAlreadyReported).
-		report := p.errors.Report(true) // Use color
-		if report != "" {
+		// Print all collected errors before aborting (see ErrAlreadyReported); the
+		// panic still carries the plain text so callers can inspect the message.
+		if report := p.errors.Report(true); report != "" {
 			fmt.Fprintln(os.Stderr, report)
 		}
-		panic(ErrAlreadyReported)
+		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
 }
 
@@ -420,11 +420,12 @@ func (p *Parser) ParseProgram() *Program {
 
 	// Check for parse errors
 	if p.errors.HasErrors() {
-		// Print all collected errors (formatted with source snippet + caret), then
-		// abort quietly — the diagnostic above is the message, so the top level must
-		// not print a second context-free copy.
+		// Print all collected errors (formatted with source snippet + caret) to the
+		// user, then abort with an already-reported error that still carries the
+		// plain text — so the top level does not print a second copy, but callers
+		// and tests can still inspect the message.
 		fmt.Fprintln(os.Stderr, p.errors.Report(true))
-		panic(ErrAlreadyReported)
+		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
 
 	// Copy cstructs from parser to program
