@@ -1107,7 +1107,10 @@ func (fc *TimCompiler) compileInternal(program *Program, outputPath string, deps
 		fc.out.LeaSymbolToReg("rax", "main")
 		fc.out.CallRegister("rax")
 	} else if _, exists := fc.variables["main"]; exists {
-		compilerError("'main' must be a function, not a plain value (use 'main = { %s }' to return an exit code)", "42")
+		// main is a plain value (e.g. `main = 42`): load it as the exit code.
+		// The arm64 backend already accepts this shape, so we mirror it here to
+		// keep plain-value main portable across backends.
+		fc.compileExpression(&IdentExpr{Name: "main"})
 	} else {
 		// No main - return 0
 		fc.out.XorRegWithReg("xmm0", "xmm0")
@@ -20500,7 +20503,10 @@ func CompileTimWithOptions(inputPath string, outputPath string, platform Platfor
 
 	err = compiler.Compile(program, outputPath)
 	if err != nil {
-		return fmt.Errorf("compilation failed: %v", err)
+		// Return the raw error; the CLI adds a single "compilation failed:" prefix.
+		// Prefixing here too produced a doubled "compilation failed: compilation
+		// failed:" in user output.
+		return err
 	}
 
 	// Output optimization summary in verbose mode

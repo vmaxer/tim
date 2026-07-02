@@ -2,9 +2,17 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"strings"
 )
+
+// ErrAlreadyReported signals that a full, formatted diagnostic has already been
+// written to stderr (e.g. by the parser's ErrorCollector, complete with source
+// snippet and caret). Callers that see this error should fail with a non-zero
+// exit status WITHOUT printing anything further, so the user is not shown a
+// second, redundant, context-free copy of the same failure.
+var ErrAlreadyReported = errors.New("compilation aborted (diagnostics already reported)")
 
 // ErrorLevel indicates the severity of an error
 type ErrorLevel int

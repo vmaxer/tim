@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -12,6 +13,16 @@ import (
 	"strings"
 	"time"
 )
+
+// exitWithCLIError terminates with a non-zero status after a CLI failure. If the
+// diagnostic was already printed in full (ErrAlreadyReported), it exits quietly
+// so the user is not shown a second, redundant copy of the same error.
+func exitWithCLIError(err error) {
+	if !errors.Is(err, ErrAlreadyReported) {
+		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	}
+	os.Exit(1)
+}
 
 // A tiny compiler for x86_64, aarch64, and riscv64 for Linux, macOS, FreeBSD
 
@@ -1479,8 +1490,7 @@ func main() {
 			}
 			err := RunCLI(inputFiles, targetPlatform, VerboseMode, QuietMode, *optTimeout, UpdateDepsFlag, SingleFlag, cliOutputPath, *depsFlag)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitWithCLIError(err)
 			}
 			return
 		}
@@ -1497,8 +1507,7 @@ func main() {
 			}
 			err := RunCLI([]string{"."}, targetPlatform, VerboseMode, QuietMode, *optTimeout, UpdateDepsFlag, SingleFlag, cliOutputPath, *depsFlag)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-				os.Exit(1)
+				exitWithCLIError(err)
 			}
 			return
 		}

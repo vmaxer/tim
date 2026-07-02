@@ -2,12 +2,24 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 )
+
+// wrapCompileError adds a single user-facing "compilation failed:" prefix to a
+// compilation error. If the diagnostic was already printed in full (see
+// ErrAlreadyReported), it propagates the sentinel untouched so the top level can
+// exit quietly instead of printing a second, context-free copy.
+func wrapCompileError(err error) error {
+	if err == nil || errors.Is(err, ErrAlreadyReported) {
+		return err
+	}
+	return fmt.Errorf("compilation failed: %v", err)
+}
 
 // cli.go - User-friendly command-line interface for tim
 //
@@ -221,7 +233,7 @@ func cmdBuild(ctx *CommandContext, args []string) error {
 	}
 
 	if err != nil {
-		return fmt.Errorf("compilation failed: %v", err)
+		return wrapCompileError(err)
 	}
 
 	if ctx.Verbose {
@@ -265,7 +277,7 @@ func cmdRun(ctx *CommandContext, args []string) error {
 	// Compile
 	err := CompileTimWithOptions(inputFile, tmpExec, ctx.Platform, ctx.OptTimeout, ctx.Verbose, ctx.DepsOnly)
 	if err != nil {
-		return fmt.Errorf("compilation failed: %v", err)
+		return wrapCompileError(err)
 	}
 
 	// Ensure cleanup
@@ -314,7 +326,7 @@ func cmdRunShebang(ctx *CommandContext, scriptPath string, scriptArgs []string) 
 	// Compile (quietly unless verbose mode)
 	err := CompileTimWithOptions(scriptPath, tmpExec, ctx.Platform, ctx.OptTimeout, ctx.Verbose, ctx.DepsOnly)
 	if err != nil {
-		return fmt.Errorf("compilation failed: %v", err)
+		return wrapCompileError(err)
 	}
 
 	defer os.Remove(tmpExec)

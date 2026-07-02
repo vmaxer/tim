@@ -593,7 +593,9 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 				fc.out.XorRegWithReg("xmm0", "xmm0")
 			}
 		} else {
-			compilerError("'main' must be a function, not a plain value (use 'main = { 42 }' to return an exit code)")
+			// main is a plain value (e.g. `main = 42`): load it as the exit code,
+			// mirroring the arm64 backend so plain-value main is portable.
+			fc.compileExpression(&IdentExpr{Name: "main"})
 		}
 		// Result is in xmm0 (float64)
 		// Convert float64 result in xmm0 to int32 in rdi (for exit code)

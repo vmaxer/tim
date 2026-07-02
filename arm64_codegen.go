@@ -1907,7 +1907,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			if VerboseMode {
 				fmt.Fprintf(os.Stderr, "Error: undefined variable '%s'\n", e.Name)
 			}
-			return fmt.Errorf("undefined variable: %s", e.Name)
+			return acg.undefinedVariableError(e.Name)
 		}
 		// ldr d0, [x29, #offset]
 		// x29 points to saved fp location, variables start at offset 16
@@ -8352,6 +8352,20 @@ func getRegisterNumber(reg string) uint8 {
 	}
 }
 
+// undefinedVariableError builds the "undefined variable" error, matching the
+// x86 backend: when a close in-scope name exists (edit distance <= 3), it is
+// offered as a "Did you mean" suggestion. Keeps the diagnostic identical across
+// backends instead of the old bare "undefined variable: X".
+func (acg *ARM64CodeGen) undefinedVariableError(name string) error {
+	scope := make(map[string]int, len(acg.stackVars)+len(acg.globalSlots))
+	maps.Copy(scope, acg.stackVars)
+	maps.Copy(scope, acg.globalSlots)
+	if s := findSimilarIdentifiers(name, scope, 3); len(s) > 0 {
+		return fmt.Errorf("undefined variable '%s'. Did you mean: %s?", name, strings.Join(s, ", "))
+	}
+	return fmt.Errorf("undefined variable '%s'", name)
+}
+
 // compilePostfixStmt compiles postfix increment/decrement statements (x++, x--)
 func (acg *ARM64CodeGen) compilePostfixStmt(postfix *PostfixExpr) error {
 	// x++ and x-- are statements only, not expressions
@@ -8363,7 +8377,7 @@ func (acg *ARM64CodeGen) compilePostfixStmt(postfix *PostfixExpr) error {
 	// Get the variable's stack offset
 	offset, exists := acg.stackVars[identExpr.Name]
 	if !exists {
-		return fmt.Errorf("undefined variable '%s'", identExpr.Name)
+		return acg.undefinedVariableError(identExpr.Name)
 	}
 
 	// Check if variable is mutable

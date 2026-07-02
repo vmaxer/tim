@@ -1,6 +1,11 @@
 package main
 
 import (
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -820,5 +825,89 @@ func TestEvaluation(t *testing.T) {
 				t.Errorf("Expected output to contain %q, got %q", tt.expectedOutput, output)
 			}
 		})
+	}
+}
+
+// TestPlainValueMainExitCode guards a cross-backend consistency fix: a plain
+// value `main = N` (no block) must compile on every backend and use N as the
+// process exit code. The arm64 backend always accepted this shape; the x86
+// backends used to reject it with "'main' must be a function". compileAndRun
+// discards the exit code, so this test checks it directly.
+func TestPlainValueMainExitCode(t *testing.T) {
+	tmpDir := t.TempDir()
+	srcFile := filepath.Join(tmpDir, "pv.tim")
+	if err := os.WriteFile(srcFile, []byte("main = 7\n"), 0644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+
+	exePath := filepath.Join(tmpDir, "pv")
+	if runtime.GOOS == "windows" {
+		exePath += ".exe"
+	}
+	osType, _ := ParseOS(runtime.GOOS)
+	archType, _ := ParseArch(runtime.GOARCH)
+	if err := CompileTimWithOptions(srcFile, exePath, Platform{OS: osType, Arch: archType}, 0, false, false); err != nil {
+		t.Fatalf("plain-value main should compile, got: %v", err)
+	}
+
+	cmd := exec.Command(exePath)
+	cmd.Env = os.Environ()
+	err := cmd.Run()
+	got := 0
+	if err != nil {
+		exitErr, ok := err.(*exec.ExitError)
+		if !ok {
+			t.Fatalf("execution failed: %v", err)
+		}
+		got = exitErr.ExitCode()
+	}
+	if got != 7 {
+		t.Errorf("plain-value main exit code = %d, want 7", got)
+	}
+}
+
+// compileErr compiles a snippet for the host platform and returns the resulting
+// error (nil on success). Used to assert on diagnostic quality.
+func compileErr(t *testing.T, code string) error {
+	t.Helper()
+	tmpDir := t.TempDir()
+	src := filepath.Join(tmpDir, "e.tim")
+	if err := os.WriteFile(src, []byte(code), 0644); err != nil {
+		t.Fatalf("write source: %v", err)
+	}
+	osType, _ := ParseOS(runtime.GOOS)
+	archType, _ := ParseArch(runtime.GOARCH)
+	return CompileTimWithOptions(src, filepath.Join(tmpDir, "e"), Platform{OS: osType, Arch: archType}, 0, false, false)
+}
+
+// TestDiagnosticsNotNoisy guards two user-facing diagnostic clean-ups:
+//  1. Syntax errors are printed once, in full (snippet + caret), then abort via
+//     ErrAlreadyReported so no second context-free copy is shown.
+//  2. Semantic errors carry no doubled "compilation failed:" prefix and, when a
+//     near name exists, include a "Did you mean" suggestion consistently.
+func TestDiagnosticsNotNoisy(t *testing.T) {
+	// Syntax error → already-reported sentinel (top level stays quiet).
+	synErr := compileErr(t, "main = {\n  x = = 5\n}\n")
+	if synErr == nil {
+		t.Fatal("expected a syntax error")
+	}
+	if !errors.Is(synErr, ErrAlreadyReported) {
+		t.Errorf("syntax error should be ErrAlreadyReported (already printed in full), got: %v", synErr)
+	}
+
+	// Semantic error → raw message, no doubled prefix, with a suggestion.
+	semErr := compileErr(t, "main = {\n  velocity = 3.0\n  println(veloctiy)\n}\n")
+	if semErr == nil {
+		t.Fatal("expected an undefined-variable error")
+	}
+	msg := semErr.Error()
+	if strings.Contains(msg, "compilation failed") {
+		t.Errorf("library-level error must not carry a 'compilation failed' prefix (the CLI adds one): %q", msg)
+	}
+	if !strings.Contains(msg, "undefined variable 'veloctiy'") {
+		t.Errorf("expected an 'undefined variable' message, got: %q", msg)
+	}
+	if !strings.Contains(msg, "Did you mean: velocity?") {
+		t.Errorf("expected a 'Did you mean' suggestion for a near name, got: %q", msg)
 	}
 }
