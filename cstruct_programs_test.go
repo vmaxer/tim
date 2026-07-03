@@ -130,6 +130,39 @@ main = {
 	testInlineTim(t, "cstruct_by_value", source, "13\n24\n110\n")
 }
 
+// TestCStructMethodOnLocalInIfArm covers a cstruct local defined inside an
+// `if`-expression arm and then used as a method-call receiver in the SAME arm.
+// The operator-overload/method desugar pass used to skip locals declared inside
+// a value-position `if` block, so `a.add(horizon)` kept its unresolved `a.add`
+// form and was reported as an undefined function (and, in heavier scenes,
+// showed up as a segfault once worked around). It must resolve to V_add now.
+func TestCStructMethodOnLocalInIfArm(t *testing.T) {
+	source := `cstruct V { x as float64, y as float64, z as float64 }
+
+fun V.add(o: V) = V(self.x + o.x, self.y + o.y, self.z + o.z)
+fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+
+fun f(dy) {
+    horizon = V(0.45, 0.10, 0.38)
+    base = if dy < 0.0 {
+        a = horizon.scale(2.0)
+        a.add(horizon)
+    } else {
+        horizon
+    }
+    base
+}
+
+main = {
+    w = f(-0.5)
+    println(w.x)
+    println(w.y)
+    println(w.z)
+}
+`
+	testInlineTim(t, "cstruct_method_on_local_in_if_arm", source, "1.35\n0.3\n1.14\n")
+}
+
 func TestExistingCStructPrograms(t *testing.T) {
 	tests := []string{
 		"cstruct_test",

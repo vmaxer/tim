@@ -5436,7 +5436,10 @@ func (acg *ARM64CodeGen) emitWriteFloatSmart(fd uint64) error {
 		return err
 	}
 	acg.out.AddImm64("sp", "sp", 16)
-	if err := acg.emitWriteFloat(15, fd, true); err != nil {
+	// 6 fractional digits with trailing-zero trim, matching the x86
+	// compileFloatToString path. Using 15 here would surface the double's
+	// binary-rounding noise (e.g. 123456.789 -> 123456.789000000004307).
+	if err := acg.emitWriteFloat(6, fd, true); err != nil {
 		return err
 	}
 

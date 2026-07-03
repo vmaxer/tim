@@ -19880,7 +19880,6 @@ func getUnknownFunctions(program *Program) []string {
 			unknown = append(unknown, funcName)
 		}
 	}
-
 	return unknown
 }
 

@@ -3185,10 +3185,20 @@ func opDesugarExpr(expr Expression, env, retType map[string]string, defined map[
 		e.C = opDesugarExpr(e.C, env, retType, defined)
 		return e
 	case *BlockExpr:
-		// A nested lambda's body or block: process its statements with the same
-		// env (locals already collected for the enclosing function).
+		// A nested block — typically an `if`/`match` arm used as a value (e.g.
+		// `base = if c { a = h.scale(2); a.add(h) } else { h }`). Collect the
+		// block's OWN local cstruct types first, into a child env, so a later
+		// statement can resolve a method call on a local defined earlier in the
+		// same block. Without this, `a.add(h)` would keep its unresolved
+		// `a.add` form and be reported as an undefined function. The child env
+		// keeps these locals from leaking to sibling arms.
+		inner := make(map[string]string)
+		maps.Copy(inner, env)
 		for _, s := range e.Statements {
-			opDesugarStmt(s, env, retType, defined)
+			opCollectLocalTypesStmt(s, inner, retType)
+		}
+		for _, s := range e.Statements {
+			opDesugarStmt(s, inner, retType, defined)
 		}
 		return e
 	case *LambdaExpr:
