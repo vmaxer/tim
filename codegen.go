@@ -17461,7 +17461,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		fc.out.Cvtsi2sd("xmm0", "rax")
 
 	case "read_i8", "read_i16", "read_i32", "read_i64",
-		"read_u8", "read_u16", "read_u32", "read_u64", "read_f64":
+		"read_u8", "read_u16", "read_u32", "read_u64", "read_f32", "read_f64":
 		// FFI memory read: read_TYPE(ptr, index) -> value
 		if len(call.Args) != 2 {
 			compilerError("%s() requires exactly 2 arguments (ptr, index)", call.Function)
@@ -17470,14 +17470,14 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		// Determine type size and signed/unsigned
 		var typeSize int
 		isSigned := strings.HasPrefix(call.Function, "read_i")
-		isFloat := call.Function == "read_f64"
+		isFloat := call.Function == "read_f64" || call.Function == "read_f32"
 
 		switch call.Function {
 		case "read_i8", "read_u8":
 			typeSize = 1
 		case "read_i16", "read_u16":
 			typeSize = 2
-		case "read_i32", "read_u32":
+		case "read_i32", "read_u32", "read_f32":
 			typeSize = 4
 		case "read_i64", "read_u64", "read_f64":
 			typeSize = 8
@@ -17512,8 +17512,14 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 
 		// Read value from memory
 		if isFloat {
-			// Read float64 directly
-			fc.out.MovMemToXmm("xmm0", "r10", 0)
+			if typeSize == 4 {
+				// 32-bit C float: movss xmm0, [r10] then widen to Tim's float64.
+				fc.out.Emit([]byte{0xF3, 0x41, 0x0F, 0x10, 0x02}) // movss xmm0, [r10]
+				fc.out.Emit([]byte{0xF3, 0x0F, 0x5A, 0xC0})       // cvtss2sd xmm0, xmm0
+			} else {
+				// Read float64 directly
+				fc.out.MovMemToXmm("xmm0", "r10", 0)
+			}
 		} else {
 			// Read integer and convert
 			switch typeSize {
@@ -19660,7 +19666,7 @@ func checkForwardReferences(program *Program) []string {
 		"alloc":               true, "free": true,
 		"dlopen": true, "dlsym": true, "dlclose": true,
 		"read_i8": true, "read_u8": true, "read_i16": true, "read_u16": true,
-		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f64": true,
+		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f32": true, "read_f64": true,
 		"write_i8": true, "write_u8": true, "write_i16": true, "write_u16": true,
 		"write_i32": true, "write_u32": true, "write_i64": true, "write_u64": true, "write_f32": true, "write_f64": true,
 		"call": true, "arena_create": true, "arena_alloc": true, "arena_reset": true, "arena_destroy": true,
@@ -19790,7 +19796,7 @@ func getUnknownFunctions(program *Program) []string {
 		"dlopen": true, "dlsym": true, "dlclose": true,
 		// Memory operations
 		"read_i8": true, "read_u8": true, "read_i16": true, "read_u16": true,
-		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f64": true,
+		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f32": true, "read_f64": true,
 		"write_i8": true, "write_u8": true, "write_i16": true, "write_u16": true,
 		"write_i32": true, "write_u32": true, "write_i64": true, "write_u64": true, "write_f32": true, "write_f64": true,
 		// Dynamic calling

@@ -130,6 +130,64 @@ main = {
 	testInlineTim(t, "cstruct_by_value", source, "13\n24\n110\n")
 }
 
+// TestReadWriteFloat32 covers the 32-bit-float FFI accessors. write_f32 existed
+// only on x86; read_f32 did not exist at all. C graphics/audio APIs (vertex
+// buffers, colours, SDL mouse coords, PCM samples) are float32-heavy, so both
+// directions must work on both backends. Values chosen to be exactly
+// representable in float32 so the round-trip is bit-clean.
+func TestReadWriteFloat32(t *testing.T) {
+	source := `import c
+buf = c.malloc(16.0)
+write_f32(buf, 0, 3.5)
+write_f32(buf, 4, 0.0-2.25)
+write_f32(buf, 8, 1000.5)
+println(read_f32(buf, 0))
+println(read_f32(buf, 4))
+println(read_f32(buf, 8))
+c.free(buf)
+`
+	testInlineTim(t, "read_write_f32", source, "3.5\n-2.25\n1000.5\n")
+}
+
+// TestChainedCStructMethodsCompileFast guards against the inliner blowing up on
+// deeply chained cstruct method calls. Each such call inlines to a body whose
+// arguments (the constructors) were being deep-copied at every use site, and the
+// whole result was re-inlined at every level — so a chain like a matrix build +
+// transform expanded the AST exponentially and OOM-killed the compiler. The fix
+// binds a multiply-used constructor arg once and re-inlines only the body, not
+// the already-inlined argument bindings. If that regresses, this test hangs
+// instead of returning a value — a clear signal in CI.
+func TestChainedCStructMethodsCompileFast(t *testing.T) {
+	source := `cstruct V3 { x as float64, y as float64, z as float64 }
+
+fun V3.add(o: V3)   = V3(self.x+o.x, self.y+o.y, self.z+o.z)
+fun V3.sub(o: V3)   = V3(self.x-o.x, self.y-o.y, self.z-o.z)
+fun V3.scale(s)     = V3(self.x*s, self.y*s, self.z*s)
+fun V3.dot(o: V3)   = self.x*o.x + self.y*o.y + self.z*o.z
+fun V3.cross(o: V3) = V3(self.y*o.z-self.z*o.y, self.z*o.x-self.x*o.z, self.x*o.y-self.y*o.x)
+fun V3.norm() {
+    l = sqrt(self.x*self.x + self.y*self.y + self.z*self.z)
+    if l > 0.0 { V3(self.x/l, self.y/l, self.z/l) } else { V3(0.0,0.0,0.0) }
+}
+
+fun build(t) {
+    a = V3(1.0, 2.0, 3.0)
+    b = V3(4.0, 5.0, 6.0)
+    // A long chain of struct-returning methods, the shape that used to explode.
+    r = a.add(b).sub(a).scale(2.0).add(b.cross(a)).norm().scale(3.0)
+    r.x + r.y + r.z
+}
+
+main = {
+    println(build(1.0))
+}
+`
+	// A non-hanging result is the real assertion; the value just pins correctness
+	// (sum of the normalized-and-scaled chain = 90/sqrt(362) ≈ 4.7302). Match a
+	// prefix so a last-digit rounding difference between backends can't flake it.
+	testInlineTim(t, "chained_cstruct_methods", source, "4.7302")
+}
+
 // TestCStructMethodOnLocalInIfArm covers a cstruct local defined inside an
 // `if`-expression arm and then used as a method-call receiver in the SAME arm.
 // The operator-overload/method desugar pass used to skip locals declared inside

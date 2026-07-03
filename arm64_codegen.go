@@ -3849,10 +3849,10 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 		// Result pointer in x0 -> numeric double convention in d0.
 		return acg.out.ScvtfInt64ToDouble("d0", "x0")
 	case "write_i8", "write_i16", "write_i32", "write_i64",
-		"write_u8", "write_u16", "write_u32", "write_u64", "write_f64":
+		"write_u8", "write_u16", "write_u32", "write_u64", "write_f32", "write_f64":
 		return acg.compileMemoryWrite(call)
 	case "read_i8", "read_i16", "read_i32", "read_i64",
-		"read_u8", "read_u16", "read_u32", "read_u64", "read_f64":
+		"read_u8", "read_u16", "read_u32", "read_u64", "read_f32", "read_f64":
 		return acg.compileMemoryRead(call)
 	case "dlopen":
 		// dlopen(path, flags)
@@ -8680,7 +8680,7 @@ func (acg *ARM64CodeGen) compileMemoryWrite(call *CallExpr) error {
 		typeSize = 1
 	case "write_i16", "write_u16":
 		typeSize = 2
-	case "write_i32", "write_u32":
+	case "write_i32", "write_u32", "write_f32":
 		typeSize = 4
 	case "write_i64", "write_u64", "write_f64":
 		typeSize = 8
@@ -8728,7 +8728,11 @@ func (acg *ARM64CodeGen) compileMemoryWrite(call *CallExpr) error {
 	}
 
 	// Write value to memory
-	if call.Function == "write_f64" {
+	if call.Function == "write_f32" {
+		// Narrow Tim's float64 to a 32-bit C float, then store it.
+		acg.out.out.writer.WriteBytes([]byte{0x01, 0x40, 0x62, 0x1e}) // fcvt s1, d0
+		acg.out.out.writer.WriteBytes([]byte{0x21, 0x01, 0x00, 0xbd}) // str s1, [x9]
+	} else if call.Function == "write_f64" {
 		// Write float64 directly: str d0, [x9]
 		acg.out.out.writer.WriteBytes([]byte{0x20, 0x01, 0x00, 0xfd})
 	} else {
@@ -8778,7 +8782,7 @@ func (acg *ARM64CodeGen) compileMemoryRead(call *CallExpr) error {
 		typeSize = 1
 	case "read_i16", "read_u16":
 		typeSize = 2
-	case "read_i32", "read_u32":
+	case "read_i32", "read_u32", "read_f32":
 		typeSize = 4
 	case "read_i64", "read_u64", "read_f64":
 		typeSize = 8
@@ -8815,7 +8819,11 @@ func (acg *ARM64CodeGen) compileMemoryRead(call *CallExpr) error {
 	acg.out.out.writer.WriteBytes([]byte{0xe9, 0x03, 0x40, 0xf9}) // ldr x9, [sp]
 	acg.out.out.writer.WriteBytes([]byte{0x29, 0x01, 0x0a, 0x8b}) // add x9, x9, x10
 
-	if call.Function == "read_f64" {
+	if call.Function == "read_f32" {
+		// 32-bit C float: ldr s0, [x9] then widen to Tim's float64 (fcvt d0, s0).
+		acg.out.out.writer.WriteBytes([]byte{0x20, 0x01, 0x40, 0xbd}) // ldr s0, [x9]
+		acg.out.out.writer.WriteBytes([]byte{0x00, 0xc0, 0x22, 0x1e}) // fcvt d0, s0
+	} else if call.Function == "read_f64" {
 		acg.out.out.writer.WriteBytes([]byte{0x20, 0x01, 0x40, 0xfd}) // ldr d0, [x9]
 	} else {
 		switch typeSize {

@@ -43,6 +43,7 @@ func optimizeProgram(program *Program) *Program {
 	optimizerCStructDecls = program.CStructs
 	inlineReinlineDepth = 0
 	inlineTempCounter = 0
+	inlineBudget = inlineBudgetMax
 
 	// Pass 1: Constant folding (2 + 3 → 5)
 	for i, stmt := range program.Statements {
@@ -1880,7 +1881,8 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 			// Only inline if:
 			// 1. Parameter count matches
 			// 2. Called at least once
-			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 {
+			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 && inlineBudget > 0 {
+				inlineBudget--
 				// Inline the body, let-binding any non-trivial argument so it is
 				// evaluated exactly once (naive substitution would duplicate e.g.
 				// `vscale(b,s)` into each `.x/.y/.z` use — quadratic blowup and
@@ -1892,7 +1894,21 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 				// self-recursive one-liner candidates.
 				if inlineReinlineDepth < 200 {
 					inlineReinlineDepth++
-					inlined = inlineFunctionsExpr(inlined, candidates, callCounts)
+					// inlineWithLetBinding returns either the substituted body, or a
+					// block `{ __inl bindings…; body }`. The leading bindings hold the
+					// call's arguments, which were ALREADY inlined bottom-up at line
+					// ~1894 before we got here — re-walking them re-does that work at
+					// every re-inline level, which is what makes a deep chain of
+					// struct-method calls expand super-linearly. Re-inline only the
+					// final body expression (nested candidate calls, including those in
+					// the body's own local assignments, live there); leave the bindings
+					// untouched.
+					if blk, ok := inlined.(*BlockExpr); ok && len(blk.Statements) > 0 {
+						last := len(blk.Statements) - 1
+						blk.Statements[last] = inlineFunctions(blk.Statements[last], candidates, callCounts)
+					} else {
+						inlined = inlineFunctionsExpr(inlined, candidates, callCounts)
+					}
 					inlineReinlineDepth--
 				}
 				return inlined
@@ -2045,6 +2061,16 @@ var inlineTempCounter int
 // calls collapse) without looping forever on self-recursive one-liner candidates.
 var inlineReinlineDepth int
 
+// inlineBudget caps the TOTAL number of inline substitutions per program. Each
+// re-inline of an inlined body re-walks the (growing) result, so a deep chain of
+// struct method calls can expand the AST super-linearly. When the budget is
+// exhausted the inliner stops expanding and leaves the remaining calls as real
+// function calls — always correct, just less inlined. Generous enough that
+// ordinary code inlines fully; only pathological expansion is clamped.
+var inlineBudget int
+
+const inlineBudgetMax = 200000
+
 // inlineArgIsTrivial reports whether an argument is safe to substitute directly
 // into every use without a binding: a bare variable or literal has no evaluation
 // cost and no side effects, so duplicating it is free.
@@ -2065,6 +2091,124 @@ func inlineArgIsTrivial(arg Expression) bool {
 // substituted directly; non-trivial args are bound to a fresh local first
 // (`__inl_N = arg`) so they are computed once, then the body is emitted as a block
 // whose value is the substituted body.
+// countParamUses returns how many times the identifier `name` is referenced in
+// expr. It mirrors the node types substituteParamsExpr rewrites, so its count
+// matches the number of substitution sites — which is what decides whether
+// inlining an argument would duplicate it. Nested lambdas that rebind `name` are
+// not descended into (that scope shadows the param). Over/under-counting only
+// affects whether a temp is introduced (a perf choice, never correctness).
+func countParamUses(expr Expression, name string) int {
+	switch e := expr.(type) {
+	case *IdentExpr:
+		if e.Name == name {
+			return 1
+		}
+	case *BinaryExpr:
+		return countParamUses(e.Left, name) + countParamUses(e.Right, name)
+	case *CallExpr:
+		n := 0
+		if e.Function == name {
+			n++
+		}
+		for _, a := range e.Args {
+			n += countParamUses(a, name)
+		}
+		return n
+	case *DirectCallExpr:
+		n := countParamUses(e.Callee, name)
+		for _, a := range e.Args {
+			n += countParamUses(a, name)
+		}
+		return n
+	case *FieldAccessExpr:
+		return countParamUses(e.Object, name)
+	case *CastExpr:
+		return countParamUses(e.Expr, name)
+	case *UnaryExpr:
+		return countParamUses(e.Operand, name)
+	case *LengthExpr:
+		return countParamUses(e.Operand, name)
+	case *FMAExpr:
+		return countParamUses(e.A, name) + countParamUses(e.B, name) + countParamUses(e.C, name)
+	case *IndexExpr:
+		return countParamUses(e.List, name) + countParamUses(e.Index, name)
+	case *ListExpr:
+		n := 0
+		for _, x := range e.Elements {
+			n += countParamUses(x, name)
+		}
+		return n
+	case *MapExpr:
+		n := 0
+		for i := range e.Keys {
+			n += countParamUses(e.Keys[i], name) + countParamUses(e.Values[i], name)
+		}
+		return n
+	case *MatchExpr:
+		n := countParamUses(e.Condition, name)
+		for _, c := range e.Clauses {
+			if c.Guard != nil {
+				n += countParamUses(c.Guard, name)
+			}
+			n += countParamUses(c.Result, name)
+		}
+		if e.DefaultExpr != nil {
+			n += countParamUses(e.DefaultExpr, name)
+		}
+		return n
+	case *BlockExpr:
+		n := 0
+		for _, s := range e.Statements {
+			n += countParamUsesStmt(s, name)
+		}
+		return n
+	case *JumpExpr:
+		if e.Value != nil {
+			return countParamUses(e.Value, name)
+		}
+	case *LambdaExpr:
+		// A nested lambda whose params include `name` shadows it; otherwise its
+		// body can still reference the outer param (a closure), so count it.
+		if slices.Contains(e.Params, name) {
+			return 0
+		}
+		return countParamUses(e.Body, name)
+	}
+	return 0
+}
+
+func countParamUsesStmt(stmt Statement, name string) int {
+	switch s := stmt.(type) {
+	case *AssignStmt:
+		return countParamUses(s.Value, name)
+	case *ExpressionStmt:
+		return countParamUses(s.Expr, name)
+	case *LoopStmt:
+		n := countParamUses(s.Iterable, name)
+		for _, b := range s.Body {
+			n += countParamUsesStmt(b, name)
+		}
+		return n
+	case *JumpStmt:
+		if s.Value != nil {
+			return countParamUses(s.Value, name)
+		}
+	case *IfStmt:
+		n := 0
+		for _, br := range s.Branches {
+			n += countParamUses(br.Condition, name)
+			for _, b := range br.Body {
+				n += countParamUsesStmt(b, name)
+			}
+		}
+		for _, b := range s.ElseBody {
+			n += countParamUsesStmt(b, name)
+		}
+		return n
+	}
+	return 0
+}
+
 func inlineWithLetBinding(lambda *LambdaExpr, args []Expression) Expression {
 	substMap := make(map[string]Expression, len(lambda.Params))
 	var bindings []Statement
@@ -2085,11 +2229,24 @@ func inlineWithLetBinding(lambda *LambdaExpr, args []Expression) Expression {
 		}
 		switch {
 		case isCStructConstructorCall(arg):
-			// Substitute the constructor directly. The codegen folds `Ctor(..).f`
-			// to the f-th argument (SROA) — and since the fields are distinct
-			// expressions, accessing .x/.y/.z does not re-evaluate anything. A cast
-			// wrapper would hide the constructor from the fold, so don't add one.
-			substMap[param] = arg
+			// A cstruct constructor argument. If the parameter is used at most once
+			// in the body, substitute the constructor directly: the codegen folds
+			// `Ctor(..).f` to the f-th argument (SROA), and a single use can't
+			// duplicate work. But when the param is used MORE than once (e.g. a
+			// method reading `self.x/.y/.z` twice), direct substitution deep-copies
+			// the whole constructor at every use site — and if that constructor holds
+			// already-inlined nested calls, chaining makes the AST grow
+			// exponentially (OOM). Bind it to a temp once instead; SROA still folds
+			// the resulting `tmp.field` reads, so there is no runtime cost. No cast
+			// wrapper: the constructor keeps its own type for the fold.
+			if countParamUses(lambda.Body, param) > 1 {
+				inlineTempCounter++
+				tmp := fmt.Sprintf("__inl_%d", inlineTempCounter)
+				bindings = append(bindings, &AssignStmt{Name: tmp, Value: arg})
+				substMap[param] = &IdentExpr{Name: tmp}
+			} else {
+				substMap[param] = arg
+			}
 		case inlineArgIsTrivial(arg):
 			// Cheap to duplicate (a variable read or literal).
 			substMap[param] = wrap(arg)
