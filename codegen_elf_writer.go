@@ -46,12 +46,15 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 		}
 	}
 
-	// Math functions that require libm when called via C FFI
+	// Math functions that require libm, whether reached via C FFI (c.sin) or as a
+	// bare libm call (fmod, hypot, ...) that the codegen lowers to an external call.
 	libmFunctions := map[string]bool{
 		"sin": true, "cos": true, "tan": true, "asin": true, "acos": true, "atan": true, "atan2": true,
 		"sinh": true, "cosh": true, "tanh": true,
-		"log": true, "log10": true, "exp": true, "pow": true, "sqrt": true,
-		"fabs": true, "fmod": true, "ceil": true, "floor": true,
+		"log": true, "log10": true, "log2": true, "exp": true, "exp2": true, "pow": true, "sqrt": true, "cbrt": true,
+		"fabs": true, "fmod": true, "ceil": true, "floor": true, "trunc": true,
+		// Two-arg libm: double f(double, double)
+		"hypot": true, "copysign": true, "fdim": true, "fmax": true, "fmin": true, "nextafter": true,
 	}
 
 	needsLibm := false
@@ -65,6 +68,17 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 			} else {
 				needsLibc = true
 			}
+		}
+	}
+
+	// Bare libm calls (e.g. fmod/hypot/fmin without a "c." prefix) lower to an
+	// external call too, so they require libm to be linked. Without this the
+	// program would link statically and the call would jump to an unresolved
+	// address at runtime.
+	for funcName := range fc.usedFunctions {
+		if libmFunctions[funcName] {
+			needsLibm = true
+			break
 		}
 	}
 

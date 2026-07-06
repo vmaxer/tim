@@ -69,6 +69,9 @@ type TimCompiler struct {
 	platform             Platform                      // Target platform (arch + OS)
 	variables            map[string]int                // variable name -> stack offset
 	mutableVars          map[string]bool               // variable name -> is mutable
+	boxedVars            map[string]bool               // names that live in a heap cell in the current scope (captured-and-mutated locals)
+	varIsClosure         map[string]bool               // variable name -> holds a callable closure (so `g = f(x); g()` invokes it)
+	returnsClosure       map[string]bool               // lambda-var name -> its body evaluates to a closure
 	parentVariables      map[string]bool               // Track parent-scope vars in parallel loops (use r11 instead of rbp)
 	varTypes             map[string]string             // variable name -> "map" or "list" (legacy)
 	varTypeInfo          map[string]*TimType           // variable name -> type annotation (new type system)
@@ -172,6 +175,10 @@ type LambdaFunc struct {
 	IsNested          bool              // True if this lambda is nested inside another
 	IsPure            bool              // True if function has no side effects (eligible for memoization)
 	ParamCStructTypes map[string]string // param name -> cstruct type from `(a as V)` / `self: V` annotations
+	// BoxedCaptures marks which of CapturedVars are boxed: the env slot holds a
+	// heap cell pointer (shared with the enclosing scope) instead of a value, so
+	// `<-` updates in the closure persist and are visible across calls.
+	BoxedCaptures map[string]bool
 }
 
 type PatternLambdaFunc struct {
@@ -247,6 +254,9 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 		regTracker:          NewRegisterTracker(),
 		regSpiller:          NewRegisterSpiller(SpillToStack),
 		movedVars:           make(map[string]bool),
+		boxedVars:           make(map[string]bool),
+		varIsClosure:        make(map[string]bool),
+		returnsClosure:      make(map[string]bool),
 		scopeDepth:          0,
 		scopedMoved:         []map[string]bool{make(map[string]bool)},
 		errors:              NewErrorCollector(10),
@@ -1047,7 +1057,11 @@ func (fc *TimCompiler) compileInternal(program *Program, outputPath string, deps
 	}
 
 	if fc.maxStackOffset > 0 {
-		alignedSize := int64((fc.maxStackOffset + 15) & ^15)
+		// Add temp space beyond the pre-pass high-water mark (mirroring the
+		// 4096-byte slack lambda frames get): block locals are allocated during
+		// code generation starting at maxStackOffset, so they can land past the
+		// offsets the pre-pass saw.
+		alignedSize := int64((fc.maxStackOffset + 4096 + 15) & ^15)
 		if VerboseMode {
 			fmt.Fprintf(os.Stderr, "Allocating %d bytes of stack space (maxStackOffset=%d)\n", alignedSize, fc.maxStackOffset)
 		}
@@ -1493,9 +1507,29 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 			fc.updateStackOffset(64)
 		}
 
+		// Make a cstruct-typed iterator (`for b: Ball in ...`) visible while
+		// collecting the body, so assignments like `d := b.c` are typed here the
+		// same way they are during compilation (compileListLoop registers the
+		// identical mapping). Saved/restored so an outer binding of the same
+		// name is not clobbered.
+		prevIterCStruct, hadIterCStruct := fc.varCStructType[s.Iterator]
+		registeredIterCStruct := false
+		if _, isStruct := fc.cstructs[s.IteratorType]; isStruct {
+			fc.varCStructType[s.Iterator] = s.IteratorType
+			registeredIterCStruct = true
+		}
+
 		for _, bodyStmt := range s.Body {
 			if err := fc.collectSymbols(bodyStmt); err != nil {
 				return err
+			}
+		}
+
+		if registeredIterCStruct {
+			if hadIterCStruct {
+				fc.varCStructType[s.Iterator] = prevIterCStruct
+			} else {
+				delete(fc.varCStructType, s.Iterator)
 			}
 		}
 
@@ -1860,6 +1894,19 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 			fc.currentAssignName = s.Name
 			fc.compileExpression(s.Value)
 			fc.currentAssignName = ""
+
+			// Boxed variables live in a heap cell shared with nested closures:
+			// a new declaration allocates the cell, and any update stores the
+			// value through the cell pointer rather than into the slot directly.
+			if fc.boxedVars[s.Name] {
+				if !s.IsUpdate && !s.IsReuseMutable {
+					fc.emitBoxedDeclaration(offset)
+				} else {
+					fc.emitBoxedStore(offset)
+				}
+				break
+			}
+
 			// Use r11 for parent variables in parallel loops, rbp for local variables
 			baseReg := "rbp"
 			if fc.parentVariables != nil && fc.parentVariables[s.Name] {
@@ -3805,6 +3852,16 @@ func (fc *TimCompiler) compileListLoop(stmt *LoopStmt) {
 	fc.variables[stmt.Iterator] = iterOffset
 	fc.mutableVars[stmt.Iterator] = true
 
+	// A typed cstruct iterator (`@ b as Ball in balls`) makes the loop variable a
+	// pointer to that struct, so record its type for field-access resolution —
+	// otherwise `b.field` reads at an unknown offset and silently yields 0. This
+	// mirrors the ARM64 backend (arm64_codegen.go).
+	registeredIterCStruct := false
+	if _, isStruct := fc.cstructs[stmt.IteratorType]; isStruct {
+		fc.varCStructType[stmt.Iterator] = stmt.IteratorType
+		registeredIterCStruct = true
+	}
+
 	loopStartPos := fc.eb.text.Len()
 
 	// Register this loop on the active loop stack
@@ -3898,6 +3955,9 @@ func (fc *TimCompiler) compileListLoop(stmt *LoopStmt) {
 
 	delete(fc.variables, stmt.Iterator)
 	delete(fc.mutableVars, stmt.Iterator)
+	if registeredIterCStruct {
+		delete(fc.varCStructType, stmt.Iterator)
+	}
 
 	// Patch all end jumps (conditional jump + any @0 breaks)
 	for _, patchPos := range fc.activeLoops[len(fc.activeLoops)-1].EndPatches {
@@ -4226,6 +4286,50 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		// Indexing returns the element type
 		// For lists/maps, elements are numbers (float64)
 		return "number"
+	case *FieldAccessExpr:
+		// A cstruct field access reads a scalar (float64/int/pointer bits) — always
+		// a number, never a string/list. Returning "unknown" here made the "+"
+		// operator mistake `struct.field + x` for a list append and dereference the
+		// field value as a list pointer.
+		return "number"
+	case *FMAExpr:
+		// A fused multiply-add (created by the optimizer from `a*b + c`, e.g. an
+		// inlined dot product) is pure float arithmetic. Returning "unknown" here
+		// made the "+" operator mistake `f(a, b) + x` for a list append and
+		// dereference the result value as a list pointer.
+		return "number"
+	case *MatchExpr:
+		// A guard/value match (e.g. an inlined clamp helper) evaluates to one of
+		// its clause results — report the first arm with a known type. Defaults
+		// to "number" so arithmetic on an inlined helper's result dispatches to
+		// float ops instead of list append (mirrors ctypes.TypeOf's arm walk).
+		for _, cl := range e.Clauses {
+			if cl.Result != nil {
+				if t := fc.getExprType(cl.Result); t != "unknown" {
+					return t
+				}
+			}
+		}
+		if e.DefaultExpr != nil {
+			if t := fc.getExprType(e.DefaultExpr); t != "unknown" {
+				return t
+			}
+		}
+		return "number"
+	case *BlockExpr:
+		// A block (e.g. an inlined function body) evaluates to its last
+		// expression — look through it, as ctypes.TypeOf does for cstructs.
+		if n := len(e.Statements); n > 0 {
+			switch s := e.Statements[n-1].(type) {
+			case *ExpressionStmt:
+				return fc.getExprType(s.Expr)
+			case *JumpStmt:
+				if s.Value != nil {
+					return fc.getExprType(s.Value)
+				}
+			}
+		}
+		return "unknown"
 	default:
 		return "unknown"
 	}
@@ -4254,11 +4358,62 @@ func (fc *TimCompiler) registerAssignCStructTypes(name string, value Expression)
 		if et := fc.ctypes.LambdaReturnsListElem(lam.Body); et != "" {
 			fc.funcReturnsListElem[name] = et
 		}
+		// Record whether the lambda's body evaluates to a closure, so a variable
+		// assigned its call result (`counter = make_counter(0)`) is known to be
+		// invocable — including with zero args (mirrors ARM64 markIfClosure).
+		fc.returnsClosure[name] = lambdaBodyReturnsClosure(lam.Body)
 		return
+	}
+	switch v := value.(type) {
+	case *CallExpr:
+		if fc.returnsClosure[v.Function] {
+			fc.varIsClosure[name] = true
+		}
+	case *IdentExpr:
+		// Alias of another closure variable.
+		if fc.varIsClosure[v.Name] {
+			fc.varIsClosure[name] = true
+		}
 	}
 	if ct := fc.ctypes.TypeOf(value); ct != "" {
 		fc.varCStructType[name] = ct
 	}
+	// Track lists of cstructs (`xs := [Ball(...), ...]`) so `xs[i].field` resolves
+	// the element layout, mirroring the ARM64 backend.
+	if et := fc.ctypes.listElemTypeOf(value); et != "" {
+		fc.varListElemType[name] = et
+	}
+}
+
+// emitBoxedDeclaration allocates a heap cell for a new boxed local (a variable
+// some nested lambda updates via `<-`), stores the value in xmm0 into it, and
+// writes the cell pointer into the variable's stack slot. The slot then holds
+// a shared pointer that nested closures capture by reference, so a closure's
+// mutation persists and is visible across calls (the canonical make_counter
+// pattern). Mirrors the ARM64 backend's heap-cell boxing.
+func (fc *TimCompiler) emitBoxedDeclaration(offset int) {
+	fc.usesArenas = true // cells live in the arena like closure environments
+	// Spill the value across the allocation call (it clobbers xmm0).
+	fc.out.SubImmFromReg("rsp", 16)
+	fc.out.MovXmmToMem("xmm0", "rsp", 0)
+	// 16-byte align rsp for the call (same dance as closure allocation).
+	fc.out.MovRegToReg("r13", "rsp")
+	fc.out.AndRegWithImm("rsp", -16)
+	fc.out.MovImmToReg("rdi", "16")
+	fc.callArenaAlloc()
+	fc.out.MovRegToReg("rsp", "r13")
+	fc.out.MovMemToXmm("xmm15", "rsp", 0)
+	fc.out.AddImmToReg("rsp", 16)
+	fc.out.MovXmmToMem("xmm15", "rax", 0)     // cell[0] = value
+	fc.out.MovRegToMem("rax", "rbp", -offset) // slot = cell pointer
+}
+
+// emitBoxedStore stores the value in xmm0 through the heap cell of the boxed
+// variable whose slot is at the given rbp-relative offset (used for `<-`
+// updates of a boxed local or a boxed capture).
+func (fc *TimCompiler) emitBoxedStore(offset int) {
+	fc.out.MovMemToReg("rax", "rbp", -offset) // rax = cell pointer
+	fc.out.MovXmmToMem("xmm0", "rax", 0)      // cell[0] = value
 }
 
 // emitCStructFieldRead emits code to read a cstruct field from [rdi + offset] into xmm0.
@@ -4791,6 +4946,13 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 					fc.addSemanticError(fmt.Sprintf("undefined variable '%s'", e.Name))
 					compilerError("undefined variable '%s'", e.Name)
 				}
+			}
+			// Boxed variable (a local some nested closure mutates, or a boxed
+			// capture): the slot holds a heap cell pointer — deref it.
+			if fc.boxedVars[e.Name] {
+				fc.out.MovMemToReg("rax", "rbp", -offset) // rax = cell pointer
+				fc.out.MovMemToXmm("xmm0", "rax", 0)      // value = cell[0]
+				break
 			}
 			// Use r11 for parent variables in parallel loops, rbp for local variables
 			baseReg := "rbp"
@@ -6532,6 +6694,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			IsPure:            isPure,
 			ParamCStructTypes: e.ParamCStructTypes,
 		})
+		lambdaIdx := len(fc.lambdaFuncs) - 1
 
 		// For closures with captured variables, we need runtime allocation
 		// For simple lambdas, use a static closure object with NULL environment
@@ -6570,10 +6733,19 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				if !exists {
 					compilerError("captured variable '%s' not found in scope", varName)
 				}
-				// Load variable value to xmm15
+				// Load variable value to xmm15. For a boxed variable the slot
+				// holds the shared heap cell pointer, and this verbatim copy
+				// captures it BY REFERENCE — mark it so the nested lambda reads
+				// and writes through the cell.
 				fc.out.MovMemToXmm("xmm15", "rbp", -varOffset)
 				// Store in environment at r12+16+(i*8)
 				fc.out.MovXmmToMem("xmm15", "r12", 16+(i*8))
+				if fc.boxedVars[varName] {
+					if fc.lambdaFuncs[lambdaIdx].BoxedCaptures == nil {
+						fc.lambdaFuncs[lambdaIdx].BoxedCaptures = make(map[string]bool)
+					}
+					fc.lambdaFuncs[lambdaIdx].BoxedCaptures[varName] = true
+				}
 			}
 
 			// Return closure object pointer as float64 in xmm0
@@ -6667,6 +6839,15 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		}
 
 	case *BlockExpr:
+		// Block locals are allocated here at compile time (the pre-pass only
+		// walked them provisionally and restored stackOffset afterwards). Start
+		// them at the function's high-water mark so they can never land inside
+		// slots handed out earlier — e.g. a surrounding list loop's bookkeeping
+		// area (BaseOffset+16..+64), which the stale stackOffset would overlap
+		// and the loop's saved list pointer would be silently clobbered.
+		if fc.stackOffset < fc.maxStackOffset {
+			fc.stackOffset = fc.maxStackOffset
+		}
 		// First, collect symbols from all statements in the block
 		for _, stmt := range e.Statements {
 			if err := fc.collectSymbols(stmt); err != nil {
@@ -6679,6 +6860,13 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.compileExpression(&NumberExpr{Value: 1.0})
 			return
 		}
+
+		// Snapshot runtime rsp usage so block evaluation is rsp-neutral: each
+		// new local emits `sub rsp, 16` (see AssignStmt), and a block may be
+		// evaluated mid-expression while the enclosing operator's spilled
+		// operand lives at (%rsp) — leaking the subs would make that reload
+		// read a dead slot (and sink rsp on every loop iteration).
+		runtimeStackBefore := fc.runtimeStack
 
 		// Save tail position state - only last statement can be in tail position
 		savedTailPosition := fc.inTailPosition
@@ -6735,6 +6923,14 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 
 		// Restore tail position
 		fc.inTailPosition = savedTailPosition
+
+		// Release the stack space the block's locals allocated (they are
+		// block-scoped and dead now), restoring rsp for the enclosing
+		// expression. The result in xmm0 is unaffected.
+		if delta := fc.runtimeStack - runtimeStackBefore; delta > 0 {
+			fc.out.AddImmToReg("rsp", int64(delta))
+			fc.runtimeStack = runtimeStackBefore
+		}
 
 	case *MatchExpr:
 		fc.compileMatchExpr(e)
@@ -8128,7 +8324,20 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 		oldVariables := fc.variables
 		oldMutableVars := fc.mutableVars
 		oldStackOffset := fc.stackOffset
+		oldMaxStackOffset := fc.maxStackOffset
 		oldRuntimeStack := fc.runtimeStack
+		oldBoxedVars := fc.boxedVars
+
+		// Names this function must heap-box: locals some nested lambda updates
+		// via `<-` (shared cell so the mutation persists), plus its own boxed
+		// captures (env slot holds the cell pointer). Params are never boxed.
+		fc.boxedVars = boxedCaptureVars(lambda.Body)
+		for name := range lambda.BoxedCaptures {
+			fc.boxedVars[name] = true
+		}
+		for _, p := range lambda.Params {
+			delete(fc.boxedVars, p)
+		}
 
 		// Create new scope for lambda
 		// CRITICAL: Copy ALL variables (including module-level) for lookup
@@ -8328,7 +8537,9 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 			varOffset := baseCapturedOffset + i*16
 			fc.stackOffset = varOffset // Track for compatibility
 			fc.variables[capturedVar] = varOffset
-			fc.mutableVars[capturedVar] = false
+			// A boxed capture is captured by reference (the slot holds a shared
+			// heap cell pointer), so `<-` updates to it are legal in this scope.
+			fc.mutableVars[capturedVar] = lambda.BoxedCaptures[capturedVar]
 
 			// IMPORTANT: Restore type information for captured variables
 			if typ, exists := lambda.CapturedVarTypes[capturedVar]; exists {
@@ -8352,6 +8563,11 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 		fc.labelCounter = 0
 
 		fc.pushDeferScope()
+
+		// Scope the stack high-water mark to this lambda: block locals allocated
+		// during body compilation start at maxStackOffset, so it must reflect
+		// this frame's slots (params/captures), not another function's.
+		fc.maxStackOffset = fc.stackOffset
 
 		// Compile lambda body (result in xmm0)
 		fc.compileExpression(lambda.Body)
@@ -8378,7 +8594,9 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 		fc.variables = oldVariables
 		fc.mutableVars = oldMutableVars
 		fc.stackOffset = oldStackOffset
+		fc.maxStackOffset = oldMaxStackOffset
 		fc.runtimeStack = oldRuntimeStack
+		fc.boxedVars = oldBoxedVars
 	}
 }
 
@@ -8402,10 +8620,12 @@ func (fc *TimCompiler) generatePatternLambdaFunctions() {
 		oldVariables := fc.variables
 		oldMutableVars := fc.mutableVars
 		oldStackOffset := fc.stackOffset
+		oldMaxStackOffset := fc.maxStackOffset
 
 		fc.variables = make(map[string]int)
 		fc.mutableVars = make(map[string]bool)
 		fc.stackOffset = 0
+		fc.maxStackOffset = 0
 
 		if VerboseMode {
 			debugf("DEBUG generatePatternLambdaFunctions: reset variables map for '%s', fc.variables=%v\n", patternLambda.Name, fc.variables)
@@ -8523,6 +8743,7 @@ func (fc *TimCompiler) generatePatternLambdaFunctions() {
 		fc.variables = oldVariables
 		fc.mutableVars = oldMutableVars
 		fc.stackOffset = oldStackOffset
+		fc.maxStackOffset = oldMaxStackOffset
 	}
 }
 
@@ -11809,8 +12030,10 @@ func (fc *TimCompiler) generateArenaEnsureCapacity() {
 }
 
 func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
-	// Callable if it has a known function signature; otherwise treat as plain value
-	isCallable := fc.functionSignatures[call.Function] != nil
+	// Callable if it has a known function signature, or it holds a closure
+	// returned from a closure-returning function (`counter = make_counter(0)`);
+	// otherwise treat as plain value
+	isCallable := fc.functionSignatures[call.Function] != nil || fc.varIsClosure[call.Function]
 
 	if VerboseMode {
 		debugf("DEBUG compileStoredFunctionCall: function='%s', isCallable=%v, args=%d\n", call.Function, isCallable, len(call.Args))
@@ -12751,6 +12974,39 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	// Save int part as float in xmm1 BEFORE printing (printing will clobber rax)
 	fc.out.Cvtsi2sd("xmm1", "rax")
 
+	// Get fractional part BEFORE printing the integer digits: frac = num - int.
+	// Rounding the fraction may carry into the integer part (0.9999999 rounds
+	// to 1.000000), so the carry has to be known before those digits are written.
+	fc.out.SubsdXmm("xmm0", "xmm1") // xmm0 = fractional part in [0, 1)
+
+	// Bias the fraction by half of the last printed place (0.5e-6) so the
+	// digit-by-digit extraction below rounds to nearest instead of truncating.
+	// Without this, 3.14159 (stored as 3.14158999...) prints as 3.141589; the
+	// arm64 formatter rounds via fcvtns, so this keeps the backends consistent.
+	fc.loadFloatConstant("xmm4", 0.0000005)
+	fc.out.AddsdXmm("xmm0", "xmm4")
+
+	// Carry: the biased fraction may have reached 1.0 (e.g. 0.9999999 + bias).
+	// Fold it into the integer part, or the first digit extraction yields 10
+	// and a ':' (ASCII '9'+1) leaks into the output.
+	fc.loadFloatConstant("xmm4", 1.0)
+	// loadFloatConstant clobbers rax (rip-relative address load), so re-extract
+	// the integer part from the saved value now that both constants are loaded.
+	fc.out.MovMemToXmm("xmm1", bufPtr, 24)
+	fc.out.Cvttsd2si("rax", "xmm1")
+	fc.out.Ucomisd("xmm0", "xmm4")
+	noCarryJump := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpBelow, 0) // frac < 1.0: no carry
+	noCarryEnd := fc.eb.text.Len()
+	fc.out.AddImmToReg("rax", 1)
+	fc.out.SubsdXmm("xmm0", "xmm4")
+	noCarryPos := fc.eb.text.Len()
+	fc.patchJumpImmediate(noCarryJump+2, int32(noCarryPos-noCarryEnd))
+
+	// Stash the biased fraction (the original value at bufPtr+24 is no longer
+	// needed) while integer printing clobbers the registers.
+	fc.out.MovXmmToMem("xmm0", bufPtr, 24)
+
 	// Print integer part
 	fc.compileIntToStringAtPosNoNewline("rax", "rsi")
 	// rsi now points after the integer part
@@ -12760,25 +13016,8 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	fc.out.MovByteRegToMem("r10", "rsi", 0)
 	fc.out.AddImmToReg("rsi", 1)
 
-	// Get fractional part: frac = num - int_part
+	// Reload the biased fraction
 	fc.out.MovMemToXmm("xmm0", bufPtr, 24)
-	// xmm1 already has int part as float from above
-	fc.out.SubsdXmm("xmm0", "xmm1") // xmm0 = fractional part
-
-	// Check if fractional part is zero
-	fc.out.XorRegWithReg("rax", "rax")
-	fc.out.Cvtsi2sd("xmm2", "rax") // xmm2 = 0.0
-	fc.out.Ucomisd("xmm0", "xmm2")
-	fracZeroJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0) // Jump if frac == 0
-	fracZeroEnd := fc.eb.text.Len()
-
-	// Bias the fraction by half of the last printed place (0.5e-6) so the
-	// digit-by-digit extraction below rounds to nearest instead of truncating.
-	// Without this, 3.14159 (stored as 3.14158999...) prints as 3.141589; the
-	// arm64 formatter rounds via fcvtns, so this keeps the backends consistent.
-	fc.loadFloatConstant("xmm4", 0.0000005)
-	fc.out.AddsdXmm("xmm0", "xmm4")
 
 	// Print up to 6 decimal digits
 	fc.out.MovImmToReg("r11", "6") // digit counter
@@ -12835,21 +13074,17 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	// Not a '0', so advance back to position after this character
 	fc.out.AddImmToReg("rsi", 1)
 
-	// Non-zero fractional path is finished. Skip the decimal-point removal
-	// below (that step is only for the frac==0 case) and go straight to the
-	// newline; otherwise it would clobber the last significant digit.
-	nonZeroDoneJump := fc.eb.text.Len()
-	fc.out.JumpUnconditional(0)
-	nonZeroDoneEnd := fc.eb.text.Len()
-
-	// Fractional part was zero - remove the decimal point we added
-	fracZeroPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(fracZeroJump+2, int32(fracZeroPos-fracZeroEnd))
+	// If the strip walked all the way back to the decimal point (all six
+	// digits rounded to zero, e.g. 1.0000000000000002 or a carry like
+	// 2.9999999 -> 3.000000), drop the point too; rsi currently points just
+	// past it and would leave a dangling "3." in the output.
+	fc.out.CmpRegToImm("r10", 46) // '.'
+	dotKeepJump := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotEqual, 0)
+	dotKeepEnd := fc.eb.text.Len()
 	fc.out.SubImmFromReg("rsi", 1) // Remove the '.' we added
-
-	// Newline target shared by both paths
-	nonZeroDonePos := fc.eb.text.Len()
-	fc.patchJumpImmediate(nonZeroDoneJump+1, int32(nonZeroDonePos-nonZeroDoneEnd))
+	dotKeepPos := fc.eb.text.Len()
+	fc.patchJumpImmediate(dotKeepJump+2, int32(dotKeepPos-dotKeepEnd))
 
 	// Add newline
 	fc.out.MovImmToReg("r10", "10") // '\n'
@@ -15873,6 +16108,110 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		// Convert result from rax to xmm0
 		fc.out.Cvtsi2sd("xmm0", "rax")
 
+	case "fork":
+		// fork(): raw syscall on Linux (keeps the binary static); libc elsewhere.
+		if len(call.Args) != 0 {
+			compilerError("fork() takes no arguments")
+		}
+		if fc.eb.target.OS() == OSLinux {
+			fc.out.MovImmToReg("rax", "57") // SYS_fork
+			fc.out.Emit([]byte{0x0f, 0x05}) // syscall
+			fc.out.Cvtsi2sd("xmm0", "rax")
+		} else {
+			fc.callFunction("fork", "")
+			fc.out.Cvtsi2sd("xmm0", "rax")
+		}
+
+	case "waitpid":
+		// waitpid(pid, status, options): SYS_wait4 with rusage=NULL on Linux.
+		if len(call.Args) != 3 {
+			compilerError("waitpid() requires exactly 3 arguments")
+		}
+		if fc.eb.target.OS() == OSLinux {
+			for i := len(call.Args) - 1; i >= 0; i-- {
+				fc.compileExpression(call.Args[i])
+				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.out.PushReg("rax")
+			}
+			fc.out.PopReg("rdi")               // pid
+			fc.out.PopReg("rsi")               // status*
+			fc.out.PopReg("rdx")               // options
+			fc.out.XorRegWithReg("r10", "r10") // rusage = NULL
+			fc.out.MovImmToReg("rax", "61")    // SYS_wait4
+			fc.out.Emit([]byte{0x0f, 0x05})    // syscall
+			fc.out.Cvtsi2sd("xmm0", "rax")
+		} else {
+			fc.compileCFunctionCall("", "waitpid", call.Args)
+		}
+
+	case "mmap":
+		// mmap(addr, len, prot, flags, fd, offset). Tim's portable flag values
+		// follow the macOS constants (MAP_ANON=0x1000); on Linux the anonymous
+		// bit is translated to MAP_ANONYMOUS (0x20) so the same program maps
+		// shared/anonymous memory on both platforms.
+		if len(call.Args) != 6 {
+			compilerError("mmap() requires exactly 6 arguments")
+		}
+		if fc.eb.target.OS() == OSLinux {
+			argRegs := []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
+			for i := len(call.Args) - 1; i >= 0; i-- {
+				fc.compileExpression(call.Args[i])
+				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.out.PushReg("rax")
+			}
+			for i := range argRegs {
+				fc.out.PopReg(argRegs[i])
+			}
+			// Branch-free MAP_ANON translation in flags (r10):
+			// r11 = (flags & 0x1000) >> 7 (0x1000 -> 0x20), clear 0x1000, or in r11.
+			fc.out.MovRegToReg("r11", "r10")
+			fc.out.AndRegWithImm("r11", 0x1000)
+			fc.out.ShrRegByImm("r11", 7)
+			fc.out.AndRegWithImm("r10", ^int32(0x1000))
+			fc.out.OrRegWithReg("r10", "r11")
+			fc.out.MovImmToReg("rax", "9")  // SYS_mmap
+			fc.out.Emit([]byte{0x0f, 0x05}) // syscall
+			fc.out.Cvtsi2sd("xmm0", "rax")
+		} else {
+			fc.compileCFunctionCall("", "mmap", call.Args)
+		}
+
+	case "munmap":
+		// munmap(addr, len): raw syscall on Linux; libc elsewhere.
+		if len(call.Args) != 2 {
+			compilerError("munmap() requires exactly 2 arguments")
+		}
+		if fc.eb.target.OS() == OSLinux {
+			for i := len(call.Args) - 1; i >= 0; i-- {
+				fc.compileExpression(call.Args[i])
+				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.out.PushReg("rax")
+			}
+			fc.out.PopReg("rdi")
+			fc.out.PopReg("rsi")
+			fc.out.MovImmToReg("rax", "11") // SYS_munmap
+			fc.out.Emit([]byte{0x0f, 0x05}) // syscall
+			fc.out.Cvtsi2sd("xmm0", "rax")
+		} else {
+			fc.compileCFunctionCall("", "munmap", call.Args)
+		}
+
+	case "proc_exit":
+		// Immediate process exit: no atexit handlers, no stdio flush — essential
+		// for a forked worker that must not run the parent's cleanup (mirrors the
+		// ARM64 backend's libc _exit lowering; on Linux this is SYS_exit_group).
+		if len(call.Args) != 1 {
+			compilerError("proc_exit() requires exactly 1 argument")
+		}
+		if fc.eb.target.OS() == OSLinux {
+			fc.compileExpression(call.Args[0])
+			fc.out.Cvttsd2si("rdi", "xmm0")
+			fc.out.MovImmToReg("rax", "231") // SYS_exit_group
+			fc.out.Emit([]byte{0x0f, 0x05})  // syscall
+		} else {
+			fc.compileCFunctionCall("", "_exit", call.Args)
+		}
+
 	case "sqrt":
 		if len(call.Args) != 1 {
 			compilerError("sqrt() requires exactly 1 argument")
@@ -18730,20 +19069,21 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		// For now, generate a call instruction hoping it will be resolved
 		// In the future, this will be resolved by loading from dependency repos
 
-		// Arguments are passed in xmm0-xmm5 (up to 6 args)
-		// Compile arguments in order
-		for i, arg := range call.Args {
+		// Float arguments are passed in xmm0-xmm7 per the SysV ABI (up to 8 args).
+		// Each argument expression itself computes into xmm0, so we cannot compile
+		// straight into the target register — we spill every argument to the stack
+		// first, then load each into its final xmm register. Spilling the last
+		// argument too (rather than leaving it in xmm0) is what keeps arg[n-1] out
+		// of xmm0, where restoring arg0 would otherwise clobber it.
+		for _, arg := range call.Args {
 			fc.compileExpression(arg)
-			if i < len(call.Args)-1 {
-				// Save result to stack if not the last arg
-				fc.out.SubImmFromReg("rsp", StackSlotSize)
-				fc.out.MovXmmToMem("xmm0", "rsp", 0)
-			}
+			fc.out.SubImmFromReg("rsp", StackSlotSize)
+			fc.out.MovXmmToMem("xmm0", "rsp", 0)
 		}
 
-		// Restore arguments from stack in reverse order to registers
-		// Last arg is already in xmm0
-		for i := len(call.Args) - 2; i >= 0; i-- {
+		// Pop arguments from the stack into registers. The last argument is on top
+		// of the stack, so unwinding in reverse places arg[i] into xmm[i].
+		for i := len(call.Args) - 1; i >= 0; i-- {
 			regName := fmt.Sprintf("xmm%d", i)
 			fc.out.MovMemToXmm(regName, "rsp", 0)
 			fc.out.AddImmToReg("rsp", StackSlotSize)
