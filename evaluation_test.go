@@ -91,6 +91,93 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "guard_statement_early_exit",
+			// Statement-level guard clauses: `| cond => stmt` between ordinary
+			// statements is sugar for `if cond { stmt }` — the early-exit guard.
+			code: `
+				clamp = (x, lo, hi) -> {
+					| x < lo => ret lo
+					| x > hi => ret hi
+					x
+				}
+				main = {
+					println(clamp(5, 0, 10))
+					println(clamp(0 - 3, 0, 10))
+					println(clamp(42, 0, 10))
+				}
+			`,
+			expectedOutput: "5\n0\n10\n",
+			expectCompile:  true,
+		},
+		{
+			name: "guard_statement_err",
+			// The canonical precondition guard: `| cond => err "msg"` returns a
+			// NaN-boxed error that the caller's or! catches.
+			code: `
+				divide = (a, b) -> {
+					| b == 0 => err "division by zero"
+					ret a / b
+				}
+				main = {
+					println(divide(10, 2) or! { println("caught"); 111 })
+					println(divide(1, 0) or! { println("caught"); 222 })
+				}
+			`,
+			expectedOutput: "5\ncaught\n222\n",
+			expectCompile:  true,
+		},
+		{
+			name: "err_keyword_returns_error_value",
+			// `err msg` desugars to `ret error(msg)`: the caller receives an error
+			// NaN, not the message string, in every err position (if body, match arm).
+			code: `
+				f = (b) -> {
+					if b == 0 { err "dv0" }
+					ret 7
+				}
+				g = (b) -> {
+					b == 0 { 1 => err "dv0" }
+					ret 8
+				}
+				main = {
+					println(f(1) or! 0 - 1)
+					println(f(0) or! 0 - 1)
+					println(g(1) or! 0 - 2)
+					println(g(0) or! 0 - 2)
+				}
+			`,
+			expectedOutput: "7\n-1\n8\n-2\n",
+			expectCompile:  true,
+		},
+		{
+			name: "match_arm_ret_from_function",
+			// `ret` as a value-match arm result returns from the enclosing
+			// function with a correct epilogue (regression: clobbered rbx/ret addr).
+			code: `
+				f = (b) -> {
+					b == 0 { 1 => ret 42 }
+					7
+				}
+				main = { println(f(0)); println(f(1)) }
+			`,
+			expectedOutput: "42\n7\n",
+			expectCompile:  true,
+		},
+		{
+			name: "currency_sign_or_bang_alias",
+			// ¤ is a one-character alias for or!.
+			code: `
+				main = {
+					x := 0
+					println(x ¤ { 99 })
+					y := 42
+					println(y ¤ { 7 })
+				}
+			`,
+			expectedOutput: "99\n42\n",
+			expectCompile:  true,
+		},
+		{
 			name: "multi_clause_guard_match",
 			// A multi-clause guard match on one line: the result of a clause must
 			// not swallow the next clause's leading `|` as the pipe operator.

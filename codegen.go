@@ -7153,9 +7153,12 @@ func (fc *TimCompiler) compileMatchJump(jumpExpr *JumpExpr) {
 		}
 		fc.out.MovRegToReg("rsp", "rbp")
 
-		// REGISTER ALLOCATOR: Restore callee-saved registers (for lambda functions)
+		// REGISTER ALLOCATOR: Restore callee-saved registers (for lambda functions).
+		// rbx is saved at [rbp-8] by the lambda prologue, so point rsp at it and
+		// pop — same epilogue as compileJumpStatement. (This previously did
+		// `add rsp, 8`, which popped the return address into rbx and crashed.)
 		if fc.currentLambda != nil {
-			fc.out.AddImmToReg("rsp", 8) // Remove alignment padding
+			fc.out.SubImmFromReg("rsp", 8) // Point to saved rbx
 			fc.out.PopReg("rbx")
 		}
 
@@ -20090,58 +20093,76 @@ func checkForwardReferences(program *Program) []string {
 
 // Confidence that this function is working: 95%
 // getUnknownFunctions determines which functions are called but not defined
-func getUnknownFunctions(program *Program) []string {
-	// Builtin functions that are always available (implemented in compiler)
-	builtins := map[string]bool{
-		"printf": true, "exit": true, "syscall": true,
-		"getpid": true, "me": true,
-		"print": true, "println": true, "peek32": true, "peek8": true, // builtin optimizations, not dependencies
-		"eprint": true, "eprintln": true, "eprintf": true, // stderr printing with Result return
-		"exitln": true, "exitf": true, // stderr printing with exit(1)
-		"malloc": true, "free": true, // memory management built-ins
-		// Process/memory syscalls for fork-based parallelism (resolved from libSystem)
-		"fork": true, "waitpid": true, "mmap": true, "munmap": true, "proc_exit": true,
-		// Math functions (hardware instructions)
-		"sqrt": true, "sin": true, "cos": true, "tan": true,
-		"asin": true, "acos": true, "atan": true, "atan2": true,
-		"exp": true, "log": true, "log10": true, "pow": true,
-		"min": true, "max": true,
-		// Additional single-arg libm (handled by the codegen libm fallback)
-		"cbrt": true, "exp2": true, "log2": true, "trunc": true, "fabs": true,
-		// Two-arg libm: double f(double, double)
-		"fmod": true, "hypot": true, "copysign": true,
-		"fdim": true, "fmax": true, "fmin": true, "nextafter": true,
-		// Raylib graphics (linked directly against libraylib via C FFI)
-		"InitWindow": true, "CloseWindow": true, "DrawRectangle": true,
-		"BeginDrawing": true, "EndDrawing": true, "ClearBackground": true,
-		"WindowShouldClose": true, "SetTargetFPS": true, "DrawPixel": true,
-		"DrawText": true, "DrawCircle": true, "DrawLine": true,
-		"floor": true, "ceil": true, "round": true,
-		"abs": true, "approx": true,
-		// Bit manipulation functions (CPU instructions with fallback)
-		"popcount": true, "clz": true, "ctz": true,
-		// Channel primitives
-		"chan": true, "close": true,
-		// List methods
-		"append": true, "head": true, "tail": true, "pop": true,
-		// Error handling
-		"error": true, "is_nan": true,
-		// Internal functions (start with _)
-		"_error_code_extract": true,
-		// Debug
-		"printa": true,
-		// Memory allocation
-		"alloc": true,
-		// Dynamic library loading
-		"dlopen": true, "dlsym": true, "dlclose": true,
-		// Memory operations
-		"read_i8": true, "read_u8": true, "read_i16": true, "read_u16": true,
-		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f32": true, "read_f64": true,
-		"write_i8": true, "write_u8": true, "write_i16": true, "write_u16": true,
-		"write_i32": true, "write_u32": true, "write_i64": true, "write_u64": true, "write_f32": true, "write_f64": true,
-		// Dynamic calling
-		"call": true, "arena_create": true, "arena_alloc": true, "arena_reset": true, "arena_destroy": true,
+// builtinFunctionNames lists the functions that are always available
+// (implemented in the compiler). Shared by getUnknownFunctions (validation)
+// and suggestSimilarFunctions ("did you mean" hints).
+var builtinFunctionNames = map[string]bool{
+	"printf": true, "exit": true, "syscall": true,
+	"getpid": true, "me": true,
+	"print": true, "println": true, "peek32": true, "peek8": true, // builtin optimizations, not dependencies
+	"eprint": true, "eprintln": true, "eprintf": true, // stderr printing with Result return
+	"exitln": true, "exitf": true, // stderr printing with exit(1)
+	"malloc": true, "free": true, // memory management built-ins
+	// Process/memory syscalls for fork-based parallelism (resolved from libSystem)
+	"fork": true, "waitpid": true, "mmap": true, "munmap": true, "proc_exit": true,
+	// Math functions (hardware instructions)
+	"sqrt": true, "sin": true, "cos": true, "tan": true,
+	"asin": true, "acos": true, "atan": true, "atan2": true,
+	"exp": true, "log": true, "log10": true, "pow": true,
+	"min": true, "max": true,
+	// Additional single-arg libm (handled by the codegen libm fallback)
+	"cbrt": true, "exp2": true, "log2": true, "trunc": true, "fabs": true,
+	// Two-arg libm: double f(double, double)
+	"fmod": true, "hypot": true, "copysign": true,
+	"fdim": true, "fmax": true, "fmin": true, "nextafter": true,
+	// Raylib graphics (linked directly against libraylib via C FFI)
+	"InitWindow": true, "CloseWindow": true, "DrawRectangle": true,
+	"BeginDrawing": true, "EndDrawing": true, "ClearBackground": true,
+	"WindowShouldClose": true, "SetTargetFPS": true, "DrawPixel": true,
+	"DrawText": true, "DrawCircle": true, "DrawLine": true,
+	"floor": true, "ceil": true, "round": true,
+	"abs": true, "approx": true,
+	// Bit manipulation functions (CPU instructions with fallback)
+	"popcount": true, "clz": true, "ctz": true,
+	// Channel primitives
+	"chan": true, "close": true,
+	// List methods
+	"append": true, "head": true, "tail": true, "pop": true,
+	// Error handling
+	"error": true, "is_nan": true,
+	// Internal functions (start with _)
+	"_error_code_extract": true,
+	// Debug
+	"printa": true,
+	// Memory allocation
+	"alloc": true,
+	// Dynamic library loading
+	"dlopen": true, "dlsym": true, "dlclose": true,
+	// Memory operations
+	"read_i8": true, "read_u8": true, "read_i16": true, "read_u16": true,
+	"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f32": true, "read_f64": true,
+	"write_i8": true, "write_u8": true, "write_i16": true, "write_u16": true,
+	"write_i32": true, "write_u32": true, "write_i64": true, "write_u64": true, "write_f32": true, "write_f64": true,
+	// Dynamic calling
+	"call": true, "arena_create": true, "arena_alloc": true, "arena_reset": true, "arena_destroy": true,
+}
+
+// suggestSimilarFunctions returns up to three builtin or program-defined
+// function names similar to name, for "did you mean" hints on undefined
+// function errors (the same treatment undefined variables already get).
+func suggestSimilarFunctions(program *Program, name string) []string {
+	candidates := make(map[string]int, len(builtinFunctionNames))
+	for f := range builtinFunctionNames {
+		candidates[f] = 0
 	}
+	for f := range collectDefinedFunctions(program) {
+		candidates[f] = 0
+	}
+	return findSimilarIdentifiers(name, candidates, 3)
+}
+
+func getUnknownFunctions(program *Program) []string {
+	builtins := builtinFunctionNames
 
 	// Collect C import namespaces (e.g., "enet", "libc")
 	cImports := make(map[string]bool)
@@ -20829,9 +20850,13 @@ func CompileTimWithOptions(inputPath string, outputPath string, platform Platfor
 		// Sort for consistent error messages
 		sort.Strings(finalUnknownFuncs)
 
-		// Report all undefined functions
+		// Report all undefined functions, with "did you mean" hints for typos
 		if len(finalUnknownFuncs) == 1 {
-			return fmt.Errorf("undefined function: %s\nNote: Function must be defined before use or imported from a dependency", finalUnknownFuncs[0])
+			name := finalUnknownFuncs[0]
+			if sugg := suggestSimilarFunctions(program, name); len(sugg) > 0 {
+				return fmt.Errorf("undefined function: %s\nDid you mean: %s?", name, strings.Join(sugg, ", "))
+			}
+			return fmt.Errorf("undefined function: %s\nNote: Function must be defined before use or imported from a dependency", name)
 		}
 		return fmt.Errorf("undefined functions: %s\nNote: Functions must be defined before use or imported from dependencies", strings.Join(finalUnknownFuncs, ", "))
 	}

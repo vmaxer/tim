@@ -1173,7 +1173,8 @@ type SpawnStmt struct {
 
 func (s *SpawnStmt) String() string {
 	var result strings.Builder
-	result.WriteString("spawn " + s.Expr.String())
+	result.WriteString("spawn ")
+	result.WriteString(s.Expr.String())
 	if s.Block != nil {
 		result.WriteString(" | ")
 		for i, param := range s.Params {
@@ -1182,7 +1183,8 @@ func (s *SpawnStmt) String() string {
 			}
 			result.WriteString(param)
 		}
-		result.WriteString(" | " + s.Block.String())
+		result.WriteString(" | ")
+		result.WriteString(s.Block.String())
 	}
 	return result.String()
 }

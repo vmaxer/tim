@@ -27,7 +27,10 @@ func hashStringKey(s string) uint64 {
 	return uint64((h32.Sum32() & 0x3FFFFFFF) | 0x40000000)
 }
 
-// levenshteinDistance calculates the edit distance between two strings
+// levenshteinDistance calculates the edit distance between two strings.
+// Adjacent transpositions count as one edit (Damerau-Levenshtein), so the
+// most common typo class — swapped letters like "prinltn" for "println" —
+// ranks closest in "did you mean" suggestions.
 func levenshteinDistance(s1, s2 string) int {
 	if len(s1) == 0 {
 		return len(s2)
@@ -61,6 +64,10 @@ func levenshteinDistance(s1, s2 string) int {
 				matrix[i-1][j]+1, // deletion
 				min(matrix[i][j-1]+1, // insertion
 					matrix[i-1][j-1]+cost)) // substitution
+			// Transposition of adjacent characters counts as a single edit.
+			if i > 1 && j > 1 && s1[i-1] == s2[j-2] && s1[i-2] == s2[j-1] {
+				matrix[i][j] = min(matrix[i][j], matrix[i-2][j-2]+1)
+			}
 		}
 	}
 

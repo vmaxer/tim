@@ -249,6 +249,10 @@ type Lexer struct {
 	line      int
 	column    int // Current column (1-indexed)
 	lineStart int // Position where current line starts
+	// unterminatedString records the position of the opening quote of a string
+	// literal that reached EOF without a closing quote. The parser reports it
+	// as a precise error instead of a misleading "expected '}'" at EOF.
+	unterminatedString *Token
 }
 
 func NewLexer(input string) *Lexer {
@@ -337,6 +341,7 @@ func (l *Lexer) NextToken() Token {
 
 	// String literal
 	if ch == '"' {
+		openLine, openColumn := l.line, tokenColumn
 		l.pos++
 		start := l.pos
 		for l.pos < len(l.input) && l.input[l.pos] != '"' {
@@ -352,6 +357,9 @@ func (l *Lexer) NextToken() Token {
 				}
 				l.pos++
 			}
+		}
+		if l.pos >= len(l.input) && l.unterminatedString == nil {
+			l.unterminatedString = &Token{Type: TOKEN_STRING, Line: openLine, Column: openColumn}
 		}
 		value := l.input[start:l.pos]
 		l.pos++ // skip closing "
@@ -425,6 +433,20 @@ func (l *Lexer) NextToken() Token {
 		return Token{Type: TOKEN_NUMBER, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
 	}
 
+	// Two-byte UTF-8 punctuation (lead byte 0xC2): ¤ (U+00A4) and µ (U+00B5).
+	// Must be handled before the identifier scan: byte 0xC2 reinterpreted as a
+	// rune is 'Â', which unicode.IsLetter would swallow into an identifier.
+	if ch == 0xC2 && l.pos+1 < len(l.input) {
+		switch l.input[l.pos+1] {
+		case 0xA4: // ¤ — alias for or! (railway-oriented error handling)
+			l.pos += 2
+			return Token{Type: TOKEN_OR_BANG, Value: "or!", Line: l.line, Column: tokenColumn}
+		case 0xB5: // µ — memory ownership/movement operator
+			l.pos += 2
+			return Token{Type: TOKEN_MU, Value: "µ", Line: l.line, Column: tokenColumn}
+		}
+	}
+
 	// Identifier or keyword (cannot start with underscore or digit)
 	if unicode.IsLetter(rune(ch)) {
 		start := l.pos
@@ -435,6 +457,7 @@ func (l *Lexer) NextToken() Token {
 
 		// Check for f-string: f"..."
 		if value == "f" && l.pos < len(l.input) && l.input[l.pos] == '"' {
+			openLine, openColumn := l.line, tokenColumn
 			l.pos++ // skip opening "
 			fstringStart := l.pos
 			for l.pos < len(l.input) && l.input[l.pos] != '"' {
@@ -449,6 +472,9 @@ func (l *Lexer) NextToken() Token {
 					}
 					l.pos++
 				}
+			}
+			if l.pos >= len(l.input) && l.unterminatedString == nil {
+				l.unterminatedString = &Token{Type: TOKEN_FSTRING, Line: openLine, Column: openColumn}
 			}
 			fstringValue := l.input[fstringStart:l.pos]
 			l.pos++ // skip closing "
@@ -971,9 +997,6 @@ func (l *Lexer) NextToken() Token {
 	case '$':
 		l.pos++
 		return Token{Type: TOKEN_DOLLAR, Value: "$", Line: l.line, Column: tokenColumn}
-	case 'µ':
-		l.pos += len("µ") // µ is multi-byte UTF-8
-		return Token{Type: TOKEN_MU, Value: "µ", Line: l.line, Column: tokenColumn}
 	}
 
 	return Token{Type: TOKEN_EOF, Line: l.line, Column: tokenColumn}

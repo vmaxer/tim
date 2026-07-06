@@ -378,7 +378,13 @@ func isPowerOfTwo(x float64) bool {
 	return (ix & (ix - 1)) == 0
 }
 
-// strengthReduceExpr performs strength reduction and peephole optimization on expressions
+// strengthReduceExpr performs strength reduction and peephole optimization on expressions.
+//
+// NOTE: this pass is implemented but NOT wired into optimizeProgram — enabling
+// it requires validating that the integer rewrites (shifts, masks) are only
+// applied to provably integer-valued floats (shouldApplyIntegerOptimization is
+// the guard). Kept as a ready-to-enable pass, not dead code.
+//
 // Replaces expensive operations with cheaper equivalent ones:
 // - x * 2^n → x << n (multiply by power of 2 → left shift)
 // - x / 2^n → x >> n (divide by power of 2 → right shift)
@@ -2264,16 +2270,6 @@ func inlineWithLetBinding(lambda *LambdaExpr, args []Expression) Expression {
 	}
 	stmts := append(bindings, &ExpressionStmt{Expr: body})
 	return &BlockExpr{Statements: stmts}
-}
-
-func substituteParams(body Expression, params []string, args []Expression) Expression {
-	// Create substitution map
-	substMap := make(map[string]Expression)
-	for i, param := range params {
-		substMap[param] = args[i]
-	}
-
-	return substituteParamsExpr(body, substMap)
 }
 
 func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expression {

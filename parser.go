@@ -207,27 +207,36 @@ func NewParserWithFilename(input, filename string) *Parser {
 	return p
 }
 
-// formatError creates a nicely formatted error message with source context
-func (p *Parser) formatError(line int, msg string) string {
-	lines := strings.Split(p.source, "\n")
-	if line < 1 || line > len(lines) {
-		return fmt.Sprintf("%s:%d: %s", p.filename, line, msg)
-	}
-
-	sourceLine := lines[line-1]
-	lineNum := fmt.Sprintf("%4d | ", line)
-	marker := strings.Repeat(" ", len(lineNum)) + strings.Repeat("^", len(sourceLine))
-
-	return fmt.Sprintf("%s:%d: error: %s\n%s%s\n%s",
-		p.filename, line, msg, lineNum, sourceLine, marker)
-}
-
 // error collects a parsing error in the ErrorCollector (railway-oriented approach)
 // In speculative mode, errors are suppressed and parsing fails silently
 func (p *Parser) error(msg string) {
 	if p.speculative {
 		// In speculative mode, don't panic - let the caller handle failure
 		panic(speculativeError{})
+	}
+
+	// An unterminated string swallows the rest of the file, so whatever error
+	// the parser stumbles into afterwards is a symptom. Report the real cause
+	// at the opening quote instead.
+	if tok := p.lexer.unterminatedString; tok != nil {
+		msg = "unterminated string literal"
+		if tok.Type == TOKEN_FSTRING {
+			msg = "unterminated f-string literal"
+		}
+		p.errors.AddError(SyntaxError(msg, SourceLocation{
+			File:   p.filename,
+			Line:   tok.Line,
+			Column: tok.Column,
+			Length: 1,
+		}))
+		p.lexer.unterminatedString = nil
+		if p.errors.ShouldStop() {
+			if report := p.errors.Report(true); report != "" {
+				fmt.Fprintln(os.Stderr, report)
+			}
+			panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
+		}
+		return
 	}
 
 	// Railway-oriented: collect error and continue if possible
@@ -248,57 +257,6 @@ func (p *Parser) error(msg string) {
 			fmt.Fprintln(os.Stderr, report)
 		}
 		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-	}
-}
-
-// parseError creates and collects a syntax error with custom location
-func (p *Parser) parseError(msg string, loc SourceLocation) {
-	if p.speculative {
-		panic(speculativeError{})
-	}
-	err := SyntaxError(msg, loc)
-	p.errors.AddError(err)
-	if p.errors.ShouldStop() {
-		// Print all collected errors before aborting (see ErrAlreadyReported); the
-		// panic still carries the plain text so callers can inspect the message.
-		if report := p.errors.Report(true); report != "" {
-			fmt.Fprintln(os.Stderr, report)
-		}
-		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-	}
-}
-
-// synchronize skips tokens until we reach a safe recovery point
-// This allows the parser to continue after an error and find more errors
-func (p *Parser) synchronize() {
-	p.nextToken()
-
-	for p.current.Type != TOKEN_EOF {
-		// Synchronization points: statement boundaries
-		switch p.current.Type {
-		case TOKEN_NEWLINE:
-			p.nextToken()
-			return
-		case TOKEN_SEMICOLON:
-			p.nextToken()
-			return
-		case TOKEN_RBRACE: // End of block
-			return
-		case TOKEN_AT: // Loop statement
-			return
-		case TOKEN_IF:
-			return
-		}
-
-		// Keywords that start new statements (stored as identifiers)
-		if p.peek.Type == TOKEN_IDENT {
-			switch p.peek.Value {
-			case "fn", "return", "break", "continue", "import", "from", "use", "defer", "if":
-				return
-			}
-		}
-
-		p.nextToken()
 	}
 }
 
@@ -446,13 +404,14 @@ func (p *Parser) ParseProgram() *Program {
 	// Don't add automatic exit(0) statement - the compiler will emit exit code
 	// after processing deferred statements (see lines 2658-2669 in compileStatement)
 
-	// Apply optimizations
+	// Apply optimizations here so every ParseProgram caller (main file,
+	// siblings, dependencies, incremental) gets an optimized AST without
+	// having to remember a separate phase call.
 	program = optimizeProgram(program)
 
 	return program
 }
 
-// optimizeProgram applies optimization passes to the AST
 func (p *Parser) parseImport() Statement {
 	p.nextToken() // skip 'import'
 
@@ -1217,6 +1176,13 @@ func (p *Parser) parseStatement() Statement {
 	// Check for break keyword (alias for ret @)
 	if p.current.Type == TOKEN_BREAK {
 		return p.parseBreakStatement()
+	}
+
+	// Guard statement: `| cond => stmt` — a statement-level guard-match clause,
+	// sugar for `if cond { stmt }`. The canonical early-exit form:
+	//   | b == 0 => err "division by zero"
+	if p.current.Type == TOKEN_PIPE {
+		return p.parseGuardStatement()
 	}
 
 	// Check for if/elif/else conditionals
@@ -2230,6 +2196,9 @@ func (p *Parser) disambiguateBlock() BlockType {
 	foundArrow := false
 	foundAssign := false // an assignment (= := <-) at depth 1 before the first arrow
 	pendingTernary := 0  // unmatched `?` at depth 1: the next ':' is a ternary separator, not a map colon
+	atLineStart := true  // next depth-1 token begins a new statement line
+	sawPipeLine := false // a depth-1 line began with '|' (a guard clause)
+	sawStmtAfterPipe := false
 
 	// Scan tokens within this block
 	for range maxBlockIterations {
@@ -2238,6 +2207,20 @@ func (p *Parser) disambiguateBlock() BlockType {
 		if tok.Type == TOKEN_EOF {
 			break
 		}
+
+		// Track statement-line boundaries at depth 1: a guard-clause line starts
+		// with '|'; any later line that starts with something other than '|' or
+		// '~>' is a plain statement, which makes the leading clauses guard
+		// STATEMENTS in a statement block (early exits), not a guard match.
+		if braceDepth == 1 && atLineStart &&
+			tok.Type != TOKEN_NEWLINE && tok.Type != TOKEN_SEMICOLON {
+			if tok.Type == TOKEN_PIPE {
+				sawPipeLine = true
+			} else if sawPipeLine && tok.Type != TOKEN_DEFAULT_ARROW && tok.Type != TOKEN_RBRACE {
+				sawStmtAfterPipe = true
+			}
+		}
+		atLineStart = tok.Type == TOKEN_NEWLINE || tok.Type == TOKEN_SEMICOLON
 
 		if tok.Type == TOKEN_LBRACE {
 			braceDepth++
@@ -2282,23 +2265,32 @@ func (p *Parser) disambiguateBlock() BlockType {
 					// Found ':' before any arrows and not a type annotation → map literal
 					foundColon = true
 				}
+				// The lookahead consumed a token; keep line tracking in sync.
+				atLineStart = nextTok.Type == TOKEN_NEWLINE || nextTok.Type == TOKEN_SEMICOLON
 			} else if tok.Type == TOKEN_EQUALS || tok.Type == TOKEN_COLON_EQUALS || tok.Type == TOKEN_LEFT_ARROW {
 				// An assignment before any arrow signals a mixed block: leading
 				// statements followed by a guard match (spec: statements execute
 				// first, then the guard match is evaluated and returned).
 				foundAssign = true
 			} else if tok.Type == TOKEN_FAT_ARROW || tok.Type == TOKEN_DEFAULT_ARROW {
-				// Found arrow → match block (=> or ~>)
+				// Found arrow → match block (=> or ~>). When the arrow belongs to a
+				// '|' guard-clause line, keep scanning: trailing statement lines
+				// would make those clauses guard statements instead (see below).
 				foundArrow = true
-				break
+				if !sawPipeLine {
+					break
+				}
 			} else if tok.Type == TOKEN_UNDERSCORE {
 				// Check if next token is =>
 				nextTok := tempLexer.NextToken()
 				if nextTok.Type == TOKEN_FAT_ARROW {
 					// Found _ => → match block
 					foundArrow = true
-					break
+					if !sawPipeLine {
+						break
+					}
 				}
+				atLineStart = nextTok.Type == TOKEN_NEWLINE || nextTok.Type == TOKEN_SEMICOLON
 			}
 		}
 	}
@@ -2306,6 +2298,12 @@ func (p *Parser) disambiguateBlock() BlockType {
 	// Apply disambiguation rules in order
 	if foundColon && !foundArrow {
 		return BlockTypeMap
+	}
+	// Guard clauses followed by plain statements: the '|' lines are guard
+	// STATEMENTS (early exits) inside a statement block, e.g.
+	// `{ | b == 0 => err "dv0"  ret a / b }` — not a guard-match expression.
+	if sawPipeLine && sawStmtAfterPipe {
+		return BlockTypeStatement
 	}
 	if foundArrow {
 		if foundAssign {
@@ -2694,6 +2692,7 @@ func (p *Parser) parseMatchTarget() Expression {
 
 	case TOKEN_RET, TOKEN_ERR:
 		// ret/err or ret @N or ret value or ret @N value
+		isErr := p.current.Type == TOKEN_ERR
 		p.nextToken() // skip 'ret'/'err'
 
 		label := 0 // 0 means return from function
@@ -2721,6 +2720,16 @@ func (p *Parser) parseMatchTarget() Expression {
 		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && !isDefaultMatch {
 			value = p.parseExpression()
 			p.nextToken()
+		}
+
+		// `err msg` returns an error value: desugar to `ret error(msg)` so the
+		// caller's or!/err? sees a NaN-boxed error, not the message itself
+		// (same lowering as parseJumpStatement).
+		if isErr {
+			if value == nil {
+				value = &StringExpr{Value: "err"}
+			}
+			value = &CallExpr{Function: "error", Args: []Expression{value}}
 		}
 
 		// Return a JumpExpr with IsBreak semantics (ret exits loop)
@@ -3506,6 +3515,30 @@ handleJump:
 	return &JumpStmt{IsBreak: true, Label: label, Value: value}
 }
 
+// parseGuardStatement parses a statement-level guard clause:
+//
+//	| cond => stmt
+//
+// It reuses the guard-match clause shape as an early-exit statement — sugar
+// for `if cond { stmt }` — so preconditions read as guards:
+//
+//	| b == 0 => err "division by zero"
+//	| a < 0  => ret 0
+//
+// current must be on '|'; on exit it is left on the statement's last token
+// (the same convention as every other statement parser).
+func (p *Parser) parseGuardStatement() Statement {
+	p.nextToken() // skip '|', move onto the condition
+	cond := p.parseExpression()
+	if p.peek.Type != TOKEN_FAT_ARROW {
+		p.error("expected '=>' after guard condition")
+	}
+	p.nextToken() // move onto '=>'
+	p.nextToken() // move onto the guarded statement
+	body := p.parseStatement()
+	return &IfStmt{Branches: []IfBranch{{Condition: cond, Body: []Statement{body}}}}
+}
+
 // parseJumpStatement parses ret statements
 // ret - return from function
 // ret value - return value from function
@@ -3516,6 +3549,7 @@ func (p *Parser) parseJumpStatement() Statement {
 	// LAST token of the statement so block parsers (which advance past it) stay in
 	// sync — otherwise `if c { ret @ }` over-consumes the brace and corrupts the
 	// scope stack. Peek-based lookahead keeps the cursor in place.
+	isErr := p.current.Type == TOKEN_ERR
 	label := 0 // 0 means return from function
 	var value Expression
 
@@ -3545,6 +3579,16 @@ func (p *Parser) parseJumpStatement() Statement {
 		p.peek.Type != TOKEN_EOF && p.peek.Type != TOKEN_SEMICOLON {
 		p.nextToken() // move onto the first token of the value
 		value = p.parseExpression()
+	}
+
+	// `err msg` returns an error value: desugar to `ret error(msg)` so the
+	// caller's or!/err? sees a NaN-boxed error, not the message itself.
+	// A bare `err` returns the generic "err" code.
+	if isErr {
+		if value == nil {
+			value = &StringExpr{Value: "err"}
+		}
+		value = &CallExpr{Function: "error", Args: []Expression{value}}
 	}
 
 	// ret is always a break/return (IsBreak=true)
@@ -4117,6 +4161,18 @@ func (p *Parser) parseLogicalAnd() Expression {
 	return left
 }
 
+// requireOperand reports a clear error when an infix operator is missing its
+// right-hand operand (e.g. `x = 1 +` at end of line). Operand parsers return
+// nil at expression delimiters, which is valid at statement level but never
+// directly after an operator; without this check the nil silently propagated
+// into a BinaryExpr and surfaced as a confusing "expected '}'" later.
+func (p *Parser) requireOperand(right Expression, op string) Expression {
+	if right == nil {
+		p.error(fmt.Sprintf("expected expression after '%s'", op))
+	}
+	return right
+}
+
 func (p *Parser) parseComparison() Expression {
 	left := p.parseRange()
 
@@ -4135,7 +4191,7 @@ func (p *Parser) parseComparison() Expression {
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.parseRange()
+		right := p.requireOperand(p.parseRange(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
@@ -4288,7 +4344,7 @@ func (p *Parser) parseAdditive() Expression {
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.parseBitwise()
+		right := p.requireOperand(p.parseBitwise(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
@@ -4306,7 +4362,7 @@ func (p *Parser) parseBitwise() Expression {
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.parseMultiplicative()
+		right := p.requireOperand(p.parseMultiplicative(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
@@ -4321,7 +4377,7 @@ func (p *Parser) parseMultiplicative() Expression {
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.parsePower()
+		right := p.requireOperand(p.parsePower(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
@@ -4342,7 +4398,7 @@ func (p *Parser) parsePower() Expression {
 		}
 		p.nextToken() // move past ** or ^
 		// Right-associative: recursively parse the right side
-		right := p.parsePower()
+		right := p.requireOperand(p.parsePower(), op)
 		return &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
