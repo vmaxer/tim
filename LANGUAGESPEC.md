@@ -2727,7 +2727,7 @@ init_sdl = () => {
 
 // Main rendering loop
 main = () => {
-    [window, renderer] := init_sdl()
+    window, renderer = init_sdl()
 
     @ frame in 0..<100 ! 200 {
         // Clear screen to black
