@@ -481,6 +481,7 @@ program         = { statement { newline } } ;
 
 statement       = assignment
                 | if_statement
+                | guard_statement
                 | expression_statement
                 | loop_statement
                 | unsafe_statement
@@ -488,11 +489,22 @@ statement       = assignment
                 | parallel_statement
                 | cstruct_decl
                 | return_statement
+                | error_statement
                 | defer_statement
                 | import_statement
                 | export_statement ;
 
 return_statement = "ret" [ "@" [ integer ] ] [ expression ] ;
+
+(* err msg returns a NaN-boxed error: desugars to `ret error(msg)`.
+   A bare err returns the generic "err" code. *)
+error_statement  = "err" [ expression ] ;
+
+(* A guard-match clause as a statement: sugar for `if expression { statement }`.
+   Canonical early-exit precondition: | b == 0 => err "division by zero"
+   A block whose | clause lines are followed by ordinary statement lines is a
+   statement block of guard statements; all-clause blocks stay guard matches. *)
+guard_statement  = "|" expression "=>" statement ;
 
 defer_statement  = "defer" expression ;
 
@@ -583,7 +595,7 @@ reduce_expr     = receive_expr ;
 
 receive_expr    = "<=" pipe_expr | or_bang_expr ;
 
-or_bang_expr    = send_expr { "or!" send_expr } ;
+or_bang_expr    = send_expr { ( "or!" | "¤" ) send_expr } ;  // ¤ (U+00A4) is a one-character alias for or!
 
 send_expr       = or_expr { "<-" or_expr } ;
 

@@ -2183,6 +2183,53 @@ result := sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
 
 **Precedence:** Lower than logical OR, higher than send operator
 
+**The `¤` alias:** the currency sign `¤` (U+00A4, Shift+4 on Nordic keyboards)
+is a one-character alias for `or!`:
+
+```tim
+x = risky() ¤ 0                  // same as: x = risky() or! 0
+w = open_window() ¤ { exit(1) }  // same with a handler block
+```
+
+### Guard Statements
+
+A guard-match clause may stand alone as a statement — `| cond => stmt` is
+sugar for `if cond { stmt }`. Guards read as preconditions and pair naturally
+with `err`/`ret` early exits:
+
+```tim
+divide = (a, b) -> {
+    | b == 0 => err "division by zero"
+    ret a / b
+}
+
+clamp = (x, lo, hi) -> {
+    | x < lo => ret lo
+    | x > hi => ret hi
+    x
+}
+```
+
+**Disambiguation:** a block whose `|` clause lines are followed by ordinary
+statement lines is a statement block containing guard statements. A block
+consisting only of clauses (optionally ending in `~>` default) remains a
+guard-match expression, and `{ statements… | clauses ~> default }` remains a
+mixed block whose trailing guard match is its value.
+
+### The `err` Keyword
+
+`err msg` returns a NaN-boxed error from the enclosing function: it desugars
+to `ret error(msg)`, so the caller's `or!`/`err?` sees an error value, never
+the message string itself. A bare `err` returns the generic `"err"` code.
+
+```tim
+f = (b) -> {
+    | b == 0 => err "dv0"   // caller's or! catches this
+    ret 7
+}
+safe = f(0) or! -1          // -1
+```
+
 ### Error Propagation Patterns
 
 ```tim
