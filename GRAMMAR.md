@@ -605,9 +605,14 @@ xor_expr        = and_expr { "xor" and_expr } ;
 
 and_expr        = comparison_expr { "and" comparison_expr } ;
 
-comparison_expr = bitwise_or_expr { comparison_op bitwise_or_expr } ;
+comparison_expr = cons_expr { comparison_op cons_expr } ;
 
 comparison_op   = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
+
+(* List cons, right-associative: `1 :: 2 :: xs` prepends, so the new list has
+   the element at index 0 and old elements shifted up one index. Binds tighter
+   than comparison and looser than ranges/arithmetic (like Haskell's `:`). *)
+cons_expr       = bitwise_or_expr [ "::" cons_expr ] ;
 
 bitwise_or_expr = bitwise_xor_expr { "|b" bitwise_xor_expr } ;
 

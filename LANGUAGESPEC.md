@@ -2016,6 +2016,8 @@ nums.length         // 3
 nums[0]             // 1
 nums[1:]            // [2, 3]
 nums + [4, 5]       // [1, 2, 3, 4, 5]
+0 :: nums           // [0, 1, 2, 3] — cons (prepend), right-associative
+1 :: 2 :: [3]       // [1, 2, 3]    — 1 :: (2 :: [3])
 ```
 
 ### Map Operations

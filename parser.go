@@ -4174,13 +4174,13 @@ func (p *Parser) requireOperand(right Expression, op string) Expression {
 }
 
 func (p *Parser) parseComparison() Expression {
-	left := p.parseRange()
+	left := p.parseCons()
 
 	// Check for 'in' operator (membership testing)
 	if p.peek.Type == TOKEN_IN {
 		p.nextToken() // move to left expr
 		p.nextToken() // skip 'in'
-		right := p.parseRange()
+		right := p.parseCons()
 		return &InExpr{Value: left, Container: right}
 	}
 
@@ -4191,8 +4191,29 @@ func (p *Parser) parseComparison() Expression {
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.requireOperand(p.parseRange(), op)
+		right := p.requireOperand(p.parseCons(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
+	}
+
+	return left
+}
+
+// parseCons handles the right-associative list cons operator:
+//
+//	elem :: list
+//
+// prepends elem to list, so `1 :: 2 :: xs` is `1 :: (2 :: xs)`. Binds tighter
+// than comparison and looser than ranges/arithmetic (like Haskell's `:`), so
+// `a + 1 :: xs` conses `a + 1` and `x :: xs == ys` compares the cons result.
+func (p *Parser) parseCons() Expression {
+	left := p.parseRange()
+
+	if p.peek.Type == TOKEN_COLONCOLON {
+		p.nextToken() // move onto '::'
+		p.nextToken() // move onto the right operand
+		p.skipExprNewlines()
+		right := p.requireOperand(p.parseCons(), "::") // right-associative
+		return &BinaryExpr{Left: left, Operator: "::", Right: right}
 	}
 
 	return left

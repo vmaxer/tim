@@ -178,6 +178,24 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
+			name: "cons_operator",
+			// `elem :: list` prepends (right-associative): the new list has the
+			// element at index 0 and the old elements shifted up one index.
+			code: `
+				main = {
+					xs = [3, 4, 5]
+					ys = 1 :: 2 :: xs
+					println(#ys)
+					println(ys[0])
+					println(ys[1])
+					println(ys[2])
+					println(ys[4])
+				}
+			`,
+			expectedOutput: "5\n1\n2\n3\n5\n",
+			expectCompile:  true,
+		},
+		{
 			name: "multi_clause_guard_match",
 			// A multi-clause guard match on one line: the result of a clause must
 			// not swallow the next clause's leading `|` as the pipe operator.

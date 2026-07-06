@@ -3,8 +3,8 @@ package engine
 
 // TimType represents a type in the Tim type system
 type TimType struct {
-	Kind     TypeKind    // The category of type
-	CType    string      // For Foreign types, the C type string (e.g., "char*", "SDL_Window*")
+	Kind     TypeKind // The category of type
+	CType    string   // For Foreign types, the C type string (e.g., "char*", "SDL_Window*")
 	ElemType *TimType // For container types, the element type
 }
 

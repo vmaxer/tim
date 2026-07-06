@@ -95,7 +95,6 @@ type TimCompiler struct {
 	stackOffset          int                           // Current stack offset for variables (logical)
 	maxStackOffset       int                           // Maximum stack offset reached (for frame allocation)
 	runtimeStack         int                           // Actual runtime stack usage (updated during compilation)
-	loopBaseOffsets      map[int]int                   // Loop label -> stackOffset before loop body (for state calculation)
 	labelCounter         int                           // Counter for unique labels (if/else, loops, etc)
 	lambdaCounter        int                           // Counter for unique lambda function names
 	activeLoops          []LoopInfo                    // Stack of active loops (for @N jump resolution)
@@ -114,7 +113,6 @@ type TimCompiler struct {
 	arenaStack           []ArenaScope                  // Stack of active arena scopes
 	globalArenaInit      bool                          // Track if global arena has been initialized
 	importedFunctions    []string                      // Track imported C functions (malloc, free, etc.)
-	cacheEnabledLambdas  map[string]bool               // Track which lambdas use cme
 	deferredExprs        [][]Expression                // Stack of deferred expressions per scope (LIFO order)
 	memoCaches           map[string]bool               // Track memoization caches that need storage allocation
 	currentAssignName    string                        // Name of variable being assigned (for lambda naming)
@@ -243,8 +241,6 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 		cConstants:          make(map[string]*CHeaderConstants),
 		cFunctionLibs:       make(map[string]string),
 		lambdaOffsets:       make(map[string]int),
-		loopBaseOffsets:     make(map[int]int),
-		cacheEnabledLambdas: make(map[string]bool),
 		hotFunctions:        make(map[string]bool),
 		hotFunctionTable:    make(map[string]int),
 		debug:               debugEnabled,
@@ -1635,149 +1631,6 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 		// No symbols to collect from expression statements
 	}
 	return nil
-}
-
-func (fc *TimCompiler) collectLoopsFromExpression(expr Expression) {
-	switch e := expr.(type) {
-	case *LoopExpr:
-		fc.labelCounter++
-		loopLabel := fc.labelCounter
-		baseOffset := fc.stackOffset
-		if VerboseMode {
-			debugf("DEBUG collectLoopsFromExpression: Setting loopBaseOffsets[%d] = %d (stackOffset=%d)\n",
-				loopLabel, baseOffset, fc.stackOffset)
-		}
-		fc.loopBaseOffsets[loopLabel] = baseOffset
-
-		if e.NeedsMaxCheck {
-			fc.updateStackOffset(48)
-		} else {
-			fc.updateStackOffset(24)
-		}
-
-		oldVariables := fc.variables
-		oldMutableVars := fc.mutableVars
-		fc.variables = make(map[string]int)
-		fc.mutableVars = make(map[string]bool)
-		maps.Copy(fc.variables, oldVariables)
-		maps.Copy(fc.mutableVars, oldMutableVars)
-
-		for _, bodyStmt := range e.Body {
-			if err := fc.collectSymbols(bodyStmt); err != nil {
-				return
-			}
-		}
-
-		fc.variables = oldVariables
-		fc.mutableVars = oldMutableVars
-		fc.stackOffset = baseOffset
-
-	case *BinaryExpr:
-		fc.collectLoopsFromExpression(e.Left)
-		fc.collectLoopsFromExpression(e.Right)
-
-	case *CallExpr:
-		for _, arg := range e.Args {
-			fc.collectLoopsFromExpression(arg)
-		}
-
-	case *LambdaExpr:
-		// Don't recurse into lambda bodies - they have their own scope
-		// Lambdas will be processed separately in generateLambdaFunctions()
-
-	case *ListExpr:
-		for _, elem := range e.Elements {
-			fc.collectLoopsFromExpression(elem)
-		}
-
-	case *MapExpr:
-		for i := range e.Keys {
-			fc.collectLoopsFromExpression(e.Keys[i])
-			fc.collectLoopsFromExpression(e.Values[i])
-		}
-
-	case *IndexExpr:
-		fc.collectLoopsFromExpression(e.List)
-		fc.collectLoopsFromExpression(e.Index)
-
-	case *RangeExpr:
-		fc.collectLoopsFromExpression(e.Start)
-		fc.collectLoopsFromExpression(e.End)
-
-	case *ParallelExpr:
-		fc.collectLoopsFromExpression(e.List)
-		fc.collectLoopsFromExpression(e.Operation)
-
-	case *PipeExpr:
-		fc.collectLoopsFromExpression(e.Left)
-		fc.collectLoopsFromExpression(e.Right)
-
-	case *InExpr:
-		fc.collectLoopsFromExpression(e.Value)
-		fc.collectLoopsFromExpression(e.Container)
-
-	case *LengthExpr:
-		fc.collectLoopsFromExpression(e.Operand)
-
-	case *MatchExpr:
-		fc.collectLoopsFromExpression(e.Condition)
-		for _, clause := range e.Clauses {
-			if clause.Guard != nil {
-				fc.collectLoopsFromExpression(clause.Guard)
-			}
-			fc.collectLoopsFromExpression(clause.Result)
-		}
-		if e.DefaultExpr != nil {
-			fc.collectLoopsFromExpression(e.DefaultExpr)
-		}
-
-	case *BlockExpr:
-		if VerboseMode {
-			debugf("DEBUG collectLoopsFromExpression BlockExpr: variables BEFORE = %v, stackOffset=%d\n",
-				fc.variables, fc.stackOffset)
-		}
-		oldVariables := fc.variables
-		oldMutableVars := fc.mutableVars
-		oldStackOffset := fc.stackOffset // Save stackOffset to restore after processing block
-		fc.variables = make(map[string]int)
-		fc.mutableVars = make(map[string]bool)
-		maps.Copy(fc.variables, oldVariables)
-		maps.Copy(fc.mutableVars, oldMutableVars)
-
-		for _, stmt := range e.Statements {
-			if err := fc.collectSymbols(stmt); err != nil {
-				return
-			}
-		}
-
-		fc.variables = oldVariables
-		fc.mutableVars = oldMutableVars
-		fc.stackOffset = oldStackOffset // Restore stackOffset - block variables will be re-allocated in compileExpression
-		if VerboseMode {
-			debugf("DEBUG collectLoopsFromExpression BlockExpr: variables AFTER = %v, stackOffset=%d\n",
-				fc.variables, fc.stackOffset)
-		}
-
-	case *UnaryExpr:
-		fc.collectLoopsFromExpression(e.Operand)
-
-	case *PostfixExpr:
-		fc.collectLoopsFromExpression(e.Operand)
-
-	case *CastExpr:
-		fc.collectLoopsFromExpression(e.Expr)
-
-	case *SliceExpr:
-		fc.collectLoopsFromExpression(e.List)
-		if e.Start != nil {
-			fc.collectLoopsFromExpression(e.Start)
-		}
-		if e.End != nil {
-			fc.collectLoopsFromExpression(e.End)
-		}
-
-	case *NumberExpr, *IdentExpr, *StringExpr, *FStringExpr, *NamespacedIdentExpr:
-	}
 }
 
 func (fc *TimCompiler) isExpressionPure(expr Expression, pureFunctions map[string]bool) bool {
@@ -4123,24 +3976,6 @@ func (fc *TimCompiler) isCFFIStringCall(expr Expression) bool {
 	return false
 }
 
-// Helper to get function names from CHeaderConstants
-func getFunctionNames(constants *CHeaderConstants) []string {
-	names := make([]string, 0, len(constants.Functions))
-	for name := range constants.Functions {
-		names = append(names, name)
-	}
-	return names
-}
-
-// Helper to get map keys for debugging
-func keysOf(m map[string]*CHeaderConstants) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	return keys
-}
-
 // getExprType returns the type of an expression at compile time
 // Returns: "string", "number", "list", "map", "cstring", or "unknown"
 func (fc *TimCompiler) getExprType(expr Expression) string {
@@ -6028,6 +5863,10 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.out.MovMemToReg("rsi", "rsp", 0) // second arg
 			fc.out.AddImmToReg("rsp", 8)
 
+			// Mark the runtime helper used so it actually gets emitted; it
+			// allocates the new list from the arena.
+			fc.trackFunctionCall("_tim_list_cons")
+			fc.usesArenas = true
 			fc.eb.GenerateCallInstruction("_tim_list_cons")
 			// Result pointer in rax, move to xmm0 preserving bit pattern
 			fc.out.SubImmFromReg("rsp", 8)
@@ -8828,121 +8667,6 @@ func (fc *TimCompiler) patchHotFunctionTable() {
 	}
 }
 
-func (fc *TimCompiler) generateCacheLookup() {
-	fc.eb.MarkLabel("_tim_cache_lookup")
-
-	fc.out.PushReg("rbp")
-	fc.out.MovRegToReg("rbp", "rsp")
-	fc.out.PushReg("rbx")
-	fc.out.PushReg("r12")
-	fc.out.PushReg("r13")
-
-	fc.out.MovRegToReg("r12", "rdi")
-	fc.out.MovRegToReg("r13", "rsi")
-
-	fc.out.MovMemToReg("rax", "r12", 0)
-	fc.out.CmpRegToImm("rax", 0)
-	notInitJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-
-	fc.out.MovMemToReg("rdi", "r12", 0)
-	fc.out.MovMemToReg("rsi", "r12", 8)
-
-	fc.out.MovRegToReg("rax", "r13")
-	fc.out.AndRegWithImm("rax", 31)
-
-	fc.out.Emit([]byte{0x48, 0xc1, 0xe0, 0x04})
-	fc.out.AddRegToReg("rax", "rdi")
-	fc.out.MovRegToReg("rbx", "rax")
-
-	fc.out.XorRegWithReg("rcx", "rcx")
-
-	loopStart := fc.eb.text.Len()
-	fc.out.CmpRegToImm("rcx", 32)
-	loopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
-
-	fc.out.MovMemToReg("rax", "rbx", 0)
-	fc.out.CmpRegToReg("rax", "r13")
-	foundJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-
-	fc.out.AddImmToReg("rbx", 16)
-	fc.out.AddImmToReg("rcx", 1)
-	backJump := fc.eb.text.Len()
-	fc.out.JumpUnconditional(int32(loopStart - (backJump + 5)))
-
-	foundLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(foundJump+2, int32(foundLabel-(foundJump+6)))
-	fc.out.LeaMemToReg("rax", "rbx", 8)
-
-	fc.out.PopReg("r13")
-	fc.out.PopReg("r12")
-	fc.out.PopReg("rbx")
-	fc.out.PopReg("rbp")
-	fc.out.Ret()
-
-	notInitLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(notInitJump+2, int32(notInitLabel-(notInitJump+6)))
-
-	loopEndLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(loopEndJump+2, int32(loopEndLabel-(loopEndJump+6)))
-	fc.out.XorRegWithReg("rax", "rax")
-	fc.out.PopReg("r13")
-	fc.out.PopReg("r12")
-	fc.out.PopReg("rbx")
-	fc.out.PopReg("rbp")
-	fc.out.Ret()
-}
-
-func (fc *TimCompiler) generateCacheInsert() {
-	fc.eb.MarkLabel("_tim_cache_insert")
-
-	fc.out.PushReg("rbp")
-	fc.out.MovRegToReg("rbp", "rsp")
-	fc.out.PushReg("rbx")
-	fc.out.PushReg("r12")
-	fc.out.PushReg("r13")
-	fc.out.PushReg("r14")
-	fc.out.PushReg("r15")
-
-	fc.out.MovRegToReg("r12", "rdi")
-	fc.out.MovRegToReg("r13", "rsi")
-	fc.out.MovRegToReg("r14", "rdx")
-
-	fc.out.MovMemToReg("rax", "r12", 0)
-	fc.out.CmpRegToImm("rax", 0)
-	alreadyInitJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpNotEqual, 0)
-
-	// Allocate hash table: malloc(defaultHashTableSize)
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", defaultHashTableSize))
-	fc.callMallocAligned("rax", 5) // 5 pushes after prologue
-	fc.out.MovRegToMem("rax", "r12", 0)
-	fc.out.MovImmToReg("rax", "32")
-	fc.out.MovRegToMem("rax", "r12", 8)
-
-	alreadyInitLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(alreadyInitJump+2, int32(alreadyInitLabel-(alreadyInitJump+6)))
-
-	fc.out.MovMemToReg("rdi", "r12", 0)
-
-	fc.out.MovRegToReg("rax", "r13")
-	fc.out.AndRegWithImm("rax", 31)
-
-	fc.out.Emit([]byte{0x48, 0xc1, 0xe0, 0x04})
-	fc.out.AddRegToReg("rax", "rdi")
-	fc.out.MovRegToMem("r13", "rax", 0)
-	fc.out.MovRegToMem("r14", "rax", 8)
-	fc.out.PopReg("r15")
-	fc.out.PopReg("r14")
-	fc.out.PopReg("r13")
-	fc.out.PopReg("r12")
-	fc.out.PopReg("rbx")
-	fc.out.PopReg("rbp")
-	fc.out.Ret()
-}
-
 func (fc *TimCompiler) generateRuntimeHelpers() {
 	debugf("DEBUG: *** generateRuntimeHelpers() called ***\n")
 	debugf("DEBUG: Used functions: %v\n", fc.usedFunctions)
@@ -8996,17 +8720,6 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 
 	// Generate syscall-based printf runtime on Linux
 	fc.GeneratePrintfSyscallRuntime()
-
-	// Only generate cache functions if actually used (small optimization)
-	if len(fc.cacheEnabledLambdas) > 0 {
-		fc.generateCacheLookup()
-		fc.generateCacheInsert()
-
-		for lambdaName := range fc.cacheEnabledLambdas {
-			cacheName := lambdaName + "_cache"
-			fc.eb.Define(cacheName, "\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00")
-		}
-	}
 
 	// Define memoization caches (for pure function automatic memoization)
 	if len(fc.memoCaches) > 0 {
@@ -10748,10 +10461,15 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 
 	// Generate _tim_list_cons only if used
 	if fc.usedFunctions["_tim_list_cons"] {
-		// Generate _tim_list_cons(element_float, list_ptr_float) -> new_list_ptr
-		// LINKED LIST implementation - creates a cons cell: [head|tail]
-		// Arguments: rdi = element (as float64 bits), rsi = tail pointer (as float64 bits, 0.0 = nil)
-		// Returns: rax = pointer to new cons cell (16 bytes)
+		// _tim_list_cons(element, list) -> new_list_ptr
+		// Arguments: rdi = element (float64 bits), rsi = list pointer (raw bits)
+		// Returns:   rax = pointer to the new list
+		//
+		// Lists are arrays: [count][key0][val0][key1][val1]... with float64
+		// index keys, 16 bytes per entry. Cons builds a NEW list of count+1
+		// entries: the element at index 0 and the old entries shifted up one
+		// index. (An earlier version built linked-list cons cells here, which
+		// nothing else in the runtime understood.)
 		fc.eb.MarkLabel("_tim_list_cons")
 
 		// Function prologue
@@ -10761,44 +10479,84 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		// Save callee-saved registers
 		fc.out.PushReg("r12")
 		fc.out.PushReg("r13")
-
-		// Align stack: call(8) + push rbp(8) + 2 pushes(16) = 32 bytes (ALIGNED)
-		// Need to subtract 8 to be misaligned by 8 before calling arena_alloc
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
+		fc.out.PushReg("r14")
+		fc.out.PushReg("r15")
 
 		// Save arguments
-		fc.out.MovRegToReg("r12", "rdi") // r12 = element bits (head)
-		fc.out.MovRegToReg("r13", "rsi") // r13 = tail pointer bits
+		fc.out.MovRegToReg("r12", "rdi") // r12 = element bits
+		fc.out.MovRegToReg("r13", "rsi") // r13 = old list pointer
 
-		// Allocate 16-byte cons cell from arena (use default arena 0)
-		// Cons cell format: [head: float64][tail: float64] = 16 bytes
+		// r14 = old count (integer)
+		fc.out.MovMemToXmm("xmm0", "r13", 0)
+		fc.out.Cvttsd2si("r14", "xmm0")
+
+		// Allocate 8 + (count+1)*16 bytes from arena 0
+		fc.out.LeaMemToReg("rsi", "r14", 1) // rsi = count + 1
+		fc.out.ShlImmReg("rsi", 4)          // *16
+		fc.out.AddImmToReg("rsi", 8)        // + count header
 		fc.out.LeaSymbolToReg("rdi", "_tim_arena_meta")
-		fc.out.MovMemToReg("rdi", "rdi", 0) // rdi = meta-arena array pointer
-		fc.out.MovMemToReg("rdi", "rdi", 0) // rdi = arena[0] struct pointer
-		fc.out.MovImmToReg("rsi", "16")     // rsi = 16 bytes
+		fc.out.MovMemToReg("rdi", "rdi", 0)        // rdi = meta-arena array pointer
+		fc.out.MovMemToReg("rdi", "rdi", 0)        // rdi = arena[0] struct pointer
+		fc.out.SubImmFromReg("rsp", StackSlotSize) // arena_alloc alignment convention
 		fc.callFunction("_tim_arena_alloc", "")
-		// rax now contains pointer to cons cell
+		fc.out.AddImmToReg("rsp", StackSlotSize)
+		fc.out.MovRegToReg("r15", "rax") // r15 = new list
 
-		// Write head (element) at [cell+0]
+		// new[0] = count + 1 (as float)
+		fc.out.LeaMemToReg("rcx", "r14", 1)
+		fc.out.Cvtsi2sd("xmm0", "rcx")
+		fc.out.MovXmmToMem("xmm0", "r15", 0)
+
+		// Entry 0: key 0.0, value = element
+		fc.out.XorRegWithReg("rcx", "rcx")
+		fc.out.Cvtsi2sd("xmm0", "rcx")
+		fc.out.MovXmmToMem("xmm0", "r15", 8) // key 0.0
 		fc.out.SubImmFromReg("rsp", 8)
 		fc.out.MovRegToMem("r12", "rsp", 0)
 		fc.out.MovMemToXmm("xmm0", "rsp", 0)
 		fc.out.AddImmToReg("rsp", 8)
-		fc.out.MovXmmToMem("xmm0", "rax", 0)
+		fc.out.MovXmmToMem("xmm0", "r15", 16) // value = element
 
-		// Write tail pointer at [cell+8]
-		fc.out.SubImmFromReg("rsp", 8)
-		fc.out.MovRegToMem("r13", "rsp", 0)
-		fc.out.MovMemToXmm("xmm0", "rsp", 0)
-		fc.out.AddImmToReg("rsp", 8)
-		fc.out.MovXmmToMem("xmm0", "rax", 8)
+		// Copy old entries shifted one index up:
+		//   for i in 0..count-1:
+		//     new[8 + (i+1)*16]     = i+1        (key)
+		//     new[8 + (i+1)*16 + 8] = old value  (from [old + 8 + i*16 + 8])
+		fc.out.XorRegWithReg("rcx", "rcx") // rcx = i
+		consLoopStart := fc.eb.text.Len()
+		fc.out.CmpRegToReg("rcx", "r14")
+		consLoopEndJump := fc.eb.text.Len()
+		fc.out.JumpConditional(JumpGreaterOrEqual, 0) // i >= count: done
+		consLoopEndEnd := fc.eb.text.Len()
 
-		// Return cons cell pointer in rax
+		// Destination address: rdi = r15 + 8 + (i+1)*16
+		fc.out.LeaMemToReg("rdi", "rcx", 1)
+		fc.out.ShlImmReg("rdi", 4)
+		fc.out.AddImmToReg("rdi", 8)
+		fc.out.AddRegToReg("rdi", "r15")
+		// Key i+1 as float
+		fc.out.LeaMemToReg("rdx", "rcx", 1)
+		fc.out.Cvtsi2sd("xmm0", "rdx")
+		fc.out.MovXmmToMem("xmm0", "rdi", 0)
+		// Source value address: rsi = r13 + 8 + i*16 + 8
+		fc.out.MovRegToReg("rsi", "rcx")
+		fc.out.ShlImmReg("rsi", 4)
+		fc.out.AddImmToReg("rsi", 16)
+		fc.out.AddRegToReg("rsi", "r13")
+		fc.out.MovMemToXmm("xmm0", "rsi", 0)
+		fc.out.MovXmmToMem("xmm0", "rdi", 8)
 
-		// Restore stack alignment
-		fc.out.AddImmToReg("rsp", StackSlotSize)
+		fc.out.IncReg("rcx")
+		fc.out.JumpUnconditional(int32(consLoopStart - (fc.eb.text.Len() + UnconditionalJumpSize)))
+
+		consLoopEnd := fc.eb.text.Len()
+		fc.patchJumpImmediate(consLoopEndJump+2, int32(consLoopEnd-consLoopEndEnd))
+
+		// Return the new list pointer in rax
+		fc.out.MovRegToReg("rax", "r15")
 
 		// Restore callee-saved registers
+		fc.out.PopReg("r15")
+		fc.out.PopReg("r14")
 		fc.out.PopReg("r13")
 		fc.out.PopReg("r12")
 
@@ -13313,118 +13071,6 @@ func (fc *TimCompiler) compileWholeNumberToString(intReg, bufPtr string) {
 	// End
 	normalEnd := fc.eb.text.Len()
 	fc.patchJumpImmediate(normalEndJump+1, int32(normalEnd-normalEndEnd))
-}
-
-func (fc *TimCompiler) compileTailCall(call *CallExpr) {
-	// Tail recursion optimization for "me" self-reference
-	// Instead of calling, we update parameters and jump to function start
-
-	fc.tailCallsOptimized++
-
-	if len(call.Args) != len(fc.currentLambda.Params) {
-		compilerError("tail call to 'me' has %d args but function has %d params",
-			len(call.Args), len(fc.currentLambda.Params))
-	}
-
-	// Step 1: Evaluate all arguments and save to temporary stack locations
-	// We need temporaries because arguments may reference current parameters
-	tempOffsets := make([]int, len(call.Args))
-	for i, arg := range call.Args {
-		// Evaluate argument
-		fc.compileExpression(arg) // Result in xmm0
-
-		// Save to temporary stack location
-		fc.out.SubImmFromReg("rsp", 16)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-		tempOffsets[i] = fc.stackOffset + 16*(i+1)
-	}
-
-	// Step 2: Copy temporary values to parameter locations
-	// Parameters are at [rbp - offset] where offset is in fc.variables
-	for i, paramName := range fc.currentLambda.Params {
-		paramOffset := fc.variables[paramName]
-		tempStackPos := 16 * (len(call.Args) - 1 - i)
-
-		// Load from temporary location
-		fc.out.MovMemToXmm("xmm0", "rsp", tempStackPos)
-
-		// Store to parameter location
-		fc.out.MovXmmToMem("xmm0", "rbp", -paramOffset)
-	}
-
-	// Step 3: Clean up temporary stack space
-	fc.out.AddImmToReg("rsp", int64(16*len(call.Args)))
-
-	// Step 4: Jump back to lambda body start (tail recursion!)
-	jumpOffset := int32(fc.lambdaBodyStart - (fc.eb.text.Len() + 5))
-	fc.out.JumpUnconditional(jumpOffset)
-}
-
-func (fc *TimCompiler) compileCachedCall(call *CallExpr) {
-	if fc.currentLambda == nil {
-		compilerError("cme can only be used inside a lambda function")
-	}
-
-	numArgs := len(call.Args)
-	if numArgs < 1 || numArgs > 3 {
-		compilerError("cme requires 1-3 arguments: cme(arg) or cme(arg, max_size) or cme(arg, max_size, cleanup_fn)")
-	}
-
-	fc.cacheEnabledLambdas[fc.currentLambda.Name] = true
-	cacheName := fc.currentLambda.Name + "_cache"
-
-	fc.compileExpression(call.Args[0])
-
-	fc.out.SubImmFromReg("rsp", 32)
-	fc.out.MovXmmToMem("xmm0", "rsp", 0)
-
-	fc.out.LeaSymbolToReg("rdi", cacheName)
-	fc.out.MovMemToXmm("xmm0", "rsp", 0)
-	fc.out.MovqXmmToReg("rsi", "xmm0")
-
-	fc.trackFunctionCall("_tim_cache_lookup")
-	fc.out.CallSymbol("_tim_cache_lookup")
-
-	fc.out.CmpRegToImm("rax", 0)
-	cacheHitJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpNotEqual, 0)
-
-	fc.out.MovMemToXmm("xmm0", "rsp", 0)
-	fc.out.SubImmFromReg("rsp", 8)
-
-	callPos := fc.eb.text.Len()
-	fc.eb.callPatches = append(fc.eb.callPatches, CallPatch{
-		position:   callPos + 1,
-		targetName: fc.currentLambda.Name,
-	})
-	fc.out.Emit([]byte{0xE8, 0x78, 0x56, 0x34, 0x12})
-
-	fc.out.AddImmToReg("rsp", 8)
-	fc.out.MovXmmToMem("xmm0", "rsp", 8)
-
-	fc.out.LeaSymbolToReg("rdi", cacheName)
-	fc.out.MovMemToXmm("xmm0", "rsp", 0)
-	fc.out.MovqXmmToReg("rsi", "xmm0")
-	fc.out.MovMemToXmm("xmm0", "rsp", 8)
-	fc.out.MovqXmmToReg("rdx", "xmm0")
-
-	fc.trackFunctionCall("_tim_cache_insert")
-	fc.out.CallSymbol("_tim_cache_insert")
-
-	fc.out.MovMemToXmm("xmm0", "rsp", 8)
-
-	skipInsertJump := fc.eb.text.Len()
-	fc.out.JumpUnconditional(0)
-
-	cacheHitLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(cacheHitJump+2, int32(cacheHitLabel-(cacheHitJump+6)))
-
-	fc.out.MovMemToXmm("xmm0", "rax", 0)
-
-	skipInsertLabel := fc.eb.text.Len()
-	fc.patchJumpImmediate(skipInsertJump+1, int32(skipInsertLabel-(skipInsertJump+5)))
-
-	fc.out.AddImmToReg("rsp", 32)
 }
 
 func (fc *TimCompiler) compileTailRecursiveCall(call *CallExpr) {

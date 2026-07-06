@@ -7020,6 +7020,48 @@ func (acg *ARM64CodeGen) generateListBuiltinHelpers() error {
 	acg.out.MovReg64("x0", "x22")
 	acg.listHelperEpilogue()
 
+	// _tim_list_cons(x0=element bits, x1=list_ptr) -> x0=new_ptr : list with the
+	// element prepended at index 0 (old elements shift up one slot). The `::`
+	// operator's runtime (`1 :: xs`).
+	acg.eb.MarkLabel("_tim_list_cons")
+	acg.listHelperPrologue()
+	if err := acg.out.StrImm64("x0", "sp", 48); err != nil { // stash element (survives alloc)
+		return err
+	}
+	acg.out.MovReg64("x19", "x1") // old list ptr
+	if err := acg.out.LdrImm64Double("d0", "x19", 0); err != nil {
+		return err
+	}
+	if err := acg.out.FcvtzsDoubleToInt64("x20", "d0"); err != nil { // count
+		return err
+	}
+	acg.out.AddImm64("x21", "x20", 1) // new count = count + 1
+	if err := acg.emitListAlloc("x21"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x22", "x0")
+	if err := acg.out.ScvtfInt64ToDouble("d0", "x21"); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64Double("d0", "x22", 0); err != nil { // store new length
+		return err
+	}
+	// Element (raw bits) into slot 0.
+	if err := acg.out.LdrImm64("x10", "sp", 48); err != nil {
+		return err
+	}
+	if err := acg.out.StrImm64("x10", "x22", 8); err != nil {
+		return err
+	}
+	// Copy old elements into slots 1..count.
+	acg.out.AddImm64("x11", "x19", 8)  // src = &old elem0
+	acg.out.AddImm64("x12", "x22", 16) // dst = &new elem1
+	if err := acg.emitListCopyLoop("x20", "x11", "x12"); err != nil {
+		return err
+	}
+	acg.out.MovReg64("x0", "x22")
+	acg.listHelperEpilogue()
+
 	// _tim_pop(x0=list_ptr) -> x0=ptr to flat 2-tuple [new_list_ptr, popped].
 	// new_list is a copy without the last element; popped is the last value
 	// (NaN for an empty list). new_list_ptr is stored scvtf-encoded so the
