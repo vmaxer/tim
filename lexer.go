@@ -278,20 +278,6 @@ func (l *Lexer) peek() byte {
 	return 0
 }
 
-// peekAhead looks n characters ahead (0-indexed from current position)
-func (l *Lexer) peekAhead(n int) byte {
-	if l.pos+1+n < len(l.input) {
-		return l.input[l.pos+1+n]
-	}
-	return 0
-}
-
-func (l *Lexer) advance() {
-	if l.pos < len(l.input) {
-		l.pos++
-	}
-}
-
 // LexerState represents a saved lexer state for lookahead
 type LexerState struct {
 	pos       int
@@ -358,6 +344,12 @@ func (l *Lexer) NextToken() Token {
 			if l.input[l.pos] == '\\' && l.pos+1 < len(l.input) {
 				l.pos += 2 // Skip backslash and next character
 			} else {
+				// Track newlines inside multi-line strings so line/column
+				// positions of all subsequent tokens stay accurate.
+				if l.input[l.pos] == '\n' {
+					l.line++
+					l.lineStart = l.pos + 1
+				}
 				l.pos++
 			}
 		}
@@ -450,6 +442,11 @@ func (l *Lexer) NextToken() Token {
 				if l.input[l.pos] == '\\' && l.pos+1 < len(l.input) {
 					l.pos += 2
 				} else {
+					// Track newlines (same as plain strings) so positions stay accurate.
+					if l.input[l.pos] == '\n' {
+						l.line++
+						l.lineStart = l.pos + 1
+					}
 					l.pos++
 				}
 			}
