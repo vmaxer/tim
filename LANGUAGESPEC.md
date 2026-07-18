@@ -6,24 +6,32 @@
 
 This document describes the complete semantics, behavior, and design philosophy of the Tim programming language. For the formal grammar, see [GRAMMAR.md](GRAMMAR.md).
 
-## ⚠️ CRITICAL: The Universal Type
+## Values and the Universal Number
 
-Tim has exactly ONE type: `map[uint64]float64`
-
-Not "represented as" or "backed by" — every value IS this map:
+Tim values are numbers, strings, lists, maps and functions. There is exactly one
+number type, `num`, and it grows as needed:
 
 ```tim
-42              // {0: 42.0}
-"Hello"         // {0: 72.0, 1: 101.0, 2: 108.0, 3: 108.0, 4: 111.0}
-[1, 2, 3]       // {0: 1.0, 1: 2.0, 2: 3.0}
-{x: 10}         // {hash("x"): 10.0}
-[]              // {}
+42                 // exact integer
+2 ** 200           // exact integer: 1606938044258990275541962092341162602522202993782792835301376
+7 / 2              // exact rational, prints 3.5
+1 / 3              // exact rational, prints 1/3
+0.1 + 0.2 == 0.3   // yes: decimal literals are exact
+sqrt(2)            // inexact float64: 1.414214
+x as float64       // explicit conversion to inexact
 ```
 
-There are NO special types, NO primitives, NO exceptions.
-Everything is a map from uint64 to float64.
-
-This is not an implementation detail — this IS Tim.
+- **Exact numbers** are integers of any size and rationals. Integer and decimal
+  literals (`42`, `0.1`, `1e-7`, `0xFF`) are exact. `+ - * / % **` on exact numbers
+  never overflow and never round; `/` gives a rational when the division is not even.
+- **Inexact numbers** are IEEE-754 float64. They come from `sqrt`, `sin`, `log`, `exp`
+  and friends, from C (`float`, `double`), and from `x as float64`. Any operation with
+  an inexact operand gives an inexact result.
+- Exact and inexact numbers compare numerically: `1 == 1.0`, `1 / 3 < 0.34`.
+- Rationals print as exact decimals when they terminate (`3.5`, `0.125`) and as
+  `n/d` otherwise (`22/7`). Inexact numbers print with up to six decimals.
+- Lists and maps print in full, nested ones included: `[[1, 2], 3]`, `{a: 1}`.
+- `floor`, `ceil`, `round` and `abs` keep exact numbers exact.
 
 ## Table of Contents
 
@@ -48,13 +56,11 @@ This is not an implementation detail — this IS Tim.
 
 Tim brings together several novel or rare features that distinguish it from other systems programming languages:
 
-### 1. Universal Map Type System
+### 1. One Universal Number Type
 
-The entire language is built on a single type: `map[uint64]float64`. Every value—numbers, strings, lists, functions—IS this map. This radical simplification enables:
-- No type system complexity
-- Uniform memory representation
-- Natural duck typing
-- Simple FFI (cast to native types only at boundaries)
+`num` covers exact integers of any size, exact rationals and inexact floats, so there
+is no `int`/`float`/`bigint`/`decimal` choice to make and no silent overflow or
+rounding in exact code. See [Values and the Universal Number](#values-and-the-universal-number).
 
 ### 2. Direct Machine Code Generation
 
@@ -209,10 +215,15 @@ add = (x, y) -> x + y             // multiple lambda parameters
 All bitwise operations are suffixed with `b` to eliminate ambiguity:
 
 ```tim
-<<b >>b <<<b >>>b    // Shifts and rotates
-&b |b ^b !b ~b          // Bitwise logic
+<<  >>               // Shift left and right
+<<<  >>>             // Rotate left and right
+&b |b ^b !b ~b       // Bitwise logic
 ?b                   // Bit test (tests if bit at position is set)
 ```
+
+Each of the four also has an assign form: `=<<`, `=>>`, `=<<<`, `=>>>`
+(`x =<< 1` is `x = x << 1`). The `b`-suffixed forms (`<<b`, `>>>b`, ...) are
+aliases for their bare counterparts.
 
 ### 7. Explicit String Encoding
 
@@ -227,9 +238,16 @@ runes = text.runes   // Map of Unicode code points {0: rune0, 1: rune1, ...}
 Network-style message passing for concurrency:
 
 ```tim
-&8080 <- "Hello"     // Send to channel
-msg <= &8080         // Receive from channel
+enet.send(":8080", "Hello")     // Send a datagram (returns bytes sent)
+
+for from, msg in ":8080" ! 10 { // Receive up to 10 messages
+    println(from, msg)          // from is the sender's port
+}
 ```
+
+`enet.send` is a builtin and can be used anywhere an expression can. The
+receive loop is `for sender, message in ":port"`; a `!` bound limits how many
+messages it accepts before exiting.
 
 ### 9. Fork-Based Process Model
 
@@ -310,10 +328,14 @@ factorial = (n, acc) -> (n == 0) {
 x = ??  // Uses OS CSPRNG
 ```
 
-### 16. Memory Ownership Operator `µ` (Prefix)
+### 16. Ownership Transfer with Postfix `!`
+
+`x!` moves a value out of `x`; reading `x` afterwards is a compile error.
+After a call expression the same `!` is a raw bitcast of the return value:
 
 ```tim
-new_owner = µold_owner  // Transfer ownership
+new_owner = old_owner!  // Transfer ownership
+bits = fetch()!         // Raw bitcast of the return value
 ```
 
 ### 17. Result Type with NaN Error Encoding
@@ -335,7 +357,7 @@ y := 100    // Mutable (explicit)
 ### Core Principles
 
 1. **Simplicity over complexity**
-   - One universal type (map)
+   - One universal number type
    - Minimal syntax
    - Direct code generation
 
@@ -363,21 +385,30 @@ y := 100    // Mutable (explicit)
 
 ## Type System
 
-Tim uses a **universal map type**: `map[uint64]float64`
+Tim values are numbers (`num`, see [Values and the Universal Number](#values-and-the-universal-number)),
+strings, lists, maps and functions.
 
-Every value in Tim IS `map[uint64]float64`:
+- **Strings**: ordered maps from index to character code
+- **Lists**: ordered maps from index to value
+- **Maps**: ordered maps from key to value
+- **Functions**: closures (code pointer and captured environment)
 
-- **Numbers**: `{0: number_value}`
-- **Strings**: `{0: char0, 1: char1, 2: char2, ...}`
-- **Lists**: `{0: elem0, 1: elem1, 2: elem2, ...}`
-- **Objects**: `{key_hash: value, ...}`
-- **Functions**: `{0: code_pointer, 1: closure_data, ...}`
+### Representation
 
-There are no special cases. No "single entry maps", no "byte indices", no "field hashes" — just uint64 keys and float64 values in every case.
+Every value is one 64-bit word. Integers with |n| < 2^53 are stored as plain float64,
+big integers and rationals are NaN-boxed pointers to heap objects, and every other
+float64 is an inexact number (a NaN carries an error code, see Error Handling).
+Arithmetic runs inline on the float64 fast path and calls a small runtime
+(`numrt/num.c`) for big integers, rationals and overflow. An inexact float64 that
+happens to be integral and below 2^53 is indistinguishable from the exact integer.
+Strings, lists and maps are pointers to ordered maps.
+
+All three backends (x86_64, arm64, riscv64) implement exact arithmetic with the
+same runtime, so a program prints the same numbers on every target.
 
 ### Type Annotations
 
-Type annotations are **optional metadata** that specify semantic intent and guide FFI conversions. They do NOT change the runtime representation (always `map[uint64]float64`).
+Type annotations are **optional metadata** that specify semantic intent and guide FFI conversions. They never change a value's runtime representation.
 
 **Native Tim types:**
 ```tim
@@ -470,16 +501,17 @@ x: num = num * 2       // OK - type annotation vs variable
 Tim has a dedicated boolean type with two values: `yes` and `no`.
 
 **Representation:**
-Booleans are `map[uint64]float64` with a special marker to distinguish them from numbers:
+Booleans are the numbers `1` and `0`:
 ```tim
-yes    // {0: 1.0, 1: 1.0}  (marker: key 1 exists with value 1.0)
-no     // {0: 0.0, 1: 0.0}  (marker: key 1 exists with value 0.0)
+yes    // 1
+no     // 0
 ```
 
-**Key distinction:** Booleans are NOT the same as `1.0` and `0.0`:
+Comparisons return `yes`/`no`, so boolean literals and numbers interchange
+freely:
 ```tim
-yes == 1.0      // no (different internal structure)
-no == 0.0       // no (different internal structure)
+yes == 1.0      // yes
+no == 0.0       // yes
 yes == yes      // yes
 no == no        // yes
 ```
@@ -649,6 +681,19 @@ nums[0] <- 99    // Update list element
 
 config := { port: 8080 }
 config.port <- 9000  // Update map field
+```
+
+Updating a map key that does not exist **inserts** it: the map grows as a
+fresh copy and the variable is rebound, so other references keep the old map.
+Keys keep their names, so `for k, v in m` yields them:
+
+```tim
+m := { a: 1 }
+m.b <- 2        // insert by field
+m["c"] <- 3     // insert by literal key
+k = "d"
+m[k] <- 4       // insert by runtime key
+println(#m)     // 4
 ```
 
 ### Multiple Assignment (Tuple Unpacking)
@@ -855,7 +900,7 @@ add = (x, y) -> x + y
 // With optional 'fun' keyword for clarity
 fun factorial = n -> {
     result := 1
-    @ i in 1..n {
+    for i in 1..n {
         result *= i
     }
     result
@@ -977,9 +1022,9 @@ The composition operator provides a concise way to build complex transformations
 
 ### Variadic Functions
 
-> **Status: NOT YET WORKING.** Variadic functions parse and compile, but calling
-> one currently segfaults at runtime (the variadic argument-list machinery is
-> incomplete). The design below is the intended behavior; do not rely on it yet.
+> **Status: NOT YET WORKING.** Variadic functions are rejected at compile time
+> (the variadic argument-list machinery is incomplete). The design below is the
+> intended behavior; do not rely on it yet.
 
 Functions can accept a variable number of arguments using the `...` suffix on the last parameter:
 
@@ -987,7 +1032,7 @@ Functions can accept a variable number of arguments using the `...` suffix on th
 // Simple variadic function
 sum = (first, rest...) -> {
     total := first
-    @ item in rest {
+    for item in rest {
         total <- total + item
     }
     total
@@ -1003,7 +1048,7 @@ printf = (format, args...) -> {
 
 // All arguments variadic
 log = (messages...) -> {
-    @ msg in messages {
+    for msg in messages {
         println(msg)
     }
 }
@@ -1029,7 +1074,7 @@ When calling a variadic function, you can:
 // Define variadic function
 max = (nums...) -> {
     result := nums[0]
-    @ n in nums {
+    for n in nums {
         ? n > result { result <- n }
     }
     result
@@ -1051,7 +1096,7 @@ max(1, 2, values..., 99)  // 99
 ### Infinite Loop
 
 ```tim
-@ {
+for {
     println("Forever")
 }
 ```
@@ -1059,7 +1104,7 @@ max(1, 2, values..., 99)  // 99
 ### Counted Loop
 
 ```tim
-@ 10 {
+for 10 {
     println("Hello")
 }
 ```
@@ -1067,12 +1112,12 @@ max(1, 2, values..., 99)  // 99
 ### Range Loop
 
 ```tim
-@ i in 0..10 {
+for i in 0..10 {
     println(i)
 }
 
 // With step
-@ i in 0..100..10 {  // 0, 10, 20, ...
+for i in 0..100..10 {  // 0, 10, 20, ...
     println(i)
 }
 ```
@@ -1081,10 +1126,31 @@ max(1, 2, values..., 99)  // 99
 
 ```tim
 nums = [1, 2, 3, 4, 5]
-@ n in nums {
+for n in nums {
     println(n)
 }
 ```
+
+### Pair Loop
+
+`for k, v in c` iterates keys together with values. For lists `k` is the
+index; for maps it is the key name, falling back to the raw numeric key for
+entries that have no name:
+
+```tim
+xs = [10, 20]
+for i, v in xs {
+    println(i, v)      // 0 10 / 1 20
+}
+
+m := { a: 1, b: 2 }
+for k, v in m {
+    println(k, v)      // a 1 / b 2
+}
+```
+
+A string-literal iterable is a network receive loop instead of pair
+iteration: `for from, msg in ":8080" { ... }`.
 
 ### Loop Control
 
@@ -1093,15 +1159,15 @@ Tim supports both traditional and modern loop control syntax:
 **Traditional syntax** (using `ret @`):
 ```tim
 // Exit current loop
-@ i in 0..<100 {
+for i in 0..<100 {
     i > 50 { ret @ }      // Exit current loop
     i == 42 { ret @ 42 }  // Exit loop with value 42
     println(i)
 }
 
 // Nested loops with explicit labels
-@ i in 0..<10 {           // Loop @1 (outer)
-    @ j in 0..<10 {       // Loop @2 (inner)
+for i in 0..<10 {           // Loop @1 (outer)
+    for j in 0..<10 {       // Loop @2 (inner)
         j == 5 { ret @ }         // Exit inner loop (@2)
         i == 5 { ret @1 }        // Exit outer loop (@1)
         i == 3 and j == 7 { ret @1 42 }  // Exit outer loop with value
@@ -1129,10 +1195,10 @@ foreach i in 0..<10 {      // Loop @1
 }
 
 // foreach is syntax sugar for @ ... in
-foreach x in items { process(x) }  // Same as: @ x in items { process(x) }
+foreach x in items { process(x) }  // Same as: for x in items { process(x) }
 ```
 
-**Recommendation:** Use `foreach/break/continue` for familiar C-style loops, use `@ / ret @` for advanced control flow.
+**Recommendation:** Use `foreach/break/continue` for familiar C-style loops, use `for / ret @` for advanced control flow.
 
 **Loop Label Numbering:**
 
@@ -1151,21 +1217,22 @@ Loops are automatically numbered from **outermost to innermost**:
 
 ### Loop `!` Keyword
 
-Loops with unknown bounds or modified counters require `!`:
+Loops with unknown bounds or modified counters require `!`. The bound is a
+maximum iteration count: exceeding it stops the loop.
 
 ```tim
 // Counter modified in loop
-@ i in 0..<10 ! 20 {
-    i++  // Modified counter, needs !
+for i in 0..<10 ! 20 {
+    i <- i + 1  // Modified counter, needs !
 }
 
 // Unknown iteration count
-@ msg in read_channel() ! inf {
+for msg in read_channel() ! inf {
     process(msg)
 }
 
 // Condition-based loop
-@ x < threshold ! 1000 {
+for x < threshold ! 1000 {
     x = compute_next(x)
 }
 ```
@@ -1220,7 +1287,7 @@ data <= &"server:9000"    // Receive from remote
 ```tim
 // Worker pattern
 worker = -> {
-    @ {
+    for {
         task <= &8080
         result = process(task)
         &8081 <- result
@@ -1228,9 +1295,9 @@ worker = -> {
 }
 
 // Pipeline pattern
-stage1 = -> @ { &8080 <- generate_data() }
-stage2 = -> @ { data <= &8080; &8081 <- transform(data) }
-stage3 = -> @ { result <= &8081; save(result) }
+stage1 = -> for { &8080 <- generate_data() }
+stage2 = -> for { data <= &8080; &8081 <- transform(data) }
+stage3 = -> for { result <= &8081; save(result) }
 ```
 
 **Note:** ENet channels are compiled directly into machine code that uses ENet library calls.
@@ -1633,7 +1700,7 @@ event := c.calloc(1, 128)! as SDL_Event  // Allocates and zeros 128 bytes
 
 **What IS builtin:**
 - **Operators:** `#`, arithmetic, logic, bitwise, etc.
-- **Control flow:** `@` loops, match blocks, `ret`, `defer`
+- **Control flow:** `for` loops, match blocks, `ret`, `defer`
 - **Core I/O:** `print`, `println`, `printf`, `eprint`, `eprintln`, `eprintf`, `exitln`, `exitf`
 - **List operations:** `head()`, `tail()`
 - **Keywords:** `arena`, `unsafe`, `cstruct`, `import`, etc.
@@ -1799,7 +1866,7 @@ See [PLATFORM_ARCHITECTURE.md](PLATFORM_ARCHITECTURE.md) for the full design rat
 | arm64-linux | arm64 | Linux | 🚧 90% (needs defer, dynamic linking) |
 | arm64-darwin | arm64 | macOS | ❌ Not started |
 | arm64-windows | arm64 | Windows | ❌ Not started |
-| riscv64-linux | riscv64 | Linux | 🚧 80% (needs testing) |
+| riscv64-linux | riscv64 | Linux | 🚧 Subset: numbers, strings, flat lists, top-level functions, match/if, loops, printing; no closures, maps or FFI |
 
 ### Syntax
 
@@ -2045,7 +2112,7 @@ abs(x)
 
 ### Result Type Design
 
-Tim uses **NaN-boxing** to encode errors within float64 values. This elegant approach, inspired by ENet's use of bit patterns for encoding flags and types, keeps everything as `map[uint64]float64` while enabling robust error handling.
+Tim uses **NaN-boxing** to encode errors within float64 values. This elegant approach, inspired by ENet's use of bit patterns for encoding flags and types, keeps every value in a single 64-bit word while enabling robust error handling.
 
 **Encoding Scheme:**
 - **Success values:** Regular float64 (standard IEEE 754 representation)
@@ -2099,7 +2166,7 @@ Error codes are exactly 4 bytes (null-padded if shorter), encoded as 32-bit inte
 ```tim
 // Arithmetic errors
 x = 10 / 0              // Error: "dv0 " (division by zero)
-y = 2 ** 1000           // Error: "ovf " (overflow)
+y = 2 ** (2 ** 40)      // Error: "ovf " (result too large to represent)
 
 // Index errors
 xs = [1, 2, 3]
@@ -2442,7 +2509,7 @@ tim --version
 
 - **x86_64** (AMD64) - Primary platform
 - **ARM64** (AArch64) - Full support
-- **RISCV64** - Full support
+- **RISCV64** - Subset (see Supported Targets)
 
 ### Compilation Process
 
@@ -2557,7 +2624,7 @@ println("Hello, World!")
 // Iterative
 factorial = n -> {
     result := 1
-    @ i in 1..n {
+    for i in 1..n {
         result *= i
     }
     result
@@ -2576,7 +2643,7 @@ println(factorial(5, 1))  // 120
 ### FizzBuzz
 
 ```tim
-@ i in 1..100 {
+for i in 1..100 {
     result = i % 15 {
         0 -> "FizzBuzz"
         ~> i % 3 {
@@ -2674,7 +2741,7 @@ println(f"Results: {results}")
 ```tim
 // Simple echo server
 server =>> {
-    @ {
+    for {
         request <= &8080
         println(f"Received: {request}")
         &8080 <- f"Echo: {request}"
@@ -2778,7 +2845,7 @@ init_sdl = () => {
 main = () => {
     window, renderer = init_sdl()
 
-    @ frame in 0..<100 ! 200 {
+    for frame in 0..<100 ! 200 {
         // Clear screen to black
         sdl.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
         sdl.SDL_RenderClear(renderer)
@@ -2808,7 +2875,7 @@ main()
 process_requests = requests -> {
     arena {
         results := []
-        @ req in requests {
+        for req in requests {
             result = handle_request(req)
             results <- results + [result]
         }
@@ -2846,24 +2913,19 @@ cas = (ptr, old, new) => unsafe int32 {
 
 ## Design Rationale
 
-### Why One Universal Type?
+### Why One Number Type?
 
-Traditional languages have complex type hierarchies:
-- Primitive types (int, float, char, bool)
-- Reference types (objects, arrays, strings)
-- Special types (null, undefined, NaN)
-- Type conversions and coercions
-- Boxing/unboxing overhead
+Most languages make you choose between `int`, `float`, `bigint` and `decimal`, and
+then surprise you with overflow (`2**63`), rounding (`0.1 + 0.2 != 0.3`) or
+truncation (`7 / 2 == 3`).
 
-**Tim's approach:** Everything is `map[uint64]float64`
+**Tim's approach:** one `num` type that is exact until you ask for a float.
 
 **Benefits:**
-1. **Conceptual simplicity:** Learn one type, understand the entire language
-2. **Implementation simplicity:** One memory layout, one set of operations
-3. **No type coercion bugs:** No implicit conversions to reason about
-4. **Uniform FFI:** Cast to C types only at boundaries
-5. **Natural duck typing:** If it has the key, it works
-6. **Optimization freedom:** Compiler can represent values efficiently while preserving semantics
+1. **Correct by default:** integer and rational arithmetic never overflows or rounds
+2. **Nothing to choose:** literals, loop counters and money all use the same type
+3. **Fast where it matters:** small integers and floats run inline as float64
+4. **Explicit inexactness:** floats come from math functions, C, or `as float64`
 
 ### Why Direct Machine Code Generation?
 
@@ -2887,7 +2949,7 @@ Most compilers use intermediate representations (IR):
 - Manual optimization (no LLVM optimization passes)
 - More maintenance burden
 
-**Why it's worth it:** Tim's simplicity makes per-architecture code manageable. The universal type system means optimizations work uniformly across all values.
+**Why it's worth it:** Tim's simplicity makes per-architecture code manageable.
 
 ### Why Fork-Based Parallelism?
 
@@ -2970,7 +3032,7 @@ Many languages accumulate features:
 **Tim's approach:** Minimal, orthogonal features
 
 **Examples:**
-- One loop construct: `@`
+- One loop construct: `for`
 - One function syntax: `=>`
 - One block syntax: `{ }`
 - Disambiguate by contents, not syntax
@@ -3067,15 +3129,12 @@ Faster than C for:
 - Compilation (direct code generation)
 - FFI (no marshalling overhead)
 
-### Is the universal type system really practical?
+### Is exact arithmetic slow?
 
-Yes, with caveats:
-- **Numbers:** Zero overhead (compiler optimizes to registers)
-- **Small strings:** Some overhead (map allocation)
-- **Large data:** Similar to C (heap allocation either way)
-- **FFI:** Zero overhead (direct casts at boundaries)
-
-The compiler's type tracking (see TYPE_TRACKING.md) eliminates most overhead.
+No, not for ordinary code:
+- **Small integers and floats:** inline float64 instructions plus one range check
+- **Big integers and rationals:** a call into the numeric runtime, which allocates
+- **FFI:** exact numbers are converted to float64 or int64 at the C boundary
 
 ### Why not use LLVM?
 

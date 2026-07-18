@@ -1,0 +1,2 @@
+printf("value: %d\n", 99)
+printf("pi-ish: %f\n", 3.5)

@@ -1,0 +1,5 @@
+cstruct Pair { a as float64, b as float64 }
+mk = x -> Pair(x, x * 2)
+p := mk(5.0)
+println(p.a)
+println(p.b)

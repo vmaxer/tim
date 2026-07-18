@@ -6,47 +6,40 @@
 
 This document defines the complete formal grammar of the Tim programming language using Extended Backus-Naur Form (EBNF).
 
-## ⚠️ CRITICAL: The Universal Type
+## Values and the Universal Number
 
-Tim has exactly ONE runtime type: `map[uint64]float64`, an ordered map.
-
-Not "represented as" or "backed by" — every value IS this map:
-
-```tim
-42              // {0: 42.0}
-"Hello"         // {0: 72.0, 1: 101.0, 2: 108.0, 3: 108.0, 4: 111.0}
-[1, 2, 3]       // {0: 1.0, 1: 2.0, 2: 3.0}
-{x: 10}         // {hash("x"): 10.0}
-[]              // {}
-{}              // {}
-```
-
-**Even C foreign types are stored as maps:**
+Tim values are numbers, strings, lists, maps and functions. There is exactly one
+number type, `num`, and it grows as needed:
 
 ```tim
-// C pointer (0x7fff1234) stored as float64 bits
-ptr: cptr = sdl.SDL_CreateWindow(...)  // {0: <pointer_as_float64>}
-
-// C string pointer
-err: cstring = sdl.SDL_GetError()      // {0: <char*_as_float64>}
-
-// C int
-result: cint = sdl.SDL_Init(...)       // {0: 1.0} or {0: 0.0}
+42                 // exact integer
+2 ** 200           // exact integer: 1606938044258990275541962092341162602522202993782792835301376
+7 / 2              // exact rational, prints 3.5
+1 / 3              // exact rational, prints 1/3
+0.1 + 0.2 == 0.3   // yes: decimal literals are exact
+sqrt(2)            // inexact float64: 1.414214
+x as float64       // explicit conversion to inexact
 ```
 
-There are NO special types, NO primitives, NO exceptions.
-Everything is a map from uint64 to float64.
-
-This is not an implementation detail — this IS Tim.
+- **Exact numbers** are integers of any size and rationals. Integer and decimal
+  literals (`42`, `0.1`, `1e-7`, `0xFF`) are exact. `+ - * / % **` on exact numbers
+  never overflow and never round; `/` gives a rational when the division is not even.
+- **Inexact numbers** are IEEE-754 float64. They come from `sqrt`, `sin`, `log`, `exp`
+  and friends, from C (`float`, `double`), and from `x as float64`. Any operation with
+  an inexact operand gives an inexact result.
+- Exact and inexact numbers compare numerically: `1 == 1.0`, `1 / 3 < 0.34`.
+- Rationals print as exact decimals when they terminate (`3.5`, `0.125`) and as
+  `n/d` otherwise (`22/7`). Inexact numbers print with up to six decimals.
+- `floor`, `ceil`, `round` and `abs` keep exact numbers exact.
 
 ## Type Annotations
 
 Type annotations are **metadata** that specify:
-1. **Semantic intent** - what does this map represent?
+1. **Semantic intent** - what does this value represent?
 2. **FFI conversions** - how to marshal at C boundaries
 3. **Optimization hints** - compiler optimizations
 
-They do NOT change the runtime representation (always `map[uint64]float64`).
+They never change a value's runtime representation.
 
 ### Native Tim Types
 - `num` - number (default type)
@@ -315,7 +308,7 @@ import "github.com/user/simplelib" as lib
 
 // No prefixes needed - feels like built-in functions!
 init_window(800, 600, "My App")
-@ {
+for {
     clear_screen(0)
     draw_rect(100, 100, 50, 50, 0xFF0000)
     draw_circle(400, 300, 30, 0x00FF00)
@@ -494,7 +487,15 @@ statement       = assignment
                 | import_statement
                 | export_statement ;
 
-return_statement = "ret" [ "@" [ integer ] ] [ expression ] ;
+(* A loop label is written with the digits attached to the '@' (@1, @2, ...).
+   Labels are numbered from the outermost loop ( @1 ) to the innermost.
+   A bare '@' (with no digits) refers to the innermost loop. *)
+loop_label      = "@" digit { digit } ;
+
+(* `ret @1 42` exits loop @1 with value 42. `ret @ 42` exits the innermost
+   loop with value 42: here the integer is the value, not a label, because
+   loop labels are written with the digits attached. *)
+return_statement = "ret" [ loop_label | "@" ] [ expression ] ;
 
 (* err msg returns a NaN-boxed error: desugars to `ret error(msg)`.
    A bare err returns the generic "err" code. *)
@@ -536,14 +537,22 @@ c_type          = "int8" | "int16" | "int32" | "int64"
 
 arena_statement = "arena" block ;
 
-loop_statement  = "@" block
-                | "@" identifier "in" expression [ "!" expression ] block
-                | "@" expression [ "!" expression ] block
+(* `for k, v in c` pairs keys with values: lists yield (index, value), maps
+   yield (key name or the raw key, value). A string-literal iterable is a
+   receive loop instead of pair iteration. *)
+loop_statement  = "while" expression block
+                | "for" [ "!" expression ] block
+                | "for" expression block
+                | "for" expression "!" expression block
+                | "for" identifier [ iterator_type ] "in" expression [ "!" expression ] block
+                | "for" identifier "," identifier "in" expression [ "!" expression ] block
                 | "foreach" identifier "in" expression [ "!" expression ] block
-                | "break" [ "@" [ integer ] ]
-                | "continue" [ "@" [ integer ] ] ;
+                | "break" [ loop_label ]
+                | "continue" [ loop_label ] ;
 
-parallel_statement = "||" identifier "in" expression block ;
+iterator_type   = ( "as" | ":" ) identifier ;
+
+parallel_statement = "||" identifier "in" expression [ "!" expression ] block ;
 
 unsafe_statement = "unsafe" type_cast block [ block ] [ block ] ;
 
@@ -554,7 +563,7 @@ type_cast       = "int8" | "int16" | "int32" | "int64"
                 | "packed" | "aligned" ;
 
 assignment      = [ "fun" ] identifier [ ":" type_annotation ] ("=" | ":=" | "<-") expression
-                | identifier ("+=" | "-=" | "*=" | "/=" | "%=" | "**=") expression
+                | identifier ("+=" | "-=" | "*=" | "/=" | "%=" | "**=" | "=<<" | "=>>" | "=<<<" | "=>>>") expression
                 | indexed_expr "<-" expression
                 | identifier_list ("=" | ":=" | "<-") expression ;  // Multiple assignment
 
@@ -567,6 +576,9 @@ native_type     = "num" | "str" | "list" | "map" | "bool" ;
 foreign_type    = "cstring" | "cptr" | "cint" | "clong"
                 | "cfloat" | "cdouble" | "cbool" | "cvoid" ;
 
+(* Map update: `m[k] <- v` writes the entry when the key exists and inserts
+   it otherwise (the map grows as a fresh copy and the variable is rebound,
+   so other references keep the old map). Field form: `m.name <- v`. *)
 indexed_expr    = identifier "[" expression "]" ;
 
 expression_statement = expression [ match_block ] ;
@@ -581,9 +593,11 @@ guard_clause    = "|" expression "=>" match_target ;  // | must be at start of l
 
 default_arm     = ( "~>" | "_" "=>" ) match_target ;
 
-match_target    = jump_target | expression ;
-
-jump_target     = integer ;
+match_target    = expression
+                | return_statement
+                | error_statement
+                | assignment
+                | block ;
 
 block           = "{" { statement { newline } } [ expression ] "}" ;
 
@@ -597,11 +611,12 @@ receive_expr    = "<=" pipe_expr | or_bang_expr ;
 
 or_bang_expr    = send_expr { ( "or!" | "¤" ) send_expr } ;  // ¤ (U+00A4) is a one-character alias for or!
 
-send_expr       = or_expr { "<-" or_expr } ;
+(* The send operator was replaced by the enet.send builtin. *)
+send_expr       = compose_expr ;
 
-or_expr         = and_expr { "or" and_expr } ;
+compose_expr    = or_expr { "<>" or_expr } ;
 
-xor_expr        = and_expr { "xor" and_expr } ;
+or_expr         = and_expr { ( "or" | "xor" ) and_expr } ;
 
 and_expr        = comparison_expr { "and" comparison_expr } ;
 
@@ -612,33 +627,45 @@ comparison_op   = "==" | "!=" | "<" | "<=" | ">" | ">=" ;
 (* List cons, right-associative: `1 :: 2 :: xs` prepends, so the new list has
    the element at index 0 and old elements shifted up one index. Binds tighter
    than comparison and looser than ranges/arithmetic (like Haskell's `:`). *)
-cons_expr       = bitwise_or_expr [ "::" cons_expr ] ;
+cons_expr       = range_expr [ "::" cons_expr ] ;
 
-bitwise_or_expr = bitwise_xor_expr { "|b" bitwise_xor_expr } ;
+(* Ranges: 0..<10 exclusive, 0..10 inclusive. The third operand is a step:
+   0..100..10 yields 0, 10, 20, ... A bare range in expression position
+   evaluates to the list of its values. *)
+range_expr      = additive_expr [ range_op additive_expr [ ".." additive_expr ] ] ;
 
-bitwise_xor_expr = bitwise_and_expr { "^b" bitwise_and_expr } ;
+range_op        = ".." | "..<" ;
 
-bitwise_and_expr = shift_expr { "&b" shift_expr } ;
+additive_expr   = bitwise_expr { ("+" | "-") bitwise_expr } ;
 
-shift_expr      = additive_expr { shift_op additive_expr } ;
+(* All bitwise and shift operators share one precedence level and bind
+   tighter than + and -: `1 + 2 &b 3` is `1 + (2 &b 3)`. *)
+bitwise_expr    = multiplicative_expr { bitwise_op multiplicative_expr } ;
 
-shift_op        = "<<b" | ">>b" | "<<<b" | ">>>b" ;
-
-additive_expr   = multiplicative_expr { ("+" | "-") multiplicative_expr } ;
+(* `<<`/`>>` shift, `<<<`/`>>>` rotate. The `b`-suffixed forms are aliases.
+   Each also has an assign form: `=<<`, `=>>`, `=<<<`, `=>>>`. *)
+bitwise_op      = "&b" | "|b" | "^b" | "?b"
+                | "<<" | ">>" | "<<<" | ">>>"
+                | "<<b" | ">>b" | "<<<b" | ">>>b" ;
 
 multiplicative_expr = power_expr { ("*" | "/" | "%") power_expr } ;
 
-power_expr      = unary_expr { ( "**" | "^" ) unary_expr } ;
+(* Power is right-associative: `2 ** 3 ** 2` is `2 ** (3 ** 2)`. `^` is an
+   alias for `**`. *)
+power_expr      = unary_expr [ ( "**" | "^" ) power_expr ] ;
 
-unary_expr      = ( "-" | "not" | "!b" | "~b" | "#" | "µ" ) unary_expr
+unary_expr      = ( "-" | "not" | "!b" | "~b" | "#" ) unary_expr
                 | postfix_expr ;
 
 postfix_expr    = primary_expr { postfix_op } ;
 
+(* postfix "!" moves a value (use-after-move is a compile error); after a call
+   expression it is a raw bitcast of the return value. *)
 postfix_op      = "[" expression "]"
                 | "." ( identifier | integer )
                 | "(" [ argument_list ] ")"
                 | "#"
+                | "!"
                 | match_block ;
 
 primary_expr    = identifier
@@ -762,7 +789,7 @@ map_entry       = ( identifier | string ) ":" expression ;
 
 identifier      = letter { letter | digit | "_" } ;
 
-number          = [ "-" ] digit { digit } [ "." digit { digit } ] ;
+number          = decimal | hex | binary ;              (* see Numbers *)
 
 string          = '"' { character } '"' ;
 
@@ -801,7 +828,7 @@ my-var     // contains hyphen
 
 ### Booleans
 
-Booleans are `map[uint64]float64` with a special marker value:
+Booleans are the numbers `1` and `0`, spelled `yes` and `no`:
 
 ```ebnf
 boolean = "yes" | "no" ;
@@ -809,8 +836,18 @@ boolean = "yes" | "no" ;
 
 **Examples:**
 ```tim
-yes             // {0: 1.0, 1: 1.0} (marker: key 1 exists with value 1.0)
-no              // {0: 0.0, 1: 0.0} (marker: key 1 exists with value 0.0)
+yes             // 1
+no              // 0
+```
+
+Comparisons return `yes`/`no`, so a comparison result and a boolean literal
+are the same value and interchange freely:
+
+```tim
+yes == 1.0      // yes
+no == 0.0       // yes
+(x > 0) { yes => "positive" no => "non-positive" }
+(x > 0) { 1 => "positive" 0 => "non-positive" }   // same match
 ```
 
 **Conversions:**
@@ -821,45 +858,41 @@ no              // {0: 0.0, 1: 0.0} (marker: key 1 exists with value 0.0)
 - `yes as num` → `1.0`
 - `no as num` → `0.0`
 
-**Comparison with numbers:**
-Booleans are NOT the same as `1.0` or `0.0`. They have a distinct internal representation:
-```tim
-yes == 1.0      // no (different internal structure)
-no == 0.0       // no (different internal structure)
-yes == yes      // yes (same boolean value)
-no == no        // yes (same boolean value)
-```
-
 **Default return value:**
 Functions that don't explicitly return a value return `1.0` (number). To return a boolean success indicator, explicitly use `yes` or `no`.
 
 ### Numbers
 
-Numbers are `map[uint64]float64` with a single entry at key 0:
+Number literals are exact (see [Values and the Universal Number](#values-and-the-universal-number)):
 
 ```ebnf
-number = [ "-" ] digit { digit } [ "." digit { digit } ] ;
+number   = decimal | hex | binary ;
+decimal  = digit { digit } [ "." digit { digit } ] [ exponent ] ;
+exponent = ( "e" | "E" ) [ "+" | "-" ] digit { digit } ;
+hex      = "0" ( "x" | "X" ) hexdigit { hexdigit } ;
+binary   = "0" ( "b" | "B" ) ( "0" | "1" ) { "0" | "1" } ;
 ```
+
+A leading `-` is the unary minus operator.
 
 **Examples:**
 ```tim
-42              // {0: 42.0}
-3.14159         // {0: 3.14159}
--17             // {0: -17.0}
-0.001           // {0: 0.001}
-1000000         // {0: 1000000.0}
--273.15         // {0: -273.15}
+42                       // exact integer
+18446744073709551616     // exact integer (2^64)
+0xFFFFFFFFFFFFFFFF       // exact integer
+3.14159                  // exact rational 314159/100000
+1e-7                     // exact rational 1/10000000
+-273.15                  // exact rational
 ```
 
 **Special values:**
-- `??` - cryptographically secure random number [0, 1) → `{0: random_value}`
-- Result of `0/0` - NaN (used for error encoding) → `{0: NaN}`
-
-**Note:** While the values stored happen to be IEEE 754 doubles, this is an implementation detail. Numbers ARE maps, not primitives.
+- `??` - cryptographically secure random inexact number in [0, 1)
+- `inf` - inexact positive infinity
+- Result of `0/0` - an error value (NaN with the `dv0` code)
 
 ### Strings
 
-Strings are `map[uint64]float64` where keys are indices and values are character codes:
+Strings are ordered maps where keys are indices and values are character codes:
 
 ```ebnf
 string = '"' { character } '"' ;
@@ -916,7 +949,8 @@ No multi-line comments.
 
 ```
 ret arena unsafe cstruct as defer spawn import shadow yes no
-fun if elif else break continue foreach malloc free
+fun if elif else break continue foreach for while malloc free
+err export use alias in and or xor not
 ```
 
 **Note:** In Tim, lambda definitions use `->` (thin arrow) and match arms use `=>` (fat arrow), similar to Rust syntax, except that `~>` is used for the default case.
@@ -1000,7 +1034,7 @@ defer c.free(ptr)
 
 **What IS builtin:**
 - Operators: `#`, arithmetic, logic, bitwise
-- Control flow: `@`, match blocks, `ret`
+- Control flow: `for`, match blocks, `ret`
 - Core I/O: `print`, `println`, `printf` (and error/exit variants)
 - List operations: `head()`, `tail()`
 - Keywords: `arena`, `unsafe`, `cstruct`, `defer`, etc.
@@ -1098,6 +1132,8 @@ bit3 = x ?b 3  // Returns 0 (bit 3 is not set)
 | `<=`     | Comparison        | Less than or equal                 | `x <= 10`                          |
 | `>=`     | Comparison        | Greater than or equal              | `x >= 10`                          |
 
+Loops use `for`; `@` marks loop labels (`@1`, `ret @`), never loops.
+
 **Important Conventions:**
 - **Functions/methods** should use `=` (immutable), not `:=`, since they rarely need reassignment
 - **Lambda syntax**: `->` always defines a lambda, `=>` always defines a match arm
@@ -1139,11 +1175,13 @@ When a function returns a list, multiple assignment unpacks the elements:
 <>    Function composition (f <> g creates a new function that applies g then f)
 <-    Update/Send (update mutable var OR send to ENet)
 <=    Receive (ENet, prefix) OR less-than-or-equal comparison
-µ     Memory ownership/movement operator (prefix)
+!     Postfix move: `x!` transfers ownership (use-after-move is a compile error);
+      after a call it is a raw bitcast of the return value: `f()!`
 .     Field access
 []    Indexing
 ()    Function call (parentheses optional for zero or one argument in some contexts)
-@     Loop
+for   Loop
+@1    Loop label (with ret/break/continue: `ret @`, `ret @1 42`)
 &     ENet address (network endpoints)
 $     Address value (memory addresses)
 ??    Random number (cryptographically safe)
@@ -1154,29 +1192,27 @@ or!   Error/null handler (executes right side if left is error or null pointer)
 
 From highest to lowest precedence:
 
-1. **Primary**: `()` `[]` `.` function call, postfix `#`
-2. **Unary**: `-` `not` `!b` `#` `µ`
-3. **Power**: `**`
+1. **Primary**: `()` `[]` `.` function call, postfix `#`, postfix `!`, postfix match `{ }`
+2. **Unary**: `-` `not` `!b` `~b` `#`
+3. **Power**: `**` `^` (right-associative)
 4. **Multiplicative**: `*` `/` `%`
-5. **Additive**: `+` `-`
-6. **Shift**: `<<b` `>>b` `<<<b` `>>>b`
-7. **Bitwise AND**: `&b`
-8. **Bitwise XOR**: `^b`
-9. **Bitwise OR**: `|b`
-10. **Comparison**: `==` `!=` `<` `<=` `>` `>=`
-11. **Logical AND**: `and`
-12. **Logical OR**: `or`
-13. **Or-bang**: `or!`
+5. **Bitwise**: `&b` `|b` `^b` `?b` `<<b` `>>b` `<<<b` `>>>b`
+6. **Additive**: `+` `-`
+7. **Range**: `..` `..<`
+8. **Cons**: `::`
+9. **Comparison**: `==` `!=` `<` `<=` `>` `>=`
+10. **Logical AND**: `and`
+11. **Logical OR/XOR**: `or` `xor`
+12. **Or-bang**: `or!` `¤`
+13. **Send**: `<-`
 14. **Function Composition**: `<>`
-15. **Send**: `<-`
-16. **Receive**: `<=`
-17. **Pipe**: `|` `||`
-18. **Match**: `{ }` (postfix)
-19. **Assignment**: `=` `:=` `<-` `+=` `-=` `*=` `/=` `%=` `**=`
+15. **Receive**: `<=` (prefix)
+16. **Pipe**: `|` `||`
+17. **Assignment**: `=` `:=` `<-` `+=` `-=` `*=` `/=` `%=` `**=`
 
 **Associativity:**
 - Left-associative: All binary operators except `**` and assignments
-- Right-associative: `**`, all assignments
+- Right-associative: `**`, `::`, all assignments
 - Non-associative: Comparison operators (can't chain)
 
 ## Parsing Rules
@@ -1277,7 +1313,7 @@ greet = { println("Hi") }  // No-arg lambda
 ```tim
 // Inferred lambda (in assignment context):
 greet = { println("Hello!") }            // Inferred: greet = -> { println("Hello!") }
-worker = { @ { process_forever() } }     // Inferred: worker = -> { @ { process_forever() } }
+worker = { for { process_forever() } }   // Inferred: worker = -> { for { process_forever() } }
 
 // Explicit no-argument lambda:
 greet = -> println("Hello!")             // Explicit ->
@@ -1285,13 +1321,13 @@ handler = -> process_events()            // Explicit ->
 
 // With block body:
 worker = {                               // Inferred lambda
-    @ { process_forever() }
+    for { process_forever() }
 }
 
 // Common use cases:
 init = { setup_resources() }             // Inferred (assignment context)
 cleanup = { release_all() }              // Inferred (assignment context)
-background = { @ { poll_events() } }     // Inferred (assignment context)
+background = { for { poll_events() } }   // Inferred (assignment context)
 
 // When explicit -> is needed:
 callbacks = [-> print("A"), -> print("B")]  // Not in assignment, need explicit ->
@@ -1300,13 +1336,17 @@ process(-> get_data())                      // Function argument, need explicit 
 
 #### Loop Forms
 
-The `@` symbol introduces loops (one of three forms):
+The `for` keyword introduces loops (one of four forms):
 
 ```tim
-@ { ... }                  // Infinite loop
-@ i in collection { ... }  // For-each loop
-@ condition { ... }        // While loop
+for { ... }                  // Infinite loop
+for 10 { ... }               // Counted loop (runs the body 10 times)
+for i in collection { ... }  // For-each loop
+for condition ! N { ... }    // Condition loop (`!` gives the max iteration count)
 ```
+
+The `@` sigil is reserved for loop labels (`@1`, `@2`, `ret @`, ...) and never
+starts a loop.
 
 **Loop Control with `ret @` and Numbered Labels:**
 
@@ -1318,17 +1358,20 @@ Instead of `break`/`continue` keywords, Tim uses `ret @` with automatically numb
 - `@3` = third level (nested inside @2)
 - `@` = current/innermost loop
 
+Labels are written with the digits attached (`@1`); a bare `@` followed by a
+space and an expression is the innermost loop plus a value.
+
 ```tim
 // Exit current loop
-@ i in 0..<100 {
+for i in 0..<100 {
     i > 50 { ret @ }      // Exit current loop (same as ret @1 here)
-    i == 42 { ret @ 42 }  // Exit loop with value 42
+    i == 42 { ret @ 42 }  // Exit the innermost loop with value 42
     println(i)
 }
 
 // Nested loops with numbered labels
-@ i in 0..<10 {           // Loop @1 (outermost)
-    @ j in 0..<10 {       // Loop @2 (inner)
+for i in 0..<10 {           // Loop @1 (outermost)
+    for j in 0..<10 {       // Loop @2 (inner)
         j == 5 { ret @ }         // Exit loop @2 (innermost)
         i == 5 { ret @1 }        // Exit loop @1 (outer)
         i == 3 and j == 7 { ret @1 42 }  // Exit loop @1 with value
@@ -1338,7 +1381,7 @@ Instead of `break`/`continue` keywords, Tim uses `ret @` with automatically numb
 
 // ret without @ returns from function (not loop)
 compute = n -> {
-    @ i in 0..<100 {
+    for i in 0..<100 {
         i == n { ret i }  // Return from function
         i == 50 { ret @ } // Exit loop only, continue function
     }
@@ -1346,18 +1389,29 @@ compute = n -> {
 }
 ```
 
+`break`, `break @1`, `continue`, `continue @1` are sugar for loop exits and
+continuations.
+
+**Ranges with steps:**
+
+```tim
+for i in 0..100..10 { println(i) }  // 0, 10, 20, ..., 100
+for i in 0..<10..2 { println(i) }   // 0, 2, 4, 6, 8
+```
+
 **Loop `!` Keyword:**
 
-Loops with unknown bounds or modified counters require `!`:
+Loops with unknown bounds or modified counters require `!`. The bound is a
+maximum iteration count: exceeding it stops the loop.
 
 ```tim
 // Counter modified, needs !
-@ i in 0..<10 ! 20 {
-    i++  // Modified counter
+for i in 0..<10 ! 20 {
+    i <- i + 1  // Modified counter
 }
 
 // Unknown iterations, needs !
-@ msg in read_channel() ! inf {
+for msg in read_channel() ! inf {
     process(msg)
 }
 ```
@@ -1455,18 +1509,19 @@ The `&` symbol creates ENet addresses (network endpoints):
 **Examples:**
 ```tim
 // Loops (statement context)
-@ { println("Forever") }           // Infinite loop
-@ i in [1, 2, 3] { println(i) }    // For-each loop
-@ x < 10 ! 100 { x = x + 1 }       // While loop (condition loops require `!`)
+for { println("Forever") }           // Infinite loop
+for i in [1, 2, 3] { println(i) }    // For-each loop
+for x < 10 ! 100 { x = x + 1 }       // Condition loop (requires `!`)
 
 // Addresses (expression context)
-server = @8080                      // Address literal
+listen(&8080)                       // Function call with address
+server = &8080                      // Address literal
 client = &localhost:9000            // Address with hostname
 remote = &192.168.1.100:3000        // Address with IP
 
 // Unambiguous in context
 listen(&8080)                       // Function call with address
-@ x > 0 ! 100 { send(&8080, data) }   // Loop with address inside
+for x > 0 ! 100 { send(&8080, data) }   // Loop with address inside
 ```
 
 #### Block vs Map vs Match
@@ -1481,7 +1536,7 @@ x { 0 -> "zero" }        // Match: contains ->
 
 ## Error Handling and Result Types
 
-Tim uses a **Result type** for operations that can fail. A Result is still `map[uint64]float64`, but with special semantic meaning tracked by the compiler.
+Tim uses a **Result type** for operations that can fail. A Result is still a single value, with special semantic meaning tracked by the compiler.
 
 ### Result Type Design
 
@@ -1763,7 +1818,7 @@ The `or!` operator:
 
 ## Type Annotations
 
-Type annotations are **optional metadata** that specify semantic intent and guide FFI marshalling. They do NOT change the runtime representation (always `map[uint64]float64`).
+Type annotations are **optional metadata** that specify semantic intent and guide FFI marshalling. They never change a value's runtime representation.
 
 ### Syntax
 

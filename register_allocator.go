@@ -22,6 +22,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 )
 
@@ -188,9 +189,9 @@ func (ra *RegisterAllocator) UseVariable(varName string) {
 
 	// Update the most recent def-use chain
 	if len(ra.defUseChains) > 0 {
-		for i := len(ra.defUseChains) - 1; i >= 0; i-- {
-			if ra.defUseChains[i].VarName == varName {
-				ra.defUseChains[i].UsePos = append(ra.defUseChains[i].UsePos, ra.position)
+		for _, v := range slices.Backward(ra.defUseChains) {
+			if v.VarName == varName {
+				v.UsePos = append(v.UsePos, ra.position)
 				break
 			}
 		}
@@ -442,8 +443,8 @@ func (ra *RegisterAllocator) GenerateEpilogue(out *Out) {
 		}
 
 		// Pop callee-saved registers in reverse order
-		for i := len(usedRegs) - 1; i >= 0; i-- {
-			out.PopReg(usedRegs[i])
+		for _, usedReg := range slices.Backward(usedRegs) {
+			out.PopReg(usedReg)
 		}
 
 	case ArchARM64:

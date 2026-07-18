@@ -8,8 +8,7 @@ import (
 // TestBlockArgumentsCurrentState documents what works and what doesn't
 // with passing blocks as arguments
 func TestBlockArgumentsCurrentState(t *testing.T) {
-	t.Run("pipeline with lambda - not fully implemented", func(t *testing.T) {
-		t.Skip("Pipeline operator with lambdas not fully implemented yet")
+	t.Run("pipeline with lambda", func(t *testing.T) {
 		source := `
 numbers := [1, 2, 3, 4, 5]
 doubled := numbers | x -> x * 2
@@ -114,7 +113,6 @@ printf("Result: %f\n", apply(y -> y * 3, 7))
 
 // TestPipelineOperator - documenting that pipeline with lambdas needs implementation
 func TestPipelineOperator(t *testing.T) {
-	t.Skip("Pipeline operator with lambdas not yet fully implemented")
 	tests := []struct {
 		name     string
 		source   string
@@ -127,7 +125,7 @@ numbers := [1, 2, 3]
 doubled := numbers | x -> x * 2
 printf("Result: %f %f %f\n", doubled[0], doubled[1], doubled[2])
 `,
-			expected: "Result: 2 4 6",
+			expected: "Result: 2.000000 4.000000 6.000000",
 		},
 		{
 			name: "chained pipelines",
@@ -136,7 +134,7 @@ numbers := [1, 2, 3]
 result := numbers | x -> x * 2 | y -> y + 1
 printf("First: %f\n", result[0])
 `,
-			expected: "First: 3",
+			expected: "First: 3.000000",
 		},
 	}
 

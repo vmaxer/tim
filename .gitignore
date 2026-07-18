@@ -98,3 +98,5 @@ examples/vls
 empty_auth.json
 _tmptest/
 _tmptest_*
+/tim
+coverage.out

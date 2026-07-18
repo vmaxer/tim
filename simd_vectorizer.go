@@ -27,7 +27,7 @@ func (sv *SIMDVectorizer) VectorizeLoop(loop *LoopStmt) bool {
 	}
 
 	// Currently only vectorize simple array operations
-	// Pattern: @ i in range(n) { result[i] = a[i] OP b[i] }
+	// Pattern: for i in range(n) { result[i] = a[i] OP b[i] }
 	if !sv.isSimpleArrayLoop(loop) {
 		return false
 	}
@@ -121,7 +121,7 @@ func (sv *SIMDVectorizer) emitVectorizedLoop(loop *LoopStmt, info *LoopVectoriza
 	// Real implementation would integrate with codegen
 
 	// Example of what we'd generate for:
-	//   @ i in range(100) { c[i] = a[i] + b[i] }
+	//   for i in range(100) { c[i] = a[i] + b[i] }
 	//
 	// Vectorized code (x86-64 AVX, 4 elements at a time):
 	//   mov rcx, 0              ; i = 0
@@ -164,6 +164,12 @@ func vectorizeLoops(stmt Statement) Statement {
 	switch s := stmt.(type) {
 	case *LoopStmt:
 		// Check if this loop can be vectorized
+		if r, ok := s.Iterable.(*RangeExpr); ok && r.Step != nil {
+			for i, bodyStmt := range s.Body {
+				s.Body[i] = vectorizeLoops(bodyStmt)
+			}
+			return s
+		}
 		// Default to x86_64 target for now
 		target := NewTarget(ArchX86_64, OSLinux)
 		analyzer := NewSIMDAnalyzer(target)

@@ -1,0 +1,4 @@
+cstruct Point { x as float64, y as float64 }
+p := Point(3.0, 4.0)
+println(p.x)
+println(p.y)

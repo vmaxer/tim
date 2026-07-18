@@ -1,0 +1,7 @@
+t := 0
+for i in 0..<3 {
+	for j in 0..<3 {
+		t <- t + 1
+	}
+}
+println(t)

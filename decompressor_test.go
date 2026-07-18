@@ -34,7 +34,6 @@ func TestRLECompression(t *testing.T) {
 }
 
 func TestDecompressorStub(t *testing.T) {
-	t.Skip("decompressor stub not fully implemented yet")
 	if testing.Short() {
 		t.Skip("skipping decompressor stub test in short mode")
 	}
@@ -48,7 +47,7 @@ func TestDecompressorStub(t *testing.T) {
 		// mov rdi, 1 (stdout)
 		0x48, 0xC7, 0xC7, 0x01, 0x00, 0x00, 0x00,
 		// lea rsi, [rip + msg]
-		0x48, 0x8D, 0x35, 0x10, 0x00, 0x00, 0x00,
+		0x48, 0x8D, 0x35, 0x19, 0x00, 0x00, 0x00,
 		// mov rdx, 3 (length)
 		0x48, 0xC7, 0xC2, 0x03, 0x00, 0x00, 0x00,
 		// syscall

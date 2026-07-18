@@ -11,8 +11,8 @@
     *   **SIMD & FMA**
 *   **Minimalist Syntax**:
     *   Unified syntax for functions, lambdas, and pattern matching.
-    *   The `@` symbol handles all loops (range, while, infinite, for-each).
-*   **Universal Type System**: Everything is a `map[uint64]float64` at runtime. This eliminates type erasure issues and simplifies serialization, while compile-time annotations (`: num`, `: str`) preserve safety.
+    *   The `for` keyword handles all loops (range, while, infinite, for-each).
+*   **One Number Type**: `num` holds exact integers of any size, exact rationals and inexact floats. `0.1 + 0.2 == 0.3`, `2 ** 200` is exact, and `7 / 2` is `3.5`, not `3`.
 *   **Compact & Standalone**: "Hello World" is ~21KB on Linux. No `libc` dependency on Linux (uses direct syscalls).
 *   **Manual Memory Management w/ Safety**: First-class **Arena** allocators for bulk deallocation and `defer` for resource cleanup. No Garbage Collector pauses.
 
@@ -41,13 +41,15 @@ tim hello.tim -o hello
 
 ## Language Tour
 
-### 1. Everything is a Map
-Tim has one runtime type.
+### 1. One Number Type
+Numbers are exact until you ask for a float.
 ```go
-42              // {0: 42.0}
-"Hi"            // {0: 72.0, 1: 105.0} (ASCII codes)
-[1, 2]          // {0: 1.0, 1: 2.0}
-{x: 10}         // {hash("x"): 10.0}
+2 ** 100          // 1267650600228229401496703205376
+7 / 2             // 3.5 (exact rational)
+1 / 3 + 1 / 6     // 0.5
+22 / 7            // 22/7
+0.1 + 0.2 == 0.3  // yes
+sqrt(2)           // 1.414214 (inexact float64)
 ```
 
 ### 2. Variables & Functions
@@ -76,12 +78,12 @@ sign = x {
 }
 
 // Range Loop
-@ i in 0..<10 {
+for i in 0..<10 {
     println(i)
 }
 
 // While Loop (condition loops require a `!` bound)
-@ count > 0 ! 1000 {
+for count > 0 ! 1000 {
     count <- count - 1
 }
 ```
@@ -184,7 +186,7 @@ tex = sdl.SDL_CreateTextureFromSurface(renderer, bmp) or! {
 defer sdl.SDL_DestroyTexture(tex)
 
 // Main rendering loop. Run for approximately 2 seconds (20 frames * 100ms = 2s)
-@ frame in 0..<20 {
+for frame in 0..<20 {
 
     // Clear screen
     sdl.SDL_RenderClear(renderer)

@@ -11,7 +11,7 @@ result {
         printf("SDL initialized successfully\n")
         
         count := 0
-        @ count < 3 ! inf {
+        for count < 3 ! inf {
             printf("Loop iteration %d\n", count)
             count <- count + 1
             sdl.SDL_Delay(500)

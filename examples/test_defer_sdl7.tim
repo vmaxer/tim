@@ -41,7 +41,7 @@ running := 1
 event := c.malloc(192) as SDL_Event
 null_ptr := 0
 
-@ running > 0 ! 2 {
+for running > 0 ! 2 {
     has_event := sdl.SDL_PollEvent(event)
     sdl.SDL_RenderClear(renderer)
     sdl.SDL_RenderTexture(renderer, tex, null_ptr, null_ptr)

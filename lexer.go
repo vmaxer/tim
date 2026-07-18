@@ -2,6 +2,7 @@
 package main
 
 import (
+	"strconv"
 	"strings"
 	"unicode"
 )
@@ -47,8 +48,10 @@ const (
 	TOKEN_TILDE           // ~
 	TOKEN_DEFAULT_ARROW   // ~>
 	TOKEN_AT              // @
-	TOKEN_AT_AT           // @@ (parallel loop with all cores)
+	TOKEN_AT_AT           // || (parallel loop with all cores)
 	TOKEN_AT_PLUSPLUS     // @++
+	TOKEN_AT_LABEL        // @1, @2, ... (loop label, digits attached)
+	TOKEN_FOR             // for (loop keyword)
 	TOKEN_IN              // in keyword
 	TOKEN_LBRACE          // {
 	TOKEN_RBRACE          // }
@@ -76,37 +79,45 @@ const (
 	TOKEN_ERR_QUESTION    // err? (check if expression is error)
 	TOKEN_VAL_QUESTION    // val? (check if expression has value)
 	// TOKEN_ME and TOKEN_CME removed - recursive calls now use mandatory max
-	TOKEN_RET        // ret keyword (return value from function/lambda)
-	TOKEN_ERR        // err keyword (return error from function/lambda)
-	TOKEN_FUN        // fun keyword (optional function definition marker)
-	TOKEN_IF         // if keyword
-	TOKEN_ELIF       // elif keyword
-	TOKEN_ELSE       // else keyword
-	TOKEN_BREAK      // break keyword (alias for ret @)
-	TOKEN_CONTINUE   // continue keyword (alias for ret @ [])
-	TOKEN_FOREACH    // foreach keyword (alias for @ ... in)
-	TOKEN_WHILE      // while keyword (condition loop without explicit bound)
-	TOKEN_MALLOC     // malloc keyword (arena allocator sugar)
-	TOKEN_FREE       // free keyword (no-op, arena cleanup)
-	TOKEN_AT_FIRST   // @first (first iteration)
-	TOKEN_AT_LAST    // @last (last iteration)
-	TOKEN_AT_COUNTER // @counter (iteration counter)
-	TOKEN_AT_I       // @i (current element/item)
-	TOKEN_PIPE_B     // |b (bitwise OR)
-	TOKEN_AMP_B      // &b (bitwise AND)
-	TOKEN_CARET_B    // ^b (bitwise XOR)
-	TOKEN_TILDE_B    // ~b (bitwise NOT)
-	TOKEN_AMP        // & (used in unsafe blocks, not for lists)
-	TOKEN_UNDERSCORE // _ (wildcard for default match)
-	TOKEN_DOLLAR     // $ (address value operator)
-	TOKEN_MU         // µ (memory ownership/movement operator)
-	TOKEN_LTLT_B     // <<b (shift left)
-	TOKEN_GTGT_B     // >>b (shift right)
-	TOKEN_LTLTLT_B   // <<<b (rotate left)
-	TOKEN_GTGTGT_B   // >>>b (rotate right)
-	TOKEN_QUESTION_B // ?b (bit test)
-	TOKEN_QUESTION   // ? (ternary conditional: cond ? a : b)
-	TOKEN_AS         // as (type casting)
+	TOKEN_RET         // ret keyword (return value from function/lambda)
+	TOKEN_ERR         // err keyword (return error from function/lambda)
+	TOKEN_FUN         // fun keyword (optional function definition marker)
+	TOKEN_IF          // if keyword
+	TOKEN_ELIF        // elif keyword
+	TOKEN_ELSE        // else keyword
+	TOKEN_BREAK       // break keyword (alias for ret @)
+	TOKEN_CONTINUE    // continue keyword (alias for ret @ [])
+	TOKEN_FOREACH     // foreach keyword (alias for @ ... in)
+	TOKEN_WHILE       // while keyword (condition loop without explicit bound)
+	TOKEN_MALLOC      // malloc keyword (arena allocator sugar)
+	TOKEN_FREE        // free keyword (no-op, arena cleanup)
+	TOKEN_AT_FIRST    // @first (first iteration)
+	TOKEN_AT_LAST     // @last (last iteration)
+	TOKEN_AT_COUNTER  // @counter (iteration counter)
+	TOKEN_AT_I        // @i (current element/item)
+	TOKEN_PIPE_B      // |b (bitwise OR)
+	TOKEN_AMP_B       // &b (bitwise AND)
+	TOKEN_CARET_B     // ^b (bitwise XOR)
+	TOKEN_TILDE_B     // ~b (bitwise NOT)
+	TOKEN_AMP         // & (used in unsafe blocks, not for lists)
+	TOKEN_UNDERSCORE  // _ (wildcard for default match)
+	TOKEN_DOLLAR      // $ (address value operator)
+	TOKEN_MU          // µ (memory ownership/movement operator)
+	TOKEN_LTLT        // << (shift left)
+	TOKEN_LTLTLT      // <<< (rotate left)
+	TOKEN_SHL_ASSIGN  // =<< (shift left, assign)
+	TOKEN_ROTL_ASSIGN // =<<< (rotate left, assign)
+	TOKEN_LTLT_B      // <<b (shift left)
+	TOKEN_GTGT        // >> (shift right)
+	TOKEN_GTGTGT      // >>> (rotate right)
+	TOKEN_SHR_ASSIGN  // =>> (shift right, assign)
+	TOKEN_ROTR_ASSIGN // =>>> (rotate right, assign)
+	TOKEN_GTGT_B      // >>b (shift right)
+	TOKEN_LTLTLT_B    // <<<b (rotate left)
+	TOKEN_GTGTGT_B    // >>>b (rotate right)
+	TOKEN_QUESTION_B  // ?b (bit test)
+	TOKEN_QUESTION    // ? (ternary conditional: cond ? a : b)
+	TOKEN_AS          // as (type casting)
 	// Integer type keywords (signed)
 	TOKEN_I8   // i8
 	TOKEN_I16  // i16
@@ -229,6 +240,28 @@ func processEscapeSequences(s string) string {
 				result.WriteRune('\\')
 			case '"':
 				result.WriteRune('"')
+			case 'x':
+				if i+3 < len(runes) {
+					if v, err := strconv.ParseUint(string(runes[i+2:i+4]), 16, 32); err == nil {
+						result.WriteRune(rune(v))
+						i += 2
+						i++
+						continue
+					}
+				}
+				result.WriteRune(runes[i])
+				result.WriteRune(runes[i+1])
+			case 'u':
+				if i+5 < len(runes) {
+					if v, err := strconv.ParseUint(string(runes[i+2:i+6]), 16, 32); err == nil {
+						result.WriteRune(rune(v))
+						i += 4
+						i++
+						continue
+					}
+				}
+				result.WriteRune(runes[i])
+				result.WriteRune(runes[i+1])
 			default:
 				// Unknown escape sequence - keep backslash and the character
 				result.WriteRune(runes[i])
@@ -528,9 +561,7 @@ func (l *Lexer) NextToken() Token {
 		case "while":
 			return Token{Type: TOKEN_WHILE, Value: value, Line: l.line, Column: tokenColumn}
 		case "for":
-			// `for` is a full alias for `@`-loops: lexes to TOKEN_AT so every loop
-			// form (for-each, typed iterator, condition, parallel) works unchanged.
-			return Token{Type: TOKEN_AT, Value: value, Line: l.line, Column: tokenColumn}
+			return Token{Type: TOKEN_FOR, Value: value, Line: l.line, Column: tokenColumn}
 		case "malloc":
 			return Token{Type: TOKEN_MALLOC, Value: value, Line: l.line, Column: tokenColumn}
 		case "free":
@@ -685,7 +716,25 @@ func (l *Lexer) NextToken() Token {
 		l.pos++
 		return Token{Type: TOKEN_COLON, Value: ":", Line: l.line, Column: tokenColumn}
 	case '=':
-		// Check for =>
+		// Assign-forms of the shifts/rotates (longest first), then =>
+		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' &&
+			l.pos+3 < len(l.input) && l.input[l.pos+3] == '<' {
+			l.pos += 4
+			return Token{Type: TOKEN_ROTL_ASSIGN, Value: "=<<<", Line: l.line, Column: tokenColumn}
+		}
+		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' &&
+			l.pos+3 < len(l.input) && l.input[l.pos+3] == '>' {
+			l.pos += 4
+			return Token{Type: TOKEN_ROTR_ASSIGN, Value: "=>>>", Line: l.line, Column: tokenColumn}
+		}
+		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' {
+			l.pos += 3
+			return Token{Type: TOKEN_SHL_ASSIGN, Value: "=<<", Line: l.line, Column: tokenColumn}
+		}
+		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' {
+			l.pos += 3
+			return Token{Type: TOKEN_SHR_ASSIGN, Value: "=>>", Line: l.line, Column: tokenColumn}
+		}
 		if l.peek() == '>' {
 			l.pos += 2
 			return Token{Type: TOKEN_FAT_ARROW, Value: "=>", Line: l.line, Column: tokenColumn}
@@ -723,10 +772,20 @@ func (l *Lexer) NextToken() Token {
 			l.pos += 4
 			return Token{Type: TOKEN_LTLTLT_B, Value: "<<<b", Line: l.line, Column: tokenColumn}
 		}
+		// Check for <<< (rotate left) - before <<b
+		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' {
+			l.pos += 3
+			return Token{Type: TOKEN_LTLTLT, Value: "<<<", Line: l.line, Column: tokenColumn}
+		}
 		// Check for <<b (shift left)
 		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == 'b' {
 			l.pos += 3
 			return Token{Type: TOKEN_LTLT_B, Value: "<<b", Line: l.line, Column: tokenColumn}
+		}
+		// Check for << (shift left)
+		if l.peek() == '<' {
+			l.pos += 2
+			return Token{Type: TOKEN_LTLT, Value: "<<", Line: l.line, Column: tokenColumn}
 		}
 		if l.peek() == '=' {
 			l.pos += 2
@@ -742,10 +801,20 @@ func (l *Lexer) NextToken() Token {
 			l.pos += 4
 			return Token{Type: TOKEN_GTGTGT_B, Value: ">>>b", Line: l.line, Column: tokenColumn}
 		}
+		// Check for >>> (rotate right) - before >>b
+		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' {
+			l.pos += 3
+			return Token{Type: TOKEN_GTGTGT, Value: ">>>", Line: l.line, Column: tokenColumn}
+		}
 		// Check for >>b (shift right)
 		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == 'b' {
 			l.pos += 3
 			return Token{Type: TOKEN_GTGT_B, Value: ">>b", Line: l.line, Column: tokenColumn}
+		}
+		// Check for >> (shift right)
+		if l.peek() == '>' {
+			l.pos += 2
+			return Token{Type: TOKEN_GTGT, Value: ">>", Line: l.line, Column: tokenColumn}
 		}
 		if l.peek() == '=' {
 			l.pos += 2
@@ -830,7 +899,7 @@ func (l *Lexer) NextToken() Token {
 		l.pos++
 		return Token{Type: TOKEN_DOT, Value: ".", Line: l.line, Column: tokenColumn}
 	case '@':
-		// Check for @@ (parallel loop)
+		// Check for || (parallel loop)
 		if l.peek() == '@' {
 			l.pos += 2
 			return Token{Type: TOKEN_AT_AT, Value: "@@", Line: l.line, Column: tokenColumn}
@@ -839,6 +908,16 @@ func (l *Lexer) NextToken() Token {
 		if l.peek() == '+' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '+' {
 			l.pos += 3
 			return Token{Type: TOKEN_AT_PLUSPLUS, Value: "@++", Line: l.line, Column: tokenColumn}
+		}
+
+		// Loop label: @ followed immediately by digits (@1, @2, @42)
+		if l.peek() >= '0' && l.peek() <= '9' {
+			start := l.pos
+			l.pos++ // skip @
+			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+				l.pos++
+			}
+			return Token{Type: TOKEN_AT_LABEL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
 		}
 
 		// Check for special keywords: @first, @last, @counter, @i

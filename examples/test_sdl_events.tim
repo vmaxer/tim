@@ -34,8 +34,8 @@ main = {
     event := (c.malloc(192) as SDL_Event)
     printf("Allocated event with c.malloc at: %p\n", event)
         
-        @ running > 0 ! 300 {
-            @ sdl.SDL_PollEvent(event) > 0 ! 100 {
+        for running > 0 ! 300 {
+            for sdl.SDL_PollEvent(event) > 0 ! 100 {
                 printf("Got event type: %d\n", event.type)
                 event.type {
                     256 => { 

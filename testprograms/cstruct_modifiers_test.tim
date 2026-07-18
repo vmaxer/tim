@@ -1,0 +1,4 @@
+cstruct Mix { n as float64, tag as int32 }
+m := Mix(2.0, 7)
+println(m.n)
+println(m.tag)

@@ -34,12 +34,12 @@ method_decl     = identifier "=" lambda_expr ;
 
 ## Classes and Object-Oriented Programming
 
-Tim supports classes as syntactic sugar over maps and closures, following the philosophy that everything is `map[uint64]float64`.
+Tim supports classes as syntactic sugar over maps and closures.
 
 ### Design Philosophy
 
 - **Syntactic sugar:** Classes compile to regular maps and lambdas
-- **No new types:** Objects are still `map[uint64]float64`
+- **No new types:** Objects are still maps
 - **Composition:** Use `<>` to extend with behavior maps (no inheritance)
 - **Minimal syntax:** Only adds the `class` keyword
 - **Transparent:** You can always see what the class desugars to
@@ -193,7 +193,7 @@ Serializable := {
     to_json: () -> {
         // Serialize instance to JSON string
         keys := this.keys()
-        @ i in 0..<keys.length {
+        for i in 0..<keys.length {
             // Build JSON...
         }
     },
@@ -284,7 +284,7 @@ class Parser {
 
     parse_number = () -> {
         result := 0
-        @ ._peek() >= 48 and ._peek() <= 57 {
+        for ._peek() >= 48 and ._peek() <= 57 {
             result <- result * 10 + (._peek() - 48)
             ._advance()
         }
@@ -310,7 +310,7 @@ class StringBuilder {
 
     build = () => {
         result := ""
-        @ part in .parts {
+        for part in .parts {
             result <- result + part
         }
         ret result

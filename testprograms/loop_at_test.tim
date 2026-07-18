@@ -1,0 +1,4 @@
+for i in 0..<4 {
+	i == 2 { ret @ }
+	println(i)
+}

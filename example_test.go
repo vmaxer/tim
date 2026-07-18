@@ -141,7 +141,7 @@ printf("5 + 10 = %v\n", result)
 // TestLoopWithLabel tests simple loops
 func TestLoopWithLabel(t *testing.T) {
 	code := `
-@ i in 0..<3 {
+for i in 0..<3 {
 	printf("i=%v\n", i)
 }
 `
@@ -168,8 +168,8 @@ result += 9
 printf("Sorted: %v %v %v %v %v %v %v %v\n", result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7])
 `
 	output := compileAndRun(t, code)
-	if !strings.Contains(output, "1.000000 1.000000 2.000000 3.000000 4.000000 5.000000 6.000000 9.000000") {
-		t.Errorf("Expected '1.000000 1.000000 2.000000 3.000000 4.000000 5.000000 6.000000 9.000000' in sorted output, got: %s", output)
+	if !strings.Contains(output, "1 1 2 3 4 5 6 9") {
+		t.Errorf("Expected '1 1 2 3 4 5 6 9' in sorted output, got: %s", output)
 	}
 }
 
@@ -209,15 +209,15 @@ func TestInsertionSort(t *testing.T) {
 	code := `
 // Build a list using += append operator in a loop
 result := []
-@ i in 1..<9 {
+for i in 1..<9 {
 	result += i
 }
 
 printf("Sorted: %v %v %v %v %v %v %v %v\n", result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7])
 `
 	output := compileAndRun(t, code)
-	if !strings.Contains(output, "1.000000 2.000000 3.000000 4.000000 5.000000 6.000000 7.000000 8.000000") {
-		t.Errorf("Expected '1.000000 2.000000 3.000000 4.000000 5.000000 6.000000 7.000000 8.000000' in sorted output, got: %s", output)
+	if !strings.Contains(output, "1 2 3 4 5 6 7 8") {
+		t.Errorf("Expected '1 2 3 4 5 6 7 8' in sorted output, got: %s", output)
 	}
 }
 
@@ -248,7 +248,7 @@ printf("Day 2: %s\n", result)
 func TestForInLoop(t *testing.T) {
 	code := `
 sum := 0
-@ i in 1..<6 {
+for i in 1..<6 {
 	sum += i
 }
 printf("Sum: %v\n", sum)

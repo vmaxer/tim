@@ -69,7 +69,7 @@ println(counter)
 			expected: "1\n2\n2",
 		},
 		{
-			name: "nested_lambda_with_module_global_KNOWN_ISSUE",
+			name: "nested_lambda_with_module_global",
 			source: `state := 10
 outer := (x) -> {
     inner := (y) -> state + x + y
@@ -80,7 +80,7 @@ println(f(3))
 state <- 20
 println(f(3))
 `,
-			expected: "SKIP: Known issue - module-level mutable updates don't reflect in closures",
+			expected: "18\n28\n",
 		},
 		{
 			name: "lambda_modifying_captured_mutable",
@@ -143,7 +143,7 @@ func TestExistingLambdaPrograms(t *testing.T) {
 
 			output, err := runWithTimeout(exePath, 5)
 			if err != nil {
-				if _, ok := err.(*exec.ExitError); !ok {
+				if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() < 0 {
 					t.Fatalf("Execution failed: %v", err)
 				}
 			}

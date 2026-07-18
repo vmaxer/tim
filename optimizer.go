@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/big"
 	"os"
 	"slices"
 	"strings"
@@ -44,6 +45,7 @@ func optimizeProgram(program *Program) *Program {
 	inlineReinlineDepth = 0
 	inlineTempCounter = 0
 	inlineBudget = inlineBudgetMax
+	clear(inlineActive)
 
 	// Pass 1: Constant folding (2 + 3 → 5)
 	for i, stmt := range program.Statements {
@@ -191,33 +193,19 @@ func foldConstantExpr(expr Expression) Expression {
 		rightNum, rightOk := e.Right.(*NumberExpr)
 
 		if leftOk && rightOk {
-			// Both are constants - fold them
-			var result float64
-			switch e.Operator {
-			case "+":
-				result = leftNum.Value + rightNum.Value
-			case "-":
-				result = leftNum.Value - rightNum.Value
-			case "*":
-				result = leftNum.Value * rightNum.Value
-			case "/":
-				if rightNum.Value == 0 {
-					// Don't fold constant division by zero - let runtime handle it
-					// This allows error handling with or! operator
-					return e
-				}
-				result = leftNum.Value / rightNum.Value
-			case "mod", "%":
-				if rightNum.Value == 0 {
-					// Don't fold constant modulo by zero - let runtime handle it
-					// This allows error handling with or! operator
-					return e
-				}
-				result = math.Mod(leftNum.Value, rightNum.Value)
-			default:
-				return e // Don't fold comparisons
+			if folded := foldNumbers(e.Operator, leftNum, rightNum); folded != nil {
+				return folded
 			}
-			return &NumberExpr{Value: result}
+		}
+		return e
+
+	case *UnaryExpr:
+		e.Operand = foldConstantExpr(e.Operand)
+		if n, ok := e.Operand.(*NumberExpr); ok && e.Operator == "-" {
+			if r, exact := n.Rat(); exact {
+				return newExactNumber(new(big.Rat).Neg(r))
+			}
+			return &NumberExpr{Value: -n.Value}
 		}
 		return e
 
@@ -232,6 +220,9 @@ func foldConstantExpr(expr Expression) Expression {
 		// Fold range start and end
 		e.Start = foldConstantExpr(e.Start)
 		e.End = foldConstantExpr(e.End)
+		if e.Step != nil {
+			e.Step = foldConstantExpr(e.Step)
+		}
 		return e
 
 	case *ListExpr:
@@ -303,6 +294,9 @@ func areExpressionsEqual(e1, e2 Expression) bool {
 	switch expr1 := e1.(type) {
 	case *NumberExpr:
 		if expr2, ok := e2.(*NumberExpr); ok {
+			if expr1.Exact != nil || expr2.Exact != nil {
+				return expr1.Exact != nil && expr2.Exact != nil && expr1.Exact.Cmp(expr2.Exact) == 0
+			}
 			return expr1.Value == expr2.Value
 		}
 	case *IdentExpr:
@@ -415,6 +409,8 @@ func strengthReduceExpr(expr Expression) Expression {
 		// Check for patterns we can optimize
 		leftNum, leftIsNum := e.Left.(*NumberExpr)
 		rightNum, rightIsNum := e.Right.(*NumberExpr)
+		leftIsNum = leftIsNum && leftNum.Exact == nil
+		rightIsNum = rightIsNum && rightNum.Exact == nil
 
 		switch e.Operator {
 		case "*":
@@ -789,6 +785,9 @@ func strengthReduceExpr(expr Expression) Expression {
 	case *RangeExpr:
 		e.Start = strengthReduceExpr(e.Start)
 		e.End = strengthReduceExpr(e.End)
+		if e.Step != nil {
+			e.Step = strengthReduceExpr(e.Step)
+		}
 		return e
 
 	case *MatchExpr:
@@ -807,13 +806,6 @@ func strengthReduceExpr(expr Expression) Expression {
 	case *BlockExpr:
 		for i, stmt := range e.Statements {
 			e.Statements[i] = strengthReduceStmt(stmt)
-		}
-		return e
-
-	case *LoopExpr:
-		e.Iterable = strengthReduceExpr(e.Iterable)
-		for i, stmt := range e.Body {
-			e.Body[i] = strengthReduceStmt(stmt)
 		}
 		return e
 
@@ -898,7 +890,7 @@ func propagateConstants(stmt Statement, constMap map[string]*NumberExpr) Stateme
 		if !s.Mutable && !s.IsUpdate {
 			if numExpr, ok := s.Value.(*NumberExpr); ok {
 				// Clone the number expression to avoid mutation issues
-				constMap[s.Name] = &NumberExpr{Value: numExpr.Value}
+				constMap[s.Name] = &NumberExpr{Value: numExpr.Value, Exact: numExpr.Exact}
 			} else {
 				// Variable is not assigned a constant, remove from map
 				delete(constMap, s.Name)
@@ -943,7 +935,7 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 		// Check if this variable has a known constant value
 		if constVal, exists := constMap[e.Name]; exists {
 			// Substitute with the constant value
-			return &NumberExpr{Value: constVal.Value}
+			return &NumberExpr{Value: constVal.Value, Exact: constVal.Exact}
 		}
 		return e
 
@@ -961,6 +953,9 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 	case *RangeExpr:
 		e.Start = propagateConstantsExpr(e.Start, constMap)
 		e.End = propagateConstantsExpr(e.End, constMap)
+		if e.Step != nil {
+			e.Step = propagateConstantsExpr(e.Step, constMap)
+		}
 		return e
 
 	case *ListExpr:
@@ -1077,6 +1072,9 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 	case *RangeExpr:
 		collectUsedVariablesExpr(e.Start, usedVars)
 		collectUsedVariablesExpr(e.End, usedVars)
+		if e.Step != nil {
+			collectUsedVariablesExpr(e.Step, usedVars)
+		}
 	case *ListExpr:
 		for _, elem := range e.Elements {
 			collectUsedVariablesExpr(elem, usedVars)
@@ -1183,10 +1181,6 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 			collectUsedVariables(stmt, usedVars)
 		}
 		for _, stmt := range e.RISCV64Block {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *LoopExpr:
-		for _, stmt := range e.Body {
 			collectUsedVariables(stmt, usedVars)
 		}
 	case *LoopStateExpr:
@@ -1721,7 +1715,9 @@ func collectInlineCandidates(stmt Statement, candidates map[string]*LambdaExpr) 
 		if !s.Mutable && !s.IsUpdate {
 			if lambda, ok := s.Value.(*LambdaExpr); ok {
 				// Only inline simple lambdas (single expression body, no blocks)
-				if !isComplexExpression(lambda.Body) {
+				selfCalls := make(map[string]int)
+				countCallsExpr(lambda.Body, selfCalls)
+				if !isComplexExpression(lambda.Body) && selfCalls[s.Name] == 0 {
 					// Store a copy to avoid mutation
 					candidates[s.Name] = &LambdaExpr{
 						Params:            lambda.Params,
@@ -1887,8 +1883,10 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 			// Only inline if:
 			// 1. Parameter count matches
 			// 2. Called at least once
-			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 && inlineBudget > 0 {
+			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 && inlineBudget > 0 && !inlineActive[e.Function] {
 				inlineBudget--
+				inlineActive[e.Function] = true
+				defer delete(inlineActive, e.Function)
 				// Inline the body, let-binding any non-trivial argument so it is
 				// evaluated exactly once (naive substitution would duplicate e.g.
 				// `vscale(b,s)` into each `.x/.y/.z` use — quadratic blowup and
@@ -1999,7 +1997,7 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 func deepCopyExpr(expr Expression) Expression {
 	switch e := expr.(type) {
 	case *NumberExpr:
-		return &NumberExpr{Value: e.Value}
+		return &NumberExpr{Value: e.Value, Exact: e.Exact}
 	case *StringExpr:
 		return &StringExpr{Value: e.Value}
 	case *IdentExpr:
@@ -2066,6 +2064,8 @@ var inlineTempCounter int
 // inlineReinlineDepth bounds re-inlining of an inlined body (so nested candidate
 // calls collapse) without looping forever on self-recursive one-liner candidates.
 var inlineReinlineDepth int
+
+var inlineActive = map[string]bool{}
 
 // inlineBudget caps the TOTAL number of inline substitutions per program. Each
 // re-inline of an inlined body re-walks the (growing) result, so a deep chain of

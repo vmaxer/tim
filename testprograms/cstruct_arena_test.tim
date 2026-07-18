@@ -1,0 +1,5 @@
+cstruct Big { a as float64, b as float64 }
+arena {
+	v := Big(1.0, 2.0)
+	println(v.a + v.b)
+}

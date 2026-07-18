@@ -8,7 +8,7 @@ import (
 func TestSIMDPatternDetection(t *testing.T) {
 	code := `
 sum := 0
-@ i in 0..<10 {
+for i in 0..<10 {
 	sum += i
 }
 printf("Sum: %v\n", sum)
@@ -16,8 +16,8 @@ printf("Sum: %v\n", sum)
 
 	// This should compile successfully (even though not vectorized)
 	output := compileAndRun(t, code)
-	if output != "Sum: 45.000000\n" {
-		t.Errorf("Expected 'Sum: 45.000000\\n', got '%s'", output)
+	if output != "Sum: 45\n" {
+		t.Errorf("Expected 'Sum: 45\\n', got '%s'", output)
 	}
 }
 
@@ -114,19 +114,19 @@ a := [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 b := [10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0]
 result := [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-@ i in 0..<8 {
+for i in 0..<8 {
     result[i] <- a[i] + b[i]
 }
 
 printf("Result: ")
-@ i in 0..<8 {
+for i in 0..<8 {
     printf("%v ", result[i])
 }
 printf("\n")
 `
 
 	output := compileAndRun(t, code)
-	expected := "Result: 11.000000 22.000000 33.000000 44.000000 55.000000 66.000000 77.000000 88.000000 \n"
+	expected := "Result: 11 22 33 44 55 66 77 88 \n"
 	if output != expected {
 		t.Errorf("Vectorized addition failed\nExpected: %s\nGot: %s", expected, output)
 	}
@@ -138,19 +138,19 @@ a := [2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0]
 b := [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
 result := [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-@ i in 0..<8 {
+for i in 0..<8 {
     result[i] <- a[i] * b[i]
 }
 
 printf("Result: ")
-@ i in 0..<8 {
+for i in 0..<8 {
     printf("%v ", result[i])
 }
 printf("\n")
 `
 
 	output := compileAndRun(t, code)
-	expected := "Result: 20.000000 30.000000 40.000000 50.000000 60.000000 70.000000 80.000000 90.000000 \n"
+	expected := "Result: 20 30 40 50 60 70 80 90 \n"
 	if output != expected {
 		t.Errorf("Vectorized multiplication failed\nExpected: %s\nGot: %s", expected, output)
 	}
@@ -162,19 +162,19 @@ a := [100.0, 200.0, 300.0, 400.0, 500.0, 600.0, 700.0, 800.0]
 b := [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
 result := [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-@ i in 0..<8 {
+for i in 0..<8 {
     result[i] <- a[i] - b[i]
 }
 
 printf("Result: ")
-@ i in 0..<8 {
+for i in 0..<8 {
     printf("%v ", result[i])
 }
 printf("\n")
 `
 
 	output := compileAndRun(t, code)
-	expected := "Result: 99.000000 198.000000 297.000000 396.000000 495.000000 594.000000 693.000000 792.000000 \n"
+	expected := "Result: 99 198 297 396 495 594 693 792 \n"
 	if output != expected {
 		t.Errorf("Vectorized subtraction failed\nExpected: %s\nGot: %s", expected, output)
 	}
@@ -187,19 +187,19 @@ a := [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 b := [10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0, 10.0]
 result := [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
-@ i in 0..<10 {
+for i in 0..<10 {
     result[i] <- a[i] * b[i]
 }
 
 printf("Result: ")
-@ i in 0..<10 {
+for i in 0..<10 {
     printf("%v ", result[i])
 }
 printf("\n")
 `
 
 	output := compileAndRun(t, code)
-	expected := "Result: 10.000000 20.000000 30.000000 40.000000 50.000000 60.000000 70.000000 80.000000 90.000000 100.000000 \n"
+	expected := "Result: 10 20 30 40 50 60 70 80 90 100 \n"
 	if output != expected {
 		t.Errorf("Vectorized with cleanup failed\nExpected: %s\nGot: %s", expected, output)
 	}

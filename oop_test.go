@@ -66,7 +66,7 @@ func TestClassComposition(t *testing.T) {
 Printable = {
     to_string = () -> {
         result := "{"
-        @ key in keys(.) {
+        for key in keys(.) {
             result <- result :: f"{key}: {.[key]} "
         }
         result :: "}"
@@ -164,7 +164,7 @@ func TestMultipleComposition(t *testing.T) {
 	code := `
 Comparable = {
     equals = other -> {
-        @ key in keys(.) {
+        for key in keys(.) {
             .[key] != other[key] { ret 0 }
         }
         ret 1
@@ -174,7 +174,7 @@ Comparable = {
 Serializable = {
     to_json = () -> {
         result := "{"
-        @ key in keys(.) {
+        for key in keys(.) {
             result <- result :: f'"{key}": "{.[key]}", '
         }
         result :: "}"

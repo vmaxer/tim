@@ -1,0 +1,2 @@
+ys = [1, 2] || x -> x
+println(ys)

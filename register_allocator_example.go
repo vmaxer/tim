@@ -5,6 +5,7 @@ package main
 
 import (
 	"fmt"
+	"slices"
 )
 
 func demonstrateRegisterAllocator() {
@@ -94,8 +95,8 @@ func demonstrateRegisterAllocator() {
 	if spillSize := ra.GetStackFrameSize(); spillSize > 0 {
 		fmt.Printf("    add rsp, %d  ; deallocate spill slots\n", spillSize)
 	}
-	for i := len(usedRegs) - 1; i >= 0; i-- {
-		fmt.Printf("    pop %s\n", usedRegs[i])
+	for _, usedReg := range slices.Backward(usedRegs) {
+		fmt.Printf("    pop %s\n", usedReg)
 	}
 	fmt.Println("    ret")
 	fmt.Println()

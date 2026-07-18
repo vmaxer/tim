@@ -1,0 +1,4 @@
+printf("int: %d\n", 42)
+printf("float: %f\n", 3.5)
+printf("string: %s\n", "hi")
+printf("mix: %d + %d = %d\n", 2, 3, 5)

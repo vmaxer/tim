@@ -191,3 +191,66 @@ func runCommandSeparate(cmd *exec.Cmd) (stdout, stderr string, exitCode int) {
 
 	return
 }
+
+func TestFormatStringArgs(t *testing.T) {
+	tests := []struct {
+		name       string
+		code       string
+		wantStdout string
+		wantStderr string
+		wantExit   int
+	}{
+		{
+			name:       "printf tim string",
+			code:       `printf("%s\n", "hello")`,
+			wantStdout: "hello\n",
+		},
+		{
+			name:       "printf c string",
+			code:       `printf("%s\n", c.strerror(0))`,
+			wantStdout: "Success\n",
+		},
+		{
+			name:       "println c string",
+			code:       `println(c.strerror(0))`,
+			wantStdout: "Success\n",
+		},
+		{
+			name:       "exitf tim string",
+			code:       `exitf("err: %s\n", "boom")`,
+			wantStderr: "err: boom\n",
+			wantExit:   1,
+		},
+		{
+			name:       "exitf c string",
+			code:       `exitf("err: %s\n", c.strerror(0))`,
+			wantStderr: "err: Success\n",
+			wantExit:   1,
+		},
+		{
+			name:       "exitf integer arg keeps exit code 1",
+			code:       `exitf("num %d\n", 5)`,
+			wantStderr: "num 5\n",
+			wantExit:   1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			binary := compileTestCode(t, tt.code)
+
+			cmd := exec.Command(binary)
+			stdout, stderr, exitCode := runCommandSeparate(cmd)
+
+			if stdout != tt.wantStdout {
+				t.Errorf("stdout = %q, want %q", stdout, tt.wantStdout)
+			}
+			if stderr != tt.wantStderr {
+				t.Errorf("stderr = %q, want %q", stderr, tt.wantStderr)
+			}
+			if exitCode != tt.wantExit {
+				t.Errorf("exit code = %d, want %d", exitCode, tt.wantExit)
+			}
+		})
+	}
+}

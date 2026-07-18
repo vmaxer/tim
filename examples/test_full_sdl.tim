@@ -19,7 +19,7 @@ printf("All initialized successfully!\n")
 
 // Simple loop - just clear and present a few times
 i := 0
-@ i < 10 ! inf {
+for i < 10 ! inf {
     sdl.SDL_RenderClear(renderer)
     sdl.SDL_RenderPresent(renderer)
     sdl.SDL_Delay(100)

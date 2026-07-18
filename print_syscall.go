@@ -23,7 +23,7 @@ func (fc *TimCompiler) generatePrintSyscall() {
 		fc.out.MovRegToReg("rbx", "rcx") // rbx = string pointer
 
 		// Get length
-		fc.out.MovMemToXmm("xmm0", "rbx", 0)
+		fc.out.MovMemToXmm("xmm0", "rbx", 8)
 		fc.out.Cvttsd2si("r12", "xmm0") // r12 = length
 
 		// Loop through characters
@@ -38,7 +38,7 @@ func (fc *TimCompiler) generatePrintSyscall() {
 		// Calculate offset: 16 + index * 16
 		fc.out.MovRegToReg("rax", "r14")
 		fc.out.ShlImmReg("rax", 4)       // rax = index * 16
-		fc.out.AddImmToReg("rax", 16)    // rax = 16 + index * 16
+		fc.out.AddImmToReg("rax", 24)    // rax = 24 + index * 16
 		fc.out.AddRegToReg("rax", "rbx") // rax = string_ptr + offset
 
 		// Load character code (value field for current map entry)
@@ -87,11 +87,11 @@ func (fc *TimCompiler) generatePrintSyscall() {
 	fc.out.PushReg("r13")
 	fc.out.PushReg("r14")
 
-	// rdi = string pointer (map: [count][0][char0][1][char1]...)
+	// rdi = string pointer (map: [tag][count][0][char0]...)
 	fc.out.MovRegToReg("rbx", "rdi")
 
 	// Get string length
-	fc.out.MovMemToXmm("xmm0", "rbx", 0)
+	fc.out.MovMemToXmm("xmm0", "rbx", 8)
 	fc.out.Cvttsd2si("r12", "xmm0") // r12 = length
 
 	// Allocate 1-byte buffer on stack
@@ -110,7 +110,7 @@ func (fc *TimCompiler) generatePrintSyscall() {
 	// Calculate character offset: 16 + index * 16
 	fc.out.MovRegToReg("rax", "r14")
 	fc.out.ShlImmReg("rax", 4)       // rax = index * 16
-	fc.out.AddImmToReg("rax", 16)    // rax = 16 + index * 16
+	fc.out.AddImmToReg("rax", 24)    // rax = 24 + index * 16
 	fc.out.AddRegToReg("rax", "rbx") // rax = string_ptr + offset
 
 	// Load character code (value field for current map entry)
@@ -166,7 +166,7 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 		fc.out.MovRegToReg("rbx", "rcx") // rbx = string pointer
 
 		// Get length
-		fc.out.MovMemToXmm("xmm0", "rbx", 0)
+		fc.out.MovMemToXmm("xmm0", "rbx", 8)
 		fc.out.Cvttsd2si("r12", "xmm0") // r12 = length
 
 		// Loop through characters
@@ -181,7 +181,7 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 		// Calculate offset: 16 + index * 16
 		fc.out.MovRegToReg("rax", "r14")
 		fc.out.ShlImmReg("rax", 4)       // rax = index * 16
-		fc.out.AddImmToReg("rax", 16)    // rax = 16 + index * 16
+		fc.out.AddImmToReg("rax", 24)    // rax = 24 + index * 16
 		fc.out.AddRegToReg("rax", "rbx") // rax = string_ptr + offset
 
 		// Load character code (value field for current map entry)
@@ -244,7 +244,7 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 	fc.out.MovRegToReg("rbx", "rdi")
 
 	// Get string length
-	fc.out.MovMemToXmm("xmm0", "rbx", 0)
+	fc.out.MovMemToXmm("xmm0", "rbx", 8)
 	fc.out.Cvttsd2si("r12", "xmm0") // r12 = length
 
 	// Allocate 1-byte buffer on stack

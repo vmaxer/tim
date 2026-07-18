@@ -1,0 +1,4 @@
+int: 42
+float: 3.500000
+string: hi
+mix: 2 + 3 = 5

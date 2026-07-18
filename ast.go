@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -15,6 +16,7 @@ type Program struct {
 	Statements         []Statement
 	ExportMode         string                  // "*" for export all without prefix, "" for require prefix
 	ExportedFuncs      []string                // Specific functions to export (only if ExportMode is not "*")
+	NotExported        map[string]bool         // Hidden by a module's selective export list
 	FunctionNamespaces map[string]string       // function name -> namespace (for imports)
 	CStructs           map[string]*CStructDecl // cstruct name -> declaration
 }
@@ -85,6 +87,7 @@ type MapUpdateStmt struct {
 	MapName string     // Name of the map/list variable
 	Index   Expression // Index expression
 	Value   Expression // New value
+	KeyName string     // Literal key name when known (kept for map inserts)
 }
 
 func (m *MapUpdateStmt) String() string {
@@ -263,7 +266,8 @@ func (e *ExpressionStmt) statementNode() {}
 type LoopStmt struct {
 	// No explicit label - determined by nesting depth when created with @
 	Iterator      string     // Variable name (e.g., "i")
-	IteratorType  string     // Optional cstruct type annotation: `@ b as Ball in ...` (empty if none)
+	KeyVar        string     // Pair form `for k, v in c`: the key/index variable ("" if single)
+	IteratorType  string     // Optional cstruct type annotation: `for b as Ball in ...` (empty if none)
 	Iterable      Expression // Expression to iterate over (e.g., range(10))
 	Body          []Statement
 	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
@@ -309,40 +313,25 @@ func (i *IfStmt) String() string {
 func (i *IfStmt) statementNode() {}
 
 type ReceiveLoopStmt struct {
-	MessageVar string      // Variable name for received message (e.g., "msg")
-	SenderVar  string      // Variable name for sender address (e.g., "from")
-	Address    Expression  // Address expression to bind to (e.g., ":5000")
-	Body       []Statement // Body statements to execute for each message
-	BaseOffset int         // Stack offset before loop body
+	MessageVar    string      // Variable name for received message (e.g., "msg")
+	SenderVar     string      // Variable name for sender address (e.g., "from")
+	Address       Expression  // Address expression to bind to (e.g., ":5000")
+	Body          []Statement // Body statements to execute for each message
+	BaseOffset    int         // Stack offset before loop body
+	MaxIterations int64       // `!` bound: messages to receive before exiting
 }
 
 func (r *ReceiveLoopStmt) String() string {
-	return fmt.Sprintf("@ %s, %s in %s { ... }", r.MessageVar, r.SenderVar, r.Address.String())
+	return fmt.Sprintf("for %s, %s in %s { ... }", r.MessageVar, r.SenderVar, r.Address.String())
 }
 
 func (r *ReceiveLoopStmt) statementNode() {}
-
-type LoopExpr struct {
-	// No explicit label - determined by nesting depth when created with @
-	Iterator      string      // Variable name (e.g., "i")
-	Iterable      Expression  // Expression to iterate over (e.g., range(10))
-	Body          []Statement // Body statements
-	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
-	NeedsMaxCheck bool        // Whether to emit runtime max iteration checking
-	NumThreads    int         // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
-	Reducer       *LambdaExpr // Optional reduction lambda for parallel loops: | a,b | { a + b }
-}
-
-func (l *LoopExpr) String() string {
-	return fmt.Sprintf("@ %s in %s { ... }", l.Iterator, l.Iterable.String())
-}
-func (l *LoopExpr) expressionNode() {}
 
 func (l *LoopStmt) String() string {
 	var out strings.Builder
 	// Show parallel prefix if NumThreads is set
 	if l.NumThreads == -1 {
-		out.WriteString("@@ ")
+		out.WriteString("|| ")
 	} else if l.NumThreads > 0 {
 		out.WriteString(fmt.Sprintf("%d @ ", l.NumThreads))
 	} else {
@@ -399,9 +388,15 @@ type Expression interface {
 
 type NumberExpr struct {
 	Value float64
+	Exact *big.Rat // exact value when it is not a small integer (big integer or rational)
 }
 
-func (n *NumberExpr) String() string  { return fmt.Sprintf("%g", n.Value) }
+func (n *NumberExpr) String() string {
+	if n.Exact != nil {
+		return n.Exact.RatString()
+	}
+	return fmt.Sprintf("%g", n.Value)
+}
 func (n *NumberExpr) expressionNode() {}
 
 type RandomExpr struct {
@@ -667,6 +662,10 @@ func (l *ListExpr) expressionNode() {}
 type MapExpr struct {
 	Keys   []Expression
 	Values []Expression
+	// KeyNames[i] is the literal key name for symbolic keys ("" when the key
+	// is numeric or computed). Map literals carry names so keys stay
+	// recoverable at runtime (iteration).
+	KeyNames []string
 }
 
 func (m *MapExpr) String() string {
@@ -739,7 +738,8 @@ func (s *SliceExpr) expressionNode() {}
 type RangeExpr struct {
 	Start     Expression
 	End       Expression
-	Inclusive bool // true for ..=, false for ..<
+	Inclusive bool       // true for ..= and .., false for ..<
+	Step      Expression // optional step (0..100..10); nil means 1
 }
 
 func (r *RangeExpr) String() string {
@@ -747,7 +747,11 @@ func (r *RangeExpr) String() string {
 	if r.Inclusive {
 		op = "..="
 	}
-	return r.Start.String() + op + r.End.String()
+	s := r.Start.String() + op + r.End.String()
+	if r.Step != nil {
+		s += ".." + r.Step.String()
+	}
+	return s
 }
 func (r *RangeExpr) expressionNode() {}
 

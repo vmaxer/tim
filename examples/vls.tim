@@ -40,7 +40,7 @@ main = {
         ret 1
     }
 
-    @ yes ! 1000000 {
+    for yes ! 1000000 {
         entry := c.readdir(dir as cptr)
         entry == 0 {
             break

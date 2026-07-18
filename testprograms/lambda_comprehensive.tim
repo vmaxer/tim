@@ -1,0 +1,5 @@
+apply = (f, x) -> f(x)
+sq = x -> x * x
+println(apply(sq, 5))
+inc = x -> x + 1
+println(apply(inc, 5))

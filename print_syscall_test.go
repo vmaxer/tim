@@ -169,7 +169,7 @@ println(100 / 10)
 		{
 			name: "print in loop",
 			code: `
-@ i in 0..2 {
+for i in 0..2 {
     println(i)
 }
 `,
@@ -178,7 +178,7 @@ println(100 / 10)
 		{
 			name: "print f-string in loop",
 			code: `
-@ i in 0..2 {
+for i in 0..2 {
     println(f"Count: {i}")
 }
 `,
@@ -278,7 +278,7 @@ func TestPrintfSyscall(t *testing.T) {
 		{
 			name:       "printf with format %v",
 			code:       `printf("%v\n", 42)`,
-			wantStdout: "42.000000\n",
+			wantStdout: "42\n",
 		},
 		{
 			name: "printf with multiple %v",
@@ -287,7 +287,7 @@ x := 10
 y := 20
 printf("x=%v, y=%v\n", x, y)
 `,
-			wantStdout: "x=10.000000, y=20.000000\n",
+			wantStdout: "x=10, y=20\n",
 		},
 		{
 			name: "println with f-string (preferred method)",

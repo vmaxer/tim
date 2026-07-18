@@ -1,0 +1,5 @@
+p := 1
+for i in 1..=4 {
+	p <- p * i
+}
+println(p)

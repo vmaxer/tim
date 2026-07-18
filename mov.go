@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"math"
 	"os"
 	"strconv"
 	"strings"
@@ -187,6 +188,16 @@ func (o *Out) movX86ImmToReg(dst, imm string) {
 			rex |= 0x01 // REX.B
 		}
 		o.Write(rex)
+		if v := int64(immVal); v < math.MinInt32 || v > math.MaxInt32 {
+			o.Write(0xB8 | (dstReg.Encoding & 7)) // MOV r64, imm64
+			for i := range 8 {
+				o.Write(uint8(immVal >> (8 * i)))
+			}
+			if VerboseMode {
+				fmt.Fprintln(os.Stderr)
+			}
+			return
+		}
 	}
 
 	// MOV with immediate encoding

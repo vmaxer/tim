@@ -1,0 +1,6 @@
+xs := [1, 2, 3]
+t := 0
+for v in xs {
+	t <- t + v
+}
+println(t)

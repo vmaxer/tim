@@ -30,8 +30,8 @@ main = {
     arena {
         event <- alloc(128) as SDL_Event
         
-        @ running > 0 ! 100 { // Limit iterations for automated test
-            @ sdl.SDL_PollEvent(event) > 0 ! 10 {
+        for running > 0 ! 100 { // Limit iterations for automated test
+            for sdl.SDL_PollEvent(event) > 0 ! 10 {
                 printf("Event type: %d\n", event.type)
                 event.type {
                     0x100 => { running <- 0 } // SDL_EVENT_QUIT

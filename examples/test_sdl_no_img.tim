@@ -15,7 +15,7 @@ println("Setup complete, starting event loop...")
 running = 1
 event = c.malloc(192)
 
-@ running > 0 ! inf {
+for running > 0 ! inf {
     has_event = sdl.SDL_PollEvent(event)
     
     has_event {

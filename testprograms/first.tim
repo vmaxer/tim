@@ -1,0 +1,2 @@
+println("My first Tim program")
+println(1 + 1)

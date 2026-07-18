@@ -311,18 +311,18 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "typed_loop_variable",
-			// `@ v as float64 in range` and `@ b as Ball in list` — the cstruct
+			// `for v as float64 in range` and `for b as Ball in list` — the cstruct
 			// iterator type lets the body read b.field directly.
 			code: `
 				cstruct Ball { cx as float64, cy as float64, cz as float64, R as float64 }
 				balls = [Ball(1.0,2.0,3.0,4.0), Ball(5.0,6.0,7.0,8.0)]
 				main = {
 					sum := 0.0
-					@ i as float64 in 0..<4 {
+					for i as float64 in 0..<4 {
 						sum <- sum + i
 					}
 					println(sum)
-					@ b as Ball in balls {
+					for b as Ball in balls {
 						println(b.cx + b.R)
 					}
 				}
@@ -749,7 +749,7 @@ func TestEvaluation(t *testing.T) {
 				fun fieldlike(ro as V, rd as V, t) {
 					p = at(ro, rd, t)
 					sum := 0.0
-					@ i in 0..<3 {
+					for i in 0..<3 {
 						sum <- sum + p.x + p.y + p.z
 					}
 					sum
@@ -811,7 +811,7 @@ func TestEvaluation(t *testing.T) {
 			code: `
 				countdown = (n) -> {
 					total := 0.0
-					@ i in 0..<100 {
+					for i in 0..<100 {
 						i >= n { ret @ }
 						total <- total + 1.0
 					}

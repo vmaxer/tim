@@ -547,28 +547,41 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 			switch next {
 			case 'd', 'i', 'l', 'u': // Integer/long/unsigned
 				fc.compileExpression(arg)
-				// xmm0 contains the number - convert to int and print
-				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.emitNumToI64()
 				fc.emitSyscallPrintInteger()
 
-			case 'v': // Value (uses 6-decimal float format like %f)
+			case 'v':
 				fc.compileExpression(arg)
-				fc.emitSyscallPrintFloatPrecise(6)
+				switch t := fc.getExprType(arg); t {
+				case "string":
+					fc.emitSyscallPrintTimString()
+				case "cstring":
+					fc.out.Cvttsd2si("rax", "xmm0")
+					fc.emitCStrWrite(1)
+				case "list", "map":
+					fc.emitSyscallPrintList(t == "map")
+				default:
+					fc.emitPrintNumber()
+				}
 
 			case 's': // String
 				fc.compileExpression(arg)
-				// xmm0 contains Tim string pointer - print it
-				fc.emitSyscallPrintTimString()
+				if fc.isCFFIStringCall(arg) || fc.getExprType(arg) == "cstring" {
+					fc.out.Cvttsd2si("rax", "xmm0")
+					fc.emitCStrWrite(1)
+				} else {
+					// xmm0 contains Tim string pointer - print it
+					fc.emitSyscallPrintTimString()
+				}
 
 			case 'f', 'g': // Float
 				fc.compileExpression(arg)
-				// xmm0 contains float - use precise formatter
+				fc.emitNumToFloat()
 				fc.emitSyscallPrintFloatPrecise(precision)
 
 			case 'p': // Pointer (hex)
 				fc.compileExpression(arg)
-				// xmm0 contains the address as float - convert to int
-				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.emitNumToI64()
 				fc.emitSyscallPrintHex()
 
 			case 't', 'b': // Boolean (t=true/false, b=yes/no)
@@ -611,6 +624,29 @@ func (fc *TimCompiler) emitSyscallPrintLiteral(str string) {
 	fc.out.LeaSymbolToReg("rsi", labelName)
 	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", len(str)))
 	fc.out.Syscall()
+}
+
+// emitSyscallPrintList prints the list/map whose pointer is in xmm0 as
+// "[a, b, c]" (or "{a, b, c}"), formatted by _tim_collection_to_string so
+// println and str() always agree.
+func (fc *TimCompiler) emitSyscallPrintList(isMap bool) {
+	fc.out.MovqXmmToReg("rdi", "xmm0")
+	openLabel, closeLabel := "_ts_open_list", "_ts_close_list"
+	if isMap {
+		openLabel, closeLabel = "_ts_open_map", "_ts_close_map"
+	}
+	fc.out.LeaSymbolToReg("rsi", openLabel)
+	fc.out.LeaSymbolToReg("rdx", closeLabel)
+	fc.trackFunctionCall("_tim_collection_to_string")
+	fc.trackFunctionCall("_tim_string_concat")
+	fc.trackFunctionCall("_tim_num")
+	fc.out.CallSymbol("_tim_collection_to_string")
+	fc.out.MovRegToReg("rdi", "rax")
+	if fc.eb.target.OS() == OSLinux {
+		fc.callFunction("_tim_print_syscall", "")
+	} else {
+		fc.callFunction("_tim_string_print", "")
+	}
 }
 
 // emitSyscallPrintChar emits code to print a single character
@@ -969,9 +1005,44 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	// Save xmm0 at the TOP of our stack frame (offset 152, safe from all modifications)
 	fc.out.MovXmmToMem("xmm0", "rsp", 152)
 
-	// ===== Print integer part INLINE (no function calls) =====
+	// Print the sign once and continue with |x|.
+	positive := fc.newNumLabel()
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.TestRegWithReg("rax", "rax")
+	positive.jcc(JumpGreaterOrEqual)
+	fc.out.ShlRegByImm("rax", 1)
+	fc.out.ShrRegByImm("rax", 1)
+	fc.out.MovRegToMem("rax", "rsp", 152)
+	fc.emitSyscallPrintLiteral("-")
+	positive.bind()
+
+	// Integer part at [rsp+136], fractional digits (rounded to nearest-even) at
+	// [rsp+144], carrying into the integer part when they round up to 10^precision.
+	multiplier := 1
+	for range precision {
+		multiplier *= 10
+	}
 	fc.out.MovMemToXmm("xmm0", "rsp", 152)
 	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2c, 0xc0}) // cvttsd2si rax, xmm0
+	fc.out.MovRegToMem("rax", "rsp", 136)
+	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2a, 0xc8}) // cvtsi2sd xmm1, rax
+	fc.out.Emit([]byte{0xf2, 0x0f, 0x5c, 0xc1})       // subsd xmm0, xmm1
+	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", multiplier))
+	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2a, 0xc8}) // cvtsi2sd xmm1, rax
+	fc.out.Emit([]byte{0xf2, 0x0f, 0x59, 0xc1})       // mulsd xmm0, xmm1
+	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2d, 0xc8}) // cvtsd2si rcx, xmm0
+	noCarry := fc.newNumLabel()
+	fc.out.CmpRegToReg("rcx", "rax")
+	noCarry.jcc(JumpLess)
+	fc.out.SubRegFromReg("rcx", "rax")
+	fc.out.MovMemToReg("rax", "rsp", 136)
+	fc.out.IncReg("rax")
+	fc.out.MovRegToMem("rax", "rsp", 136)
+	noCarry.bind()
+	fc.out.MovRegToMem("rcx", "rsp", 144)
+
+	// ===== Print integer part INLINE (no function calls) =====
+	fc.out.MovMemToReg("rax", "rsp", 136)
 
 	// Convert integer to string inline
 	fc.out.PushReg("rbx")
@@ -1028,6 +1099,11 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	fc.out.PopReg("rcx")
 	fc.out.PopReg("rbx")
 
+	if precision == 0 {
+		fc.out.AddImmToReg("rsp", 160)
+		return
+	}
+
 	// ===== Print decimal point INLINE =====
 	fc.out.MovImmToReg("rax", "46") // '.'
 	fc.out.MovRegToMem("rax", "rsp", 0)
@@ -1037,24 +1113,8 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	fc.out.MovImmToReg("rdx", "1")
 	fc.out.Syscall()
 
-	// ===== Extract decimal digits - exact working assembly =====
-	fc.out.MovMemToXmm("xmm0", "rsp", 152)            // Load saved value
-	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2c, 0xc0}) // cvttsd2si rax, xmm0
-	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2a, 0xc8}) // cvtsi2sd xmm1, rax
-	fc.out.MovMemToXmm("xmm0", "rsp", 152)            // Reload (critical!)
-	fc.out.Emit([]byte{0xf2, 0x0f, 0x5c, 0xc1})       // subsd xmm0, xmm1
-
-	multiplier := 1
-	for i := 0; i < precision; i++ {
-		multiplier *= 10
-	}
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", multiplier))
-	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2a, 0xc8}) // cvtsi2sd xmm1, rax
-	fc.out.Emit([]byte{0xf2, 0x0f, 0x59, 0xc1})       // mulsd xmm0, xmm1
-
-	// Round fractional digits using current rounding mode (nearest-even by default)
-	// instead of manual +0.5 + truncation, which biases some values downward.
-	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2d, 0xc0}) // cvtsd2si rax, xmm0
+	// ===== Fractional digits =====
+	fc.out.MovMemToReg("rax", "rsp", 144)
 
 	fc.out.MovImmToReg("rcx", "10")
 

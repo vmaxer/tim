@@ -149,6 +149,10 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 			}
 		}
 		debugf("DEBUG: Found %d writable constants\n", len(writableConsts))
+		// Data layout feeds symbol addresses, so keep it deterministic.
+		sort.Slice(writableConsts, func(i, j int) bool {
+			return writableConsts[i].name < writableConsts[j].name
+		})
 
 		// Write data section
 		for _, entry := range writableConsts {
@@ -240,30 +244,7 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	}
 	fc.eb.useDynamicLinking = true
 
-	// First pass: Build initial PLT with main program functions
-	// (will be rebuilt after runtime helpers are generated)
 	pltFunctions := []string{}
-	pltSet := make(map[string]bool)
-
-	// Build set of lambda function names to exclude from PLT
-	lambdaSet := make(map[string]bool)
-	for _, lambda := range fc.lambdaFuncs {
-		lambdaSet[lambda.Name] = true
-	}
-
-	// Add functions used so far (main program only, not runtime helpers yet)
-	for funcName := range fc.usedFunctions {
-		if lambdaSet[funcName] {
-			continue
-		}
-		if strings.HasPrefix(funcName, "_tim") || strings.HasPrefix(funcName, "tim_") {
-			continue
-		}
-		if !pltSet[funcName] {
-			pltFunctions = append(pltFunctions, funcName)
-			pltSet[funcName] = true
-		}
-	}
 
 	// Note: Runtime helper functions will be tracked but won't be in first-pass PLT
 	// This is OK - they'll be resolved as internal labels, not PLT entries
@@ -344,21 +325,16 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 		}
 	}
 
-	// Add PLT symbols
-	for _, funcName := range pltFunctions {
-		ds.AddSymbol(funcName, STB_GLOBAL, STT_FUNC)
-	}
-
-	// Add lambda symbols
-	for _, lambda := range fc.lambdaFuncs {
-		ds.AddSymbol(lambda.Name, STB_GLOBAL, STT_FUNC)
-	}
-
 	// Note: Library dependencies will be determined dynamically based on actual usage
 
 	// Add cache pointer storage to rodata (8 bytes of zeros for each cache)
 	if len(fc.memoCaches) > 0 {
+		cacheNames := make([]string, 0, len(fc.memoCaches))
 		for cacheName := range fc.memoCaches {
+			cacheNames = append(cacheNames, cacheName)
+		}
+		sort.Strings(cacheNames)
+		for _, cacheName := range cacheNames {
 			fc.eb.Define(cacheName, "\x00\x00\x00\x00\x00\x00\x00\x00")
 		}
 	}
@@ -370,6 +346,10 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 
 	fc.buildHotFunctionTable()
 	fc.generateHotFunctionTable()
+
+	// Size the layout with the runtime helpers included; this pass's text is
+	// discarded and regenerated below, but the helpers must fit before .dynamic.
+	fc.generateRuntimeHelpers()
 
 	rodataSymbols := fc.eb.RodataSection()
 
@@ -435,6 +415,52 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 			}
 		}
 		_ = dataBaseAddr // Mark as used (needed for future logic)
+	}
+
+	// Build the PLT now that runtime helpers are generated: helpers call libc
+	// too (malloc, realloc, printf, exit), and any call left out here stays an
+	// unpatched placeholder that jumps into garbage when executed.
+	pltSet := make(map[string]bool)
+	lambdaSet := make(map[string]bool)
+	for _, lambda := range fc.lambdaFuncs {
+		lambdaSet[lambda.Name] = true
+	}
+	for funcName := range fc.usedFunctions {
+		// A user function sharing a C import's name must not exclude the import
+		// from the PLT: the call would fall through to the internal label (or
+		// stay unpatched) and jump into the wrong code.
+		if lambdaSet[funcName] && fc.cFunctionLibs[funcName] == "" {
+			continue
+		}
+		if strings.HasPrefix(funcName, "_tim") || strings.HasPrefix(funcName, "tim_") {
+			continue
+		}
+		if !pltSet[funcName] {
+			pltFunctions = append(pltFunctions, funcName)
+			pltSet[funcName] = true
+		}
+	}
+	// The PLT layout feeds call displacements, so it must not depend on Go's
+	// randomized map iteration order.
+	sort.Strings(pltFunctions)
+
+	// Add PLT symbols
+	for _, funcName := range pltFunctions {
+		ds.AddSymbol(funcName, STB_GLOBAL, STT_FUNC)
+	}
+
+	// Add lambda symbols. A lambda sharing a C import's name must not be
+	// exported under that name: the local definition would shadow the shared
+	// library symbol and `c.remove(...)` would call the lambda itself.
+	pltLookup := make(map[string]bool, len(pltFunctions))
+	for _, funcName := range pltFunctions {
+		pltLookup[funcName] = true
+	}
+	for _, lambda := range fc.lambdaFuncs {
+		if pltLookup[lambda.Name] {
+			continue
+		}
+		ds.AddSymbol(lambda.Name, STB_GLOBAL, STT_FUNC)
 	}
 
 	// Write complete dynamic ELF with unique PLT functions
@@ -510,6 +536,11 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	fc.out.PushReg("rbp")
 	fc.out.MovRegToReg("rbp", "rsp")
 	fc.out.SubImmFromReg("rsp", StackSlotSize) // Align stack to 16 bytes
+	// Reserve the same frame as the first pass: top-level variables live at
+	// rbp-offset and must stay above rsp, or any call would clobber them.
+	if fc.maxStackOffset > 0 {
+		fc.out.SubImmFromReg("rsp", int64((fc.maxStackOffset+4096+15)&^15))
+	}
 	fc.out.XorRegWithReg("rax", "rax")
 	fc.out.XorRegWithReg("rdi", "rdi")
 	fc.out.XorRegWithReg("rsi", "rsi")

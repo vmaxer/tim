@@ -38,7 +38,7 @@ printf("Starting main loop...\n")
 running := 1
 event := c.malloc(192) as SDL_Event
 
-@ running > 0 ! inf {
+for running > 0 ! inf {
     has_event := sdl.SDL_PollEvent(event)
     
     has_event {

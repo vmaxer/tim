@@ -255,7 +255,7 @@ func TestExistingCStructPrograms(t *testing.T) {
 
 			output, err := runWithTimeout(exePath, 5)
 			if err != nil {
-				if _, ok := err.(*exec.ExitError); !ok {
+				if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() < 0 {
 					t.Fatalf("Execution failed: %v", err)
 				}
 			}

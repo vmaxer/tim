@@ -112,11 +112,10 @@ println(list2[3])
 	}
 }
 
-// TestTailOperatorUpdate tests the _ (tail) operator (list_update context)
+// TestTailOperatorUpdate tests tail() over a list (the designed tail syntax)
 func TestTailOperatorUpdate(t *testing.T) {
-	t.Skip("Tail operator has known issues - see TAIL.md")
 	source := `list := [1, 2, 3, 4]
-rest := _list
+rest := tail(list)
 println(rest[0])
 println(rest[1])
 `

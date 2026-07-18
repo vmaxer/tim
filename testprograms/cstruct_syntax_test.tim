@@ -1,0 +1,6 @@
+cstruct Vec2 {
+	dx as float64
+	dy as float64
+}
+v := Vec2(1.5, 2.5)
+println(v.dx + v.dy)

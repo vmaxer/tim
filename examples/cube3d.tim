@@ -64,7 +64,7 @@ angle := 0
 arena {
     event = alloc(192) as SDL_Event
 
-    @ running ! inf {
+    for running ! inf {
         has_event = sdl.SDL_PollEvent(event)
         if has_event > 0 {
             event_type = event.type

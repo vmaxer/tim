@@ -25,13 +25,16 @@ func (fc *TimCompiler) compileExitfSyscall(call *CallExpr, formatStr *StringExpr
 			}
 
 			if next == 's' {
-				// String argument - assume it's a C string (char*)
 				if argIndex+1 < len(call.Args) {
 					arg := call.Args[argIndex+1]
 					fc.compileExpression(arg)
-					// xmm0 contains pointer as float64, convert to rax
-					fc.out.MovqXmmToReg("rax", "xmm0")
-					fc.emitStderrCString()
+					if fc.isCFFIStringCall(arg) || fc.getExprType(arg) == "cstring" {
+						fc.out.Cvttsd2si("rax", "xmm0")
+					} else {
+						fc.trackFunctionCall("_tim_string_to_cstr")
+						fc.out.CallSymbol("_tim_string_to_cstr")
+					}
+					fc.emitCStrWrite(2)
 				}
 				argIndex++
 				i += 2
@@ -61,6 +64,10 @@ func (fc *TimCompiler) compileExitfSyscall(call *CallExpr, formatStr *StringExpr
 			}
 		}
 	}
+
+	fc.out.MovImmToReg("rdi", "1")
+	fc.callFunction("exit", "")
+	fc.hasExplicitExit = true
 }
 
 // emitStderrWriteLiteral writes a known-length string literal to stderr.
@@ -125,9 +132,9 @@ func (fc *TimCompiler) emitStderrChar(ch rune) {
 	fc.out.AddImmToReg("rsp", 8)
 }
 
-// emitStderrCString writes a null-terminated C string to stderr
+// emitCStrWrite writes a null-terminated C string to fd
 // Input: rax = pointer to C string
-func (fc *TimCompiler) emitStderrCString() {
+func (fc *TimCompiler) emitCStrWrite(fd int) {
 	fc.out.PushReg("rbx")
 	fc.out.MovRegToReg("rbx", "rax")
 	fc.out.XorRegWithReg("rdx", "rdx")
@@ -147,7 +154,7 @@ func (fc *TimCompiler) emitStderrCString() {
 
 	// Write using syscall
 	fc.out.MovRegToReg("rsi", "rbx")
-	fc.out.MovImmToReg("rdi", "2") // stderr
+	fc.out.MovImmToReg("rdi", fmt.Sprintf("%d", fd))
 	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 
@@ -202,7 +209,7 @@ func (fc *TimCompiler) emitStderrInteger() {
 	fc.eb.text.Bytes()[convertJump+1] = byte(convertStart - (convertJump + 2))
 
 	// Calculate length
-	fc.out.LeaMemToReg("rdx", "rsp", 32)
+	fc.out.LeaMemToReg("rdx", "rsp", 31)
 	fc.out.SubRegFromReg("rdx", "rbx")
 
 	// Write

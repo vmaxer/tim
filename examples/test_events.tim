@@ -26,11 +26,11 @@ start_time := sdl.SDL_GetTicks()
 running := 1
 frame := 0
 
-@ running > 0 ! inf {
+for running > 0 ! inf {
     current_time := sdl.SDL_GetTicks()
     elapsed := current_time - start_time
     
-    @ sdl.SDL_PollEvent(event) > 0 ! 100 {
+    for sdl.SDL_PollEvent(event) > 0 ! 100 {
         printf("Event type: %d\n", event.type)
         event.type {
             256 => { 

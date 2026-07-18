@@ -1,0 +1,3 @@
+h = x -> x + 10
+y := h
+println(y(5))

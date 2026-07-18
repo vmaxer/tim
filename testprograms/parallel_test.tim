@@ -1,0 +1,2 @@
+ys = 0..<4 || x -> x * x
+println(ys)

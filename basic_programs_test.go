@@ -70,7 +70,7 @@ printf("The answer is %v\n", x)
 msg := f"Hello, {name}!"
 println(msg)
 `,
-			expected: "SKIP: f-strings not yet fully implemented for ARM64",
+			expected: "Hello, Tim!\n",
 		},
 		{
 			name: "compound_assignment",

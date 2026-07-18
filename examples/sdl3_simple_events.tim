@@ -25,7 +25,7 @@ println("Window created! Close the window to exit.")
 running = 1
 event = c.malloc(192)  // SDL_Event size
 
-@ running > 0 ! inf {
+for running > 0 ! inf {
     // Poll for events
     has_event = sdl.SDL_PollEvent(event)
     

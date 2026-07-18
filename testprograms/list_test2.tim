@@ -1,0 +1,3 @@
+xs := [10, 20]
+ys := xs + [30]
+println(ys)
