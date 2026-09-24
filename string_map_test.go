@@ -224,8 +224,8 @@ func TestPrintfFormatting(t *testing.T) {
 		},
 		{
 			name:     "printf_boolean",
-			source:   `printf("%v\\n", 1.0)`,
-			expected: "1.0", // %v prints floats with decimal point
+			source:   `printf("%v %v\\n", 1.0, 7 / 2)`,
+			expected: "1 3.5",
 		},
 	}
 

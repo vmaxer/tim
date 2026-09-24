@@ -6,47 +6,40 @@
 
 This document defines the complete formal grammar of the Tim programming language using Extended Backus-Naur Form (EBNF).
 
-## ⚠️ CRITICAL: The Universal Type
+## Values and the Universal Number
 
-Tim has exactly ONE runtime type: `map[uint64]float64`, an ordered map.
-
-Not "represented as" or "backed by" — every value IS this map:
-
-```tim
-42              // {0: 42.0}
-"Hello"         // {0: 72.0, 1: 101.0, 2: 108.0, 3: 108.0, 4: 111.0}
-[1, 2, 3]       // {0: 1.0, 1: 2.0, 2: 3.0}
-{x: 10}         // {hash("x"): 10.0}
-[]              // {}
-{}              // {}
-```
-
-**Even C foreign types are stored as maps:**
+Tim values are numbers, strings, lists, maps and functions. There is exactly one
+number type, `num`, and it grows as needed:
 
 ```tim
-// C pointer (0x7fff1234) stored as float64 bits
-ptr: cptr = sdl.SDL_CreateWindow(...)  // {0: <pointer_as_float64>}
-
-// C string pointer
-err: cstring = sdl.SDL_GetError()      // {0: <char*_as_float64>}
-
-// C int
-result: cint = sdl.SDL_Init(...)       // {0: 1.0} or {0: 0.0}
+42                 // exact integer
+2 ** 200           // exact integer: 1606938044258990275541962092341162602522202993782792835301376
+7 / 2              // exact rational, prints 3.5
+1 / 3              // exact rational, prints 1/3
+0.1 + 0.2 == 0.3   // yes: decimal literals are exact
+sqrt(2)            // inexact float64: 1.414214
+x as float64       // explicit conversion to inexact
 ```
 
-There are NO special types, NO primitives, NO exceptions.
-Everything is a map from uint64 to float64.
-
-This is not an implementation detail — this IS Tim.
+- **Exact numbers** are integers of any size and rationals. Integer and decimal
+  literals (`42`, `0.1`, `1e-7`, `0xFF`) are exact. `+ - * / % **` on exact numbers
+  never overflow and never round; `/` gives a rational when the division is not even.
+- **Inexact numbers** are IEEE-754 float64. They come from `sqrt`, `sin`, `log`, `exp`
+  and friends, from C (`float`, `double`), and from `x as float64`. Any operation with
+  an inexact operand gives an inexact result.
+- Exact and inexact numbers compare numerically: `1 == 1.0`, `1 / 3 < 0.34`.
+- Rationals print as exact decimals when they terminate (`3.5`, `0.125`) and as
+  `n/d` otherwise (`22/7`). Inexact numbers print with up to six decimals.
+- `floor`, `ceil`, `round` and `abs` keep exact numbers exact.
 
 ## Type Annotations
 
 Type annotations are **metadata** that specify:
-1. **Semantic intent** - what does this map represent?
+1. **Semantic intent** - what does this value represent?
 2. **FFI conversions** - how to marshal at C boundaries
 3. **Optimization hints** - compiler optimizations
 
-They do NOT change the runtime representation (always `map[uint64]float64`).
+They never change a value's runtime representation.
 
 ### Native Tim Types
 - `num` - number (default type)
@@ -762,7 +755,7 @@ map_entry       = ( identifier | string ) ":" expression ;
 
 identifier      = letter { letter | digit | "_" } ;
 
-number          = [ "-" ] digit { digit } [ "." digit { digit } ] ;
+number          = decimal | hex | binary ;              (* see Numbers *)
 
 string          = '"' { character } '"' ;
 
@@ -801,7 +794,7 @@ my-var     // contains hyphen
 
 ### Booleans
 
-Booleans are `map[uint64]float64` with a special marker value:
+Booleans carry a special marker value:
 
 ```ebnf
 boolean = "yes" | "no" ;
@@ -835,31 +828,36 @@ Functions that don't explicitly return a value return `1.0` (number). To return 
 
 ### Numbers
 
-Numbers are `map[uint64]float64` with a single entry at key 0:
+Number literals are exact (see [Values and the Universal Number](#values-and-the-universal-number)):
 
 ```ebnf
-number = [ "-" ] digit { digit } [ "." digit { digit } ] ;
+number   = decimal | hex | binary ;
+decimal  = digit { digit } [ "." digit { digit } ] [ exponent ] ;
+exponent = ( "e" | "E" ) [ "+" | "-" ] digit { digit } ;
+hex      = "0" ( "x" | "X" ) hexdigit { hexdigit } ;
+binary   = "0" ( "b" | "B" ) ( "0" | "1" ) { "0" | "1" } ;
 ```
+
+A leading `-` is the unary minus operator.
 
 **Examples:**
 ```tim
-42              // {0: 42.0}
-3.14159         // {0: 3.14159}
--17             // {0: -17.0}
-0.001           // {0: 0.001}
-1000000         // {0: 1000000.0}
--273.15         // {0: -273.15}
+42                       // exact integer
+18446744073709551616     // exact integer (2^64)
+0xFFFFFFFFFFFFFFFF       // exact integer
+3.14159                  // exact rational 314159/100000
+1e-7                     // exact rational 1/10000000
+-273.15                  // exact rational
 ```
 
 **Special values:**
-- `??` - cryptographically secure random number [0, 1) → `{0: random_value}`
-- Result of `0/0` - NaN (used for error encoding) → `{0: NaN}`
-
-**Note:** While the values stored happen to be IEEE 754 doubles, this is an implementation detail. Numbers ARE maps, not primitives.
+- `??` - cryptographically secure random inexact number in [0, 1)
+- `inf` - inexact positive infinity
+- Result of `0/0` - an error value (NaN with the `dv0` code)
 
 ### Strings
 
-Strings are `map[uint64]float64` where keys are indices and values are character codes:
+Strings are ordered maps where keys are indices and values are character codes:
 
 ```ebnf
 string = '"' { character } '"' ;
@@ -1481,7 +1479,7 @@ x { 0 -> "zero" }        // Match: contains ->
 
 ## Error Handling and Result Types
 
-Tim uses a **Result type** for operations that can fail. A Result is still `map[uint64]float64`, but with special semantic meaning tracked by the compiler.
+Tim uses a **Result type** for operations that can fail. A Result is still a single value, with special semantic meaning tracked by the compiler.
 
 ### Result Type Design
 
@@ -1763,7 +1761,7 @@ The `or!` operator:
 
 ## Type Annotations
 
-Type annotations are **optional metadata** that specify semantic intent and guide FFI marshalling. They do NOT change the runtime representation (always `map[uint64]float64`).
+Type annotations are **optional metadata** that specify semantic intent and guide FFI marshalling. They never change a value's runtime representation.
 
 ### Syntax
 

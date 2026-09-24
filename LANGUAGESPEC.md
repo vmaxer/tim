@@ -6,24 +6,31 @@
 
 This document describes the complete semantics, behavior, and design philosophy of the Tim programming language. For the formal grammar, see [GRAMMAR.md](GRAMMAR.md).
 
-## ⚠️ CRITICAL: The Universal Type
+## Values and the Universal Number
 
-Tim has exactly ONE type: `map[uint64]float64`
-
-Not "represented as" or "backed by" — every value IS this map:
+Tim values are numbers, strings, lists, maps and functions. There is exactly one
+number type, `num`, and it grows as needed:
 
 ```tim
-42              // {0: 42.0}
-"Hello"         // {0: 72.0, 1: 101.0, 2: 108.0, 3: 108.0, 4: 111.0}
-[1, 2, 3]       // {0: 1.0, 1: 2.0, 2: 3.0}
-{x: 10}         // {hash("x"): 10.0}
-[]              // {}
+42                 // exact integer
+2 ** 200           // exact integer: 1606938044258990275541962092341162602522202993782792835301376
+7 / 2              // exact rational, prints 3.5
+1 / 3              // exact rational, prints 1/3
+0.1 + 0.2 == 0.3   // yes: decimal literals are exact
+sqrt(2)            // inexact float64: 1.414214
+x as float64       // explicit conversion to inexact
 ```
 
-There are NO special types, NO primitives, NO exceptions.
-Everything is a map from uint64 to float64.
-
-This is not an implementation detail — this IS Tim.
+- **Exact numbers** are integers of any size and rationals. Integer and decimal
+  literals (`42`, `0.1`, `1e-7`, `0xFF`) are exact. `+ - * / % **` on exact numbers
+  never overflow and never round; `/` gives a rational when the division is not even.
+- **Inexact numbers** are IEEE-754 float64. They come from `sqrt`, `sin`, `log`, `exp`
+  and friends, from C (`float`, `double`), and from `x as float64`. Any operation with
+  an inexact operand gives an inexact result.
+- Exact and inexact numbers compare numerically: `1 == 1.0`, `1 / 3 < 0.34`.
+- Rationals print as exact decimals when they terminate (`3.5`, `0.125`) and as
+  `n/d` otherwise (`22/7`). Inexact numbers print with up to six decimals.
+- `floor`, `ceil`, `round` and `abs` keep exact numbers exact.
 
 ## Table of Contents
 
@@ -48,13 +55,11 @@ This is not an implementation detail — this IS Tim.
 
 Tim brings together several novel or rare features that distinguish it from other systems programming languages:
 
-### 1. Universal Map Type System
+### 1. One Universal Number Type
 
-The entire language is built on a single type: `map[uint64]float64`. Every value—numbers, strings, lists, functions—IS this map. This radical simplification enables:
-- No type system complexity
-- Uniform memory representation
-- Natural duck typing
-- Simple FFI (cast to native types only at boundaries)
+`num` covers exact integers of any size, exact rationals and inexact floats, so there
+is no `int`/`float`/`bigint`/`decimal` choice to make and no silent overflow or
+rounding in exact code. See [Values and the Universal Number](#values-and-the-universal-number).
 
 ### 2. Direct Machine Code Generation
 
@@ -335,7 +340,7 @@ y := 100    // Mutable (explicit)
 ### Core Principles
 
 1. **Simplicity over complexity**
-   - One universal type (map)
+   - One universal number type
    - Minimal syntax
    - Direct code generation
 
@@ -363,21 +368,30 @@ y := 100    // Mutable (explicit)
 
 ## Type System
 
-Tim uses a **universal map type**: `map[uint64]float64`
+Tim values are numbers (`num`, see [Values and the Universal Number](#values-and-the-universal-number)),
+strings, lists, maps and functions.
 
-Every value in Tim IS `map[uint64]float64`:
+- **Strings**: ordered maps from index to character code
+- **Lists**: ordered maps from index to value
+- **Maps**: ordered maps from key to value
+- **Functions**: closures (code pointer and captured environment)
 
-- **Numbers**: `{0: number_value}`
-- **Strings**: `{0: char0, 1: char1, 2: char2, ...}`
-- **Lists**: `{0: elem0, 1: elem1, 2: elem2, ...}`
-- **Objects**: `{key_hash: value, ...}`
-- **Functions**: `{0: code_pointer, 1: closure_data, ...}`
+### Representation
 
-There are no special cases. No "single entry maps", no "byte indices", no "field hashes" — just uint64 keys and float64 values in every case.
+Every value is one 64-bit word. Integers with |n| < 2^53 are stored as plain float64,
+big integers and rationals are NaN-boxed pointers to heap objects, and every other
+float64 is an inexact number (a NaN carries an error code, see Error Handling).
+Arithmetic runs inline on the float64 fast path and calls a small runtime
+(`numrt/num.c`) for big integers, rationals and overflow. An inexact float64 that
+happens to be integral and below 2^53 is indistinguishable from the exact integer.
+Strings, lists and maps are pointers to ordered maps.
+
+Exact arithmetic is implemented in the x86_64 backend (Linux and Windows); the
+arm64 and riscv64 backends still approximate exact numbers with float64.
 
 ### Type Annotations
 
-Type annotations are **optional metadata** that specify semantic intent and guide FFI conversions. They do NOT change the runtime representation (always `map[uint64]float64`).
+Type annotations are **optional metadata** that specify semantic intent and guide FFI conversions. They never change a value's runtime representation.
 
 **Native Tim types:**
 ```tim
@@ -470,7 +484,7 @@ x: num = num * 2       // OK - type annotation vs variable
 Tim has a dedicated boolean type with two values: `yes` and `no`.
 
 **Representation:**
-Booleans are `map[uint64]float64` with a special marker to distinguish them from numbers:
+Booleans carry a marker to distinguish them from numbers:
 ```tim
 yes    // {0: 1.0, 1: 1.0}  (marker: key 1 exists with value 1.0)
 no     // {0: 0.0, 1: 0.0}  (marker: key 1 exists with value 0.0)
@@ -2045,7 +2059,7 @@ abs(x)
 
 ### Result Type Design
 
-Tim uses **NaN-boxing** to encode errors within float64 values. This elegant approach, inspired by ENet's use of bit patterns for encoding flags and types, keeps everything as `map[uint64]float64` while enabling robust error handling.
+Tim uses **NaN-boxing** to encode errors within float64 values. This elegant approach, inspired by ENet's use of bit patterns for encoding flags and types, keeps every value in a single 64-bit word while enabling robust error handling.
 
 **Encoding Scheme:**
 - **Success values:** Regular float64 (standard IEEE 754 representation)
@@ -2099,7 +2113,7 @@ Error codes are exactly 4 bytes (null-padded if shorter), encoded as 32-bit inte
 ```tim
 // Arithmetic errors
 x = 10 / 0              // Error: "dv0 " (division by zero)
-y = 2 ** 1000           // Error: "ovf " (overflow)
+y = 2 ** (2 ** 40)      // Error: "ovf " (result too large to represent)
 
 // Index errors
 xs = [1, 2, 3]
@@ -2846,24 +2860,19 @@ cas = (ptr, old, new) => unsafe int32 {
 
 ## Design Rationale
 
-### Why One Universal Type?
+### Why One Number Type?
 
-Traditional languages have complex type hierarchies:
-- Primitive types (int, float, char, bool)
-- Reference types (objects, arrays, strings)
-- Special types (null, undefined, NaN)
-- Type conversions and coercions
-- Boxing/unboxing overhead
+Most languages make you choose between `int`, `float`, `bigint` and `decimal`, and
+then surprise you with overflow (`2**63`), rounding (`0.1 + 0.2 != 0.3`) or
+truncation (`7 / 2 == 3`).
 
-**Tim's approach:** Everything is `map[uint64]float64`
+**Tim's approach:** one `num` type that is exact until you ask for a float.
 
 **Benefits:**
-1. **Conceptual simplicity:** Learn one type, understand the entire language
-2. **Implementation simplicity:** One memory layout, one set of operations
-3. **No type coercion bugs:** No implicit conversions to reason about
-4. **Uniform FFI:** Cast to C types only at boundaries
-5. **Natural duck typing:** If it has the key, it works
-6. **Optimization freedom:** Compiler can represent values efficiently while preserving semantics
+1. **Correct by default:** integer and rational arithmetic never overflows or rounds
+2. **Nothing to choose:** literals, loop counters and money all use the same type
+3. **Fast where it matters:** small integers and floats run inline as float64
+4. **Explicit inexactness:** floats come from math functions, C, or `as float64`
 
 ### Why Direct Machine Code Generation?
 
@@ -2887,7 +2896,7 @@ Most compilers use intermediate representations (IR):
 - Manual optimization (no LLVM optimization passes)
 - More maintenance burden
 
-**Why it's worth it:** Tim's simplicity makes per-architecture code manageable. The universal type system means optimizations work uniformly across all values.
+**Why it's worth it:** Tim's simplicity makes per-architecture code manageable.
 
 ### Why Fork-Based Parallelism?
 
@@ -3067,15 +3076,12 @@ Faster than C for:
 - Compilation (direct code generation)
 - FFI (no marshalling overhead)
 
-### Is the universal type system really practical?
+### Is exact arithmetic slow?
 
-Yes, with caveats:
-- **Numbers:** Zero overhead (compiler optimizes to registers)
-- **Small strings:** Some overhead (map allocation)
-- **Large data:** Similar to C (heap allocation either way)
-- **FFI:** Zero overhead (direct casts at boundaries)
-
-The compiler's type tracking (see TYPE_TRACKING.md) eliminates most overhead.
+No, not for ordinary code:
+- **Small integers and floats:** inline float64 instructions plus one range check
+- **Big integers and rationals:** a call into the numeric runtime, which allocates
+- **FFI:** exact numbers are converted to float64 or int64 at the C boundary
 
 ### Why not use LLVM?
 

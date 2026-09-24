@@ -4861,8 +4861,12 @@ func (p *Parser) parsePrimary() Expression {
 		return &LengthExpr{Operand: expr}
 
 	case TOKEN_NUMBER:
-		val := p.parseNumberLiteral(p.current.Value)
-		return &NumberExpr{Value: val}
+		n, err := parseNumber(p.current.Value)
+		if err != nil {
+			p.error(err.Error())
+			return &NumberExpr{}
+		}
+		return n
 
 	case TOKEN_INF:
 		return &NumberExpr{Value: math.Inf(1)}
@@ -4940,7 +4944,7 @@ func (p *Parser) parsePrimary() Expression {
 			// Return a copy of the stored expression to avoid mutation issues
 			switch e := expr.(type) {
 			case *NumberExpr:
-				return &NumberExpr{Value: e.Value}
+				return &NumberExpr{Value: e.Value, Exact: e.Exact}
 			case *StringExpr:
 				return &StringExpr{Value: e.Value}
 			case *ListExpr:
@@ -4949,7 +4953,7 @@ func (p *Parser) parsePrimary() Expression {
 				for i, elem := range e.Elements {
 					switch el := elem.(type) {
 					case *NumberExpr:
-						elements[i] = &NumberExpr{Value: el.Value}
+						elements[i] = &NumberExpr{Value: el.Value, Exact: el.Exact}
 					case *StringExpr:
 						elements[i] = &StringExpr{Value: el.Value}
 					default:

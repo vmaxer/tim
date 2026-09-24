@@ -34,12 +34,12 @@ method_decl     = identifier "=" lambda_expr ;
 
 ## Classes and Object-Oriented Programming
 
-Tim supports classes as syntactic sugar over maps and closures, following the philosophy that everything is `map[uint64]float64`.
+Tim supports classes as syntactic sugar over maps and closures.
 
 ### Design Philosophy
 
 - **Syntactic sugar:** Classes compile to regular maps and lambdas
-- **No new types:** Objects are still `map[uint64]float64`
+- **No new types:** Objects are still maps
 - **Composition:** Use `<>` to extend with behavior maps (no inheritance)
 - **Minimal syntax:** Only adds the `class` keyword
 - **Transparent:** You can always see what the class desugars to

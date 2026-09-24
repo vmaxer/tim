@@ -3,6 +3,7 @@ package main
 
 import (
 	"fmt"
+	"math/big"
 	"strings"
 )
 
@@ -399,9 +400,15 @@ type Expression interface {
 
 type NumberExpr struct {
 	Value float64
+	Exact *big.Rat // exact value when it is not a small integer (big integer or rational)
 }
 
-func (n *NumberExpr) String() string  { return fmt.Sprintf("%g", n.Value) }
+func (n *NumberExpr) String() string {
+	if n.Exact != nil {
+		return n.Exact.RatString()
+	}
+	return fmt.Sprintf("%g", n.Value)
+}
 func (n *NumberExpr) expressionNode() {}
 
 type RandomExpr struct {
