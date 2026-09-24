@@ -15,7 +15,7 @@
 typedef unsigned long long u64;
 typedef long long i64;
 typedef unsigned int u32;
-typedef void *(*alloc_fn)(u64);
+typedef void *(*alloc_fn)(void *ctx, u64 size);
 
 #define TAG_BIG 0xFFF9ull
 #define TAG_RAT 0xFFFAull
@@ -62,9 +62,10 @@ static double u64_to_double(u64 x) {
 }
 static inline double neg_d(double x) { return 0.0 - x; }
 
-typedef struct { alloc_fn alloc; } Ctx;
+typedef struct { alloc_fn fn; void *ctx; } Ctx;
 
-static u64 *new_limbs(Ctx *c, u64 n) { return c->alloc((n ? n : 1) * 8); }
+static void *alloc_(Ctx *c, u64 n) { return c->fn(c->ctx, n); }
+static u64 *new_limbs(Ctx *c, u64 n) { return alloc_(c, (n ? n : 1) * 8); }
 
 // Magnitude: little-endian 64-bit limbs, n == 0 means zero, d[n-1] != 0.
 typedef struct { u64 *d; u64 n; } Mag;
@@ -185,7 +186,20 @@ static Mag mag_divmod1(Ctx *c, const Mag *a, u64 d, u64 *rem) {
 	return q;
 }
 
-static int clz64(u64 x) { return x ? __builtin_clzll(x) : 64; }
+static int clz64(u64 x) {
+#if defined(__x86_64__) || defined(__aarch64__)
+	return x ? __builtin_clzll(x) : 64;
+#else
+	int n = 0;
+	if (!x)
+		return 64;
+	while (!(x & SIGN_BIT)) {
+		x <<= 1;
+		n++;
+	}
+	return n;
+#endif
+}
 
 // Knuth algorithm D. q = a / b, r = a % b.
 static void mag_divmod(Ctx *c, const Mag *a, const Mag *b, Mag *q, Mag *r) {
@@ -423,7 +437,7 @@ static u64 encode_int(Ctx *c, const Int *a) {
 		double d = (double)(i64)a->m.d[0];
 		return bits_of(a->neg ? neg_d(d) : d);
 	}
-	u64 *p = c->alloc(8 + a->m.n * 8);
+	u64 *p = alloc_(c, 8 + a->m.n * 8);
 	store_int(p, a);
 	return box(TAG_BIG, p);
 }
@@ -443,7 +457,7 @@ static u64 encode(Ctx *c, Int num, Mag den) {
 	}
 	if (mag_is_one(&den))
 		return encode_int(c, &num);
-	u64 *p = c->alloc(16 + (num.m.n + den.n) * 8);
+	u64 *p = alloc_(c, 16 + (num.m.n + den.n) * 8);
 	Int d = {den, 0};
 	store_int(store_int(p, &num), &d);
 	return box(TAG_RAT, p);
@@ -514,6 +528,48 @@ static double floor_d(double x) {
 	return t > x ? t - 1.0 : t;
 }
 
+#if !defined(__x86_64__)
+#define LN2_HI 6.93147180369123816490e-01
+#define LN2_LO 1.90821492927058770002e-10
+
+// log(x) for x > 0: x = m * 2^e with m in [sqrt(1/2), sqrt(2)), log(m) = 2 atanh(s).
+static double log_d(double x) {
+	u64 b = bits_of(x);
+	i64 e = (i64)((b >> 52) & 0x7FF) - 1023;
+	if (e == -1023) {
+		x *= 18014398509481984.0; // 2^54, subnormals
+		b = bits_of(x);
+		e = (i64)((b >> 52) & 0x7FF) - 1023 - 54;
+	}
+	double m = double_of((b & 0x000FFFFFFFFFFFFFull) | 0x3FF0000000000000ull);
+	if (m > 1.4142135623730951) {
+		m *= 0.5;
+		e++;
+	}
+	double s = (m - 1.0) / (m + 1.0), s2 = s * s, term = s, sum = 0.0;
+	for (int k = 1; k < 40; k += 2) {
+		sum += term / k;
+		term *= s2;
+	}
+	return 2.0 * sum + (double)e * LN2_LO + (double)e * LN2_HI;
+}
+
+// exp(y) = 2^k * exp(r), |r| <= ln2/2.
+static double exp_d(double y) {
+	if (y > 709.8)
+		return double_of(0x7FF0000000000000ull);
+	if (y < -745.2)
+		return 0.0;
+	double kd = floor_d(y / 0.6931471805599453 + 0.5);
+	double r = (y - kd * LN2_HI) - kd * LN2_LO, term = 1.0, sum = 1.0;
+	for (int n = 1; n < 25; n++) {
+		term *= r / n;
+		sum += term;
+	}
+	return sum * pow2((i64)kd);
+}
+#endif
+
 static double pow_d(double x, double y) {
 	if (y == 0.0)
 		return 1.0;
@@ -549,7 +605,9 @@ static double pow_d(double x, double y) {
 		: "st(1)");
 	return r;
 #else
-	return double_of(ERR_ARG);
+	if (x < 0.0)
+		return double_of(0x7FF8000000000000ull);
+	return exp_d(y * log_d(x));
 #endif
 }
 
@@ -876,7 +934,7 @@ static void put_rat(Ctx *c, Buf *b, Rat *r) {
 	mag_divmod(c, &q, &scale, &ip, &fp);
 	put_mag(c, b, &ip);
 	put(b, '.');
-	Buf fb = {c->alloc(k + 32), 0};
+	Buf fb = {alloc_(c, k + 32), 0};
 	put_mag(c, &fb, &fp);
 	for (u64 i = fb.n; i < k; i++)
 		put(b, '0');
@@ -896,7 +954,7 @@ static u64 to_string(Ctx *c, u64 v) {
 		if (!mag_is_one(&r.den))
 			cap += mag_bitlen(&r.den) + 8;
 	}
-	Buf b = {c->alloc(cap), 0};
+	Buf b = {alloc_(c, cap), 0};
 	if (!ex)
 		put_double(&b, double_of(v));
 	else if (mag_is_one(&r.den)) {
@@ -905,7 +963,7 @@ static u64 to_string(Ctx *c, u64 v) {
 		put_mag(c, &b, &r.num.m);
 	} else
 		put_rat(c, &b, &r);
-	u64 *s = c->alloc(8 + b.n * 16);
+	u64 *s = alloc_(c, 8 + b.n * 16);
 	s[0] = bits_of((double)(i64)b.n);
 	for (u64 i = 0; i < b.n; i++) {
 		s[1 + 2 * i] = i;
@@ -934,8 +992,8 @@ static u64 to_i64(Ctx *c, u64 v) {
 	return q.neg ? 0 - m : m;
 }
 
-u64 tim_num(u64 op, u64 a, u64 b, alloc_fn alloc) {
-	Ctx c = {alloc};
+u64 tim_num(u64 op, u64 a, u64 b, alloc_fn alloc, void *ctx) {
+	Ctx c = {alloc, ctx};
 	switch (op) {
 	case OP_STR: return to_string(&c, a);
 	case OP_FLOAT: return bits_of(to_double(&c, a));
