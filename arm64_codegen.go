@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"maps"
+	"math"
 	"os"
 	"slices"
 	"strconv"
@@ -13,6 +14,8 @@ import (
 
 // ARM64CodeGen handles ARM64 code generation for macOS
 type ARM64CodeGen struct {
+	usesNumRuntime      bool
+	tailExpr            Expression // the expression whose value the current lambda returns directly
 	out                 *ARM64Out
 	eb                  *ExecutableBuilder
 	stackVars           map[string]int               // variable name -> stack offset from fp
@@ -899,10 +902,9 @@ func (acg *ARM64CodeGen) compileIfStatement(stmt *IfStmt) error {
 			return err
 		}
 		// Skip the body when the condition is 0.0.
-		acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+		acg.emitTruthyA64(0, 0)
 		nextJump := acg.eb.text.Len()
-		acg.out.BranchCond("eq", 0)
+		acg.emitWords(0xB4000000) // cbz x0
 
 		for _, s := range branch.Body {
 			if err := acg.compileStatement(s); err != nil {
@@ -1776,7 +1778,14 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		}
 		return acg.compileExpression(&NumberExpr{Value: v})
 
+	case *preloadedExpr:
+		return nil
+
 	case *NumberExpr:
+		if e.Exact != nil {
+			acg.compileExactLiteralA64(e)
+			return nil
+		}
 		// Tim uses float64 for all numbers
 		// For whole numbers, convert via integer; for decimals, load from .rodata
 		if e.Value == float64(int64(e.Value)) {
@@ -1924,62 +1933,40 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		}
 
 	case *BinaryExpr:
+		if e.Operator == "*" && acg.getExprType(e.Left) == "list" {
+			if err := acg.compileExpression(e.Left); err != nil {
+				return err
+			}
+			acg.emitWords(0x9E780000, a64SubSp16, 0xF90003E0) // fcvtzs x0, d0; sub sp; str x0, [sp]
+			if err := acg.compileExpression(e.Right); err != nil {
+				return err
+			}
+			acg.emitNumToI64A64()
+			acg.emitWords(0xAA0003E1, 0xF94003E0, a64AddSp16) // mov x1, x0; ldr x0, [sp]; add sp
+			if err := acg.eb.GenerateCallInstruction("_tim_list_repeat"); err != nil {
+				return err
+			}
+			acg.emitWords(a64Scvtf)
+			return nil
+		}
 		// Check for list concatenation with + operator
 		if e.Operator == "+" {
 			leftType := acg.getExprType(e.Left)
 			rightType := acg.getExprType(e.Right)
 
 			if leftType == "list" && rightType == "list" {
-				// List concatenation: [1, 2] + [3, 4] -> [1, 2, 3, 4]
-				// Compile left list (result in d0)
 				if err := acg.compileExpression(e.Left); err != nil {
 					return err
 				}
-				// Convert d0 (float) to x0 (pointer)
-				acg.out.SubImm64("sp", "sp", 16)
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
-				if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
-					return err
-				}
-				acg.out.AddImm64("sp", "sp", 16)
-
-				// Push x0 (left ptr) to stack
-				acg.out.SubImm64("sp", "sp", 16)
-				if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
-					return err
-				}
-
-				// Compile right list (result in d0)
+				acg.emitWords(0x9E780000, a64SubSp16, 0xF90003E0) // fcvtzs x0, d0; sub sp; str x0, [sp]
 				if err := acg.compileExpression(e.Right); err != nil {
 					return err
 				}
-				// Convert d0 to x1
-				acg.out.SubImm64("sp", "sp", 16)
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
-				if err := acg.out.LdrImm64("x1", "sp", 0); err != nil {
-					return err
-				}
-				acg.out.AddImm64("sp", "sp", 16)
-
-				// Restore left ptr to x0
-				if err := acg.out.LdrImm64("x0", "sp", 0); err != nil {
-					return err
-				}
-				acg.out.AddImm64("sp", "sp", 16)
-
-				// Call _tim_list_concat(x0, x1) -> x0
+				acg.emitWords(0x9E780001, 0xF94003E0, a64AddSp16) // fcvtzs x1, d0; ldr x0, [sp]; add sp
 				if err := acg.eb.GenerateCallInstruction("_tim_list_concat"); err != nil {
 					return err
 				}
-
-				// Convert result x0 back to d0
-				acg.out.SubImm64("sp", "sp", 16)
-				if err := acg.out.StrImm64("x0", "sp", 0); err != nil {
-					return err
-				}
-				acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x40, 0xfd}) // ldr d0, [sp]
-				acg.out.AddImm64("sp", "sp", 16)
-
+				acg.emitWords(a64Scvtf)
 				return nil
 			}
 
@@ -2084,70 +2071,25 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		// Special handling for or! operator (railway-oriented programming)
 		// or! requires conditional execution: only evaluate right side if left is error/null
 		if e.Operator == "or!" {
-			// Compile left expression into d0
+			// Errors (positive NaNs) and 0 take the right-hand side; exact
+			// numbers are negative NaNs and stay.
 			if err := acg.compileExpression(e.Left); err != nil {
 				return err
 			}
-
-			// Check if d0 is NaN by comparing with itself
-			// fcmp d0, d0
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x60, 0x1e})
-			// b.vs (branch if overflow/NaN) to execute_default
-			executeDefaultPos1 := acg.eb.text.Len()
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x54}) // b.vs placeholder
-
-			// Not NaN, now check if d0 == 0.0 (null pointer)
-			// fmov d1, xzr (d1 = 0.0)
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e})
-			// fcmp d0, d1
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e})
-			// b.eq (branch if equal to 0) to execute_default
-			executeDefaultPos2 := acg.eb.text.Len()
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x54}) // b.eq placeholder
-
-			// Value is valid (not NaN and not 0), skip to end without evaluating right side
-			skipDefaultPos := acg.eb.text.Len()
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x14}) // b placeholder
-
-			// execute_default label: evaluate right expression (could be block or value)
-			executeDefaultLabel := acg.eb.text.Len()
-			if err := acg.compileExpression(e.Right); err != nil { // Result goes to d0
+			notNaN, useDefault, end := acg.newLabel(), acg.newLabel(), acg.newLabel()
+			acg.emitWords(0x1E602000) // fcmp d0, d0
+			notNaN.bcond("vc")
+			acg.emitWords(a64FmovX16D0, 0xF100021F) // fmov x16, d0; cmp x16, #0
+			end.bcond("lt")
+			useDefault.b()
+			notNaN.bind()
+			acg.emitWords(0x1E602008) // fcmp d0, #0.0
+			end.bcond("ne")
+			useDefault.bind()
+			if err := acg.compileExpression(e.Right); err != nil {
 				return err
 			}
-
-			// End label
-			endLabel := acg.eb.text.Len()
-
-			// Patch the jumps
-			// ARM64 branch offsets are in instructions (4 bytes each), not bytes
-			// Offset = (target - current_pc) / 4
-
-			// Patch NaN check (b.vs) to execute_default
-			offset1 := int32((executeDefaultLabel - executeDefaultPos1) / 4)
-			bytes1 := acg.eb.text.Bytes()
-			// b.vs encoding: 0x54 with imm19 in bits [23:5] and cond=0110 (VS) in bits [3:0]
-			instr1 := uint32(0x54000006) | (uint32(offset1&0x7ffff) << 5)
-			bytes1[executeDefaultPos1] = byte(instr1 & 0xFF)
-			bytes1[executeDefaultPos1+1] = byte((instr1 >> 8) & 0xFF)
-			bytes1[executeDefaultPos1+2] = byte((instr1 >> 16) & 0xFF)
-			bytes1[executeDefaultPos1+3] = byte((instr1 >> 24) & 0xFF)
-
-			// Patch zero check (b.eq) to execute_default
-			offset2 := int32((executeDefaultLabel - executeDefaultPos2) / 4)
-			instr2 := uint32(0x54000000) | (uint32(offset2&0x7ffff) << 5)
-			bytes1[executeDefaultPos2] = byte(instr2 & 0xFF)
-			bytes1[executeDefaultPos2+1] = byte((instr2 >> 8) & 0xFF)
-			bytes1[executeDefaultPos2+2] = byte((instr2 >> 16) & 0xFF)
-			bytes1[executeDefaultPos2+3] = byte((instr2 >> 24) & 0xFF)
-
-			// Patch skip jump (b) to end
-			offset3 := int32((endLabel - skipDefaultPos) / 4)
-			instr3 := uint32(0x14000000) | uint32(offset3&0x3ffffff)
-			bytes1[skipDefaultPos] = byte(instr3 & 0xFF)
-			bytes1[skipDefaultPos+1] = byte((instr3 >> 8) & 0xFF)
-			bytes1[skipDefaultPos+2] = byte((instr3 >> 16) & 0xFF)
-			bytes1[skipDefaultPos+3] = byte((instr3 >> 24) & 0xFF)
-
+			end.bind()
 			// d0 now contains either original value (if not NaN/null) or result of right side
 			return nil
 		}
@@ -2184,6 +2126,14 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		}
 
 		// Perform operation: d0 = d0 op d1
+		if _, ok := numBinops[e.Operator]; ok {
+			acg.emitNumBinopA64(e.Operator)
+			return nil
+		}
+		if numBitwiseOps[e.Operator] {
+			acg.emitBitwiseA64(e.Operator)
+			return nil
+		}
 		switch e.Operator {
 		case "+":
 			// fadd d0, d0, d1
@@ -2297,59 +2247,17 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			modEndLabel := acg.eb.text.Len()
 			acg.patchJumpOffset(bModEndPos, int32(modEndLabel-bModEndPos))
 		case "and":
-			// Logical AND: returns 1.0 if both non-zero, else 0.0
-			// Compare d0 with 0.0
-			// fmov d2, xzr (d2 = 0.0)
-			acg.out.out.writer.WriteBytes([]byte{0xe2, 0x03, 0x67, 0x9e})
-			// fcmp d0, d2
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x62, 0x1e})
-			// cset x0, ne (x0 = 1 if d0 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x07, 0x9f, 0x9a})
-			// Compare d1 with 0.0
-			// fcmp d1, d2
-			acg.out.out.writer.WriteBytes([]byte{0x20, 0x20, 0x62, 0x1e})
-			// cset x1, ne (x1 = 1 if d1 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x07, 0x9f, 0x9a})
-			// and x0, x0, x1
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0x8a})
-			// scvtf d0, x0 (convert result to float)
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+			acg.emitTruthyA64(0, 0)
+			acg.emitTruthyA64(1, 1)
+			acg.emitWords(0x8A010000, a64Scvtf)
 		case "or":
-			// Logical OR: returns 1.0 if either non-zero, else 0.0
-			// Compare d0 with 0.0
-			// fmov d2, xzr (d2 = 0.0)
-			acg.out.out.writer.WriteBytes([]byte{0xe2, 0x03, 0x67, 0x9e})
-			// fcmp d0, d2
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x62, 0x1e})
-			// cset x0, ne (x0 = 1 if d0 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x07, 0x9f, 0x9a})
-			// Compare d1 with 0.0
-			// fcmp d1, d2
-			acg.out.out.writer.WriteBytes([]byte{0x20, 0x20, 0x62, 0x1e})
-			// cset x1, ne (x1 = 1 if d1 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x07, 0x9f, 0x9a})
-			// orr x0, x0, x1
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0xaa})
-			// scvtf d0, x0 (convert result to float)
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+			acg.emitTruthyA64(0, 0)
+			acg.emitTruthyA64(1, 1)
+			acg.emitWords(0xAA010000, a64Scvtf)
 		case "xor":
-			// Logical XOR: returns 1.0 if exactly one non-zero, else 0.0
-			// Compare d0 with 0.0
-			// fmov d2, xzr (d2 = 0.0)
-			acg.out.out.writer.WriteBytes([]byte{0xe2, 0x03, 0x67, 0x9e})
-			// fcmp d0, d2
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x62, 0x1e})
-			// cset x0, ne (x0 = 1 if d0 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x07, 0x9f, 0x9a})
-			// Compare d1 with 0.0
-			// fcmp d1, d2
-			acg.out.out.writer.WriteBytes([]byte{0x20, 0x20, 0x62, 0x1e})
-			// cset x1, ne (x1 = 1 if d1 != 0, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x07, 0x9f, 0x9a})
-			// eor x0, x0, x1
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0xca})
-			// scvtf d0, x0 (convert result to float)
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+			acg.emitTruthyA64(0, 0)
+			acg.emitTruthyA64(1, 1)
+			acg.emitWords(0xCA010000, a64Scvtf)
 		case "shl":
 			// Shift left: convert to int64, shift, convert back
 			// fcvtzs x0, d0 (x0 = int64(d0))
@@ -2504,7 +2412,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		// each element expression (e.g. struct constructors or variables).
 		allNumbers := true
 		for _, elem := range e.Elements {
-			if _, ok := elem.(*NumberExpr); !ok {
+			if n, ok := elem.(*NumberExpr); !ok || n.Exact != nil {
 				allNumbers = false
 				break
 			}
@@ -2627,6 +2535,10 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 				return err
 			}
 		} else {
+			// Out-of-range (including negative) indices yield 0, as on x86_64.
+			acg.emitWords(0xFD400001, 0x9E780022, 0x9E6703E0, 0xEB02003F) // ldr d1, [x0]; fcvtzs x2, d1; fmov d0, xzr; cmp x1, x2
+			oob := acg.newLabel()
+			oob.bcond("hs")
 			// Skip past count (8 bytes) and index by (index * 8)
 			acg.out.AddImm64("x0", "x0", 8)
 			// x1 = x1 << 3 (multiply by 8)
@@ -2635,6 +2547,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x01, 0x8b}) // add x0, x0, x1
 			// Load element into d0
 			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x40, 0xfd}) // ldr d0, [x0]
+			oob.bind()
 		}
 
 	case *CallExpr:
@@ -2695,17 +2608,17 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		if e.IsNegMul {
 			if e.IsSub {
 				// -(a*b) - c -> -(Dn*Dm + Da) -> FNMADD
-				return acg.out.FnmaddScalar64("d0", "d2", "d1", "d3")
+				return acg.checkFMA(e, acg.out.FnmaddScalar64("d0", "d2", "d1", "d3"))
 			}
 			// -(a*b) + c -> Da - Dn*Dm -> FMSUB
-			return acg.out.FmsubScalar64("d0", "d2", "d1", "d3")
+			return acg.checkFMA(e, acg.out.FmsubScalar64("d0", "d2", "d1", "d3"))
 		}
 		if e.IsSub {
 			// a*b - c -> Dn*Dm - Da -> FNMSUB
-			return acg.out.FnmsubScalar64("d0", "d2", "d1", "d3")
+			return acg.checkFMA(e, acg.out.FnmsubScalar64("d0", "d2", "d1", "d3"))
 		}
 		// a*b + c -> FMADD
-		return acg.out.FmaddScalar64("d0", "d2", "d1", "d3")
+		return acg.checkFMA(e, acg.out.FmaddScalar64("d0", "d2", "d1", "d3"))
 
 	case *LambdaExpr:
 		// Generate a unique function name for this lambda
@@ -2794,30 +2707,19 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 
 		switch e.Operator {
 		case "-":
-			// Unary minus: negate the value
-			// Use fneg d0, d0 instruction
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x40, 0x61, 0x1e}) // fneg d0, d0
+			acg.emitWords(0x1E604001, 0x9E6703E0) // fmov d1, d0; fmov d0, xzr
+			acg.emitNumBinopA64("-")
 
 		case "not":
 			// Logical NOT: returns 1.0 if operand is 0.0, else 0.0
 			// Compare d0 with 0.0
-			// fmov d1, xzr (d1 = 0.0)
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e})
-			// fcmp d0, d1
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e})
-			// cset x0, eq (x0 = 1 if equal, else 0)
-			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x17, 0x9f, 0x9a})
-			// scvtf d0, x0 (convert to float64)
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+			acg.emitTruthyA64(0, 0)
+			acg.emitWords(0xD2400000, a64Scvtf) // eor x0, x0, #1; scvtf d0, x0
 
 		case "~b":
-			// Bitwise NOT: convert to int64, NOT, convert back
-			// fcvtzs x0, d0
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
-			// mvn x0, x0 (bitwise NOT)
-			acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x20, 0xaa})
-			// scvtf d0, x0
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
+			acg.emitNumToI64A64()
+			acg.emitWords(0xAA2003E0) // mvn x0, x0
+			acg.emitNumFromI64A64()
 
 		case "#":
 			// Length operator: the operand is a list/map pointer (numeric double);
@@ -2849,6 +2751,9 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 
 	case *MapExpr:
 		// Map literal stored as: [count (float64)] [key1] [value1] [key2] [value2] ...
+		if !mapIsStatic(e) {
+			return acg.compileDynamicMapA64(e)
+		}
 		labelName := fmt.Sprintf("map_%d", acg.stringCounter)
 		acg.stringCounter++
 
@@ -3149,7 +3054,7 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 				// For the last statement, make sure its value ends up in d0
 				if exprStmt, ok := stmt.(*ExpressionStmt); ok {
 					// Expression statement: compile it (result goes to d0)
-					return acg.compileExpression(exprStmt.Expr)
+					return acg.compileInTail(exprStmt.Expr, acg.tailExpr == Expression(e))
 				} else if assignStmt, ok := stmt.(*AssignStmt); ok {
 					// Assignment: compile it, then load the assigned value into d0
 					if err := acg.compileStatement(stmt); err != nil {
@@ -3174,9 +3079,13 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		return acg.compileExpression(&NumberExpr{Value: 0.0})
 
 	case *CastExpr:
-		// For now, just compile the expression being cast
-		// Actual type casting would be more complex
-		return acg.compileExpression(e.Expr)
+		if err := acg.compileExpression(e.Expr); err != nil {
+			return err
+		}
+		if (e.Type == "string" || e.Type == "str") && acg.getExprType(e.Expr) != "string" {
+			acg.emitNumToStringA64()
+		}
+		return nil
 
 	case *PipeExpr:
 		// Pipe operator: left | right
@@ -3397,6 +3306,7 @@ func (acg *ARM64CodeGen) compileAssignment(assign *AssignStmt) error {
 
 // compileMatchExpr compiles a match expression (if/else equivalent)
 func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
+	tail := acg.tailExpr == Expression(expr)
 	// Compile the condition expression (result in d0)
 	if err := acg.compileExpression(expr.Condition); err != nil {
 		return err
@@ -3462,15 +3372,14 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 			if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
 				return err
 			}
-			acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
-			acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+			acg.emitTruthyA64(0, 0)
 			nextClauseJumpPos = acg.eb.text.Len()
-			acg.out.BranchCond("eq", 0) // skip body if condition == 0
+			acg.emitWords(0xB4000000) // cbz x0 // skip body if condition == 0
 		}
 
 		// Matched! Compile result
 		if clause.Result != nil {
-			if err := acg.compileExpression(clause.Result); err != nil {
+			if err := acg.compileInTail(clause.Result, tail); err != nil {
 				return err
 			}
 		}
@@ -3487,7 +3396,7 @@ func (acg *ARM64CodeGen) compileMatchExpr(expr *MatchExpr) error {
 
 	// Default clause
 	if expr.DefaultExpr != nil {
-		if err := acg.compileExpression(expr.DefaultExpr); err != nil {
+		if err := acg.compileInTail(expr.DefaultExpr, tail); err != nil {
 			return err
 		}
 	} else if len(expr.Clauses) == 0 {
@@ -3738,9 +3647,16 @@ func (acg *ARM64CodeGen) compileParallelExpr(expr *ParallelExpr) error {
 // compileCall compiles a function call
 // Confidence that this function is working: 75%
 func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
+	if l := acg.currentLambda; l != nil && acg.tailExpr == Expression(call) && l.VarName != "" &&
+		call.Function == l.VarName && len(call.Args) == len(l.Params) && acg.stackVars[l.VarName] == -1 {
+		return acg.compileTailCall(call)
+	}
 	// CStruct value constructor: Point(x, y, ...) allocates the struct value.
 	if decl, ok := acg.cstructs[call.Function]; ok {
 		return acg.compileCStructConstructor(decl, call.Args)
+	}
+	if done, err := acg.compileNumBuiltinA64(call); done || err != nil {
+		return err
 	}
 
 	// Check if this is a namespaced call (e.g., sdl.SDL_Init, c.sin)
@@ -3791,14 +3707,9 @@ func (acg *ARM64CodeGen) compileCall(call *CallExpr) error {
 		if err := acg.compileExpression(call.Args[0]); err != nil {
 			return err
 		}
-		// Arg in d0
-		if err := acg.eb.GenerateCallInstruction("_tim_str"); err != nil {
-			return err
+		if acg.getExprType(call.Args[0]) != "string" {
+			acg.emitNumToStringA64()
 		}
-		// Result is a string pointer in x0. Strings use the numeric pointer
-		// convention (scvtf to store, fcvtzs to recover) — matching string
-		// literals and _tim_string_concat — so convert with scvtf, not fmov.
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
 		return nil
 	case "eprint", "eprintln", "eprintf":
 		return acg.compileEprint(call)
@@ -4167,6 +4078,9 @@ func (acg *ARM64CodeGen) compilePrintLibc(arg Expression) error {
 	if err := acg.compileExpression(arg); err != nil {
 		return err
 	}
+	if t := acg.getExprType(arg); t == "list" || t == "map" {
+		return acg.emitWriteSeqA64(1, t == "map")
+	}
 	return acg.emitWriteFloatSmart(1)
 }
 
@@ -4174,60 +4088,10 @@ func (acg *ARM64CodeGen) compilePrint(call *CallExpr) error {
 	if len(call.Args) == 0 {
 		return fmt.Errorf("print requires an argument")
 	}
-
-	arg := call.Args[0]
-
-	// On macOS, use libc printf for better compatibility
-	if acg.eb.target.OS() == OSDarwin {
-		return acg.compilePrintLibc(arg)
+	if err := acg.compilePrintLibc(call.Args[0]); err != nil {
+		return err
 	}
-
-	switch a := arg.(type) {
-	case *StringExpr:
-		// Store string in rodata
-		label := fmt.Sprintf("str_%d", acg.stringCounter)
-		acg.stringCounter++
-		content := a.Value // No newline
-		acg.eb.Define(label, content)
-
-		// mov x0, #1 (stdout)
-		if err := acg.out.MovImm64("x0", 1); err != nil {
-			return err
-		}
-
-		// Load string address into x1
-		offset := uint64(acg.eb.text.Len())
-		acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{
-			offset:     offset,
-			symbolName: label,
-		})
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0x90}) // ADRP x1, #0
-		acg.out.out.writer.WriteBytes([]byte{0x21, 0x00, 0x00, 0x91}) // ADD x1, x1, #0
-
-		// mov x2, length
-		if err := acg.out.MovImm64("x2", uint64(len(content))); err != nil {
-			return err
-		}
-
-		// Syscall number and invocation (OS-specific)
-		if acg.eb.target.OS() == OSDarwin {
-			// macOS: syscall number in x16, svc #0x80
-			if err := acg.out.MovImm64("x16", 0x2000004); err != nil { // write syscall
-				return err
-			}
-			acg.out.out.writer.WriteBytes([]byte{0x01, 0x10, 0x00, 0xd4}) // svc #0x80
-		} else {
-			// Linux: syscall number in x8, svc #0
-			if err := acg.out.MovImm64("x8", 64); err != nil { // write syscall = 64
-				return err
-			}
-			acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0xd4}) // svc #0
-		}
-
-	default:
-		return fmt.Errorf("unsupported print argument type for ARM64: %T", arg)
-	}
-
+	acg.emitWords(0x9E6703E0) // fmov d0, xzr
 	return nil
 }
 
@@ -4255,6 +4119,12 @@ func (acg *ARM64CodeGen) compilePrintlnLibc(arg Expression) error {
 	if err := acg.compileExpression(arg); err != nil {
 		return err
 	}
+	if t := acg.getExprType(arg); t == "list" || t == "map" {
+		if err := acg.emitWriteSeqA64(1, t == "map"); err != nil {
+			return err
+		}
+		return acg.emitWriteLiteral("\n", 1)
+	}
 	if err := acg.emitWriteFloatSmart(1); err != nil {
 		return err
 	}
@@ -4266,166 +4136,26 @@ func (acg *ARM64CodeGen) compilePrintln(call *CallExpr) error {
 	if len(call.Args) == 0 {
 		return fmt.Errorf("println requires an argument")
 	}
-
-	arg := call.Args[0]
-
-	// On macOS, use libc puts/printf for better compatibility
-	if acg.eb.target.OS() == OSDarwin {
-		return acg.compilePrintlnLibc(arg)
-	}
-
-	// For string literals, use syscall directly (more efficient)
-	if strExpr, ok := arg.(*StringExpr); ok {
-		// Store string in rodata
-		label := fmt.Sprintf("str_%d", acg.stringCounter)
-		acg.stringCounter++
-		content := strExpr.Value + "\n"
-		acg.eb.Define(label, content)
-
-		// mov x0, #1 (stdout)
-		if err := acg.out.MovImm64("x0", 1); err != nil {
+	if len(call.Args) == 1 {
+		if err := acg.compilePrintlnLibc(call.Args[0]); err != nil {
 			return err
 		}
-
-		// Load string address into x1
-		offset := uint64(acg.eb.text.Len())
-		acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{
-			offset:     offset,
-			symbolName: label,
-		})
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0x90}) // ADRP x1, #0
-		acg.out.out.writer.WriteBytes([]byte{0x21, 0x00, 0x00, 0x91}) // ADD x1, x1, #0
-
-		// mov x2, length
-		if err := acg.out.MovImm64("x2", uint64(len(content))); err != nil {
-			return err
-		}
-
-		// Syscall number and invocation (OS-specific)
-		if acg.eb.target.OS() == OSDarwin {
-			// macOS: syscall number in x16, svc #0x80
-			if err := acg.out.MovImm64("x16", 0x2000004); err != nil { // write syscall
+	} else {
+		for i, arg := range call.Args {
+			if i > 0 {
+				if err := acg.emitWriteLiteral(" ", 1); err != nil {
+					return err
+				}
+			}
+			if err := acg.compilePrintLibc(arg); err != nil {
 				return err
 			}
-			acg.out.out.writer.WriteBytes([]byte{0x01, 0x10, 0x00, 0xd4}) // svc #0x80
-		} else {
-			// Linux: syscall number in x8, svc #0
-			if err := acg.out.MovImm64("x8", 64); err != nil { // write syscall = 64
-				return err
-			}
-			acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0xd4}) // svc #0
 		}
-
-		return nil
-	}
-
-	// For numbers, convert to string and output via syscall
-	// This avoids libc printf which has calling convention issues on ARM64
-
-	// Compile the expression to get the number in d0
-	if err := acg.compileExpression(arg); err != nil {
-		return err
-	}
-
-	// Convert float64 in d0 to signed integer in x0
-	// fcvtzs x0, d0
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
-
-	// Special case: if x0 == 0, just print "0\n"
-	// cmp x0, #0
-	acg.out.out.writer.WriteBytes([]byte{0x1f, 0x00, 0x00, 0xf1})
-	// b.ne non_zero
-	nonZeroJump := acg.eb.text.Len()
-	acg.out.BranchCond("ne", 0) // Placeholder
-
-	// Zero case - print "0\n" via syscall
-	zeroLabel := fmt.Sprintf("println_zero_%d", acg.stringCounter)
-	acg.stringCounter++
-	acg.eb.Define(zeroLabel, "0\n")
-
-	// Load "0\n" address into x1
-	offset := uint64(acg.eb.text.Len())
-	acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{
-		offset:     offset,
-		symbolName: zeroLabel,
-	})
-	acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0x90}) // ADRP x1, #0
-	acg.out.out.writer.WriteBytes([]byte{0x21, 0x00, 0x00, 0x91}) // ADD x1, x1, #0
-
-	// mov x0, #1 (stdout)
-	if err := acg.out.MovImm64("x0", 1); err != nil {
-		return err
-	}
-	// mov x2, #2 (length)
-	if err := acg.out.MovImm64("x2", 2); err != nil {
-		return err
-	}
-	// write syscall
-	if acg.eb.target.OS() == OSDarwin {
-		if err := acg.out.MovImm64("x16", 0x2000004); err != nil {
+		if err := acg.emitWriteLiteral("\n", 1); err != nil {
 			return err
 		}
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x10, 0x00, 0xd4}) // svc #0x80
-	} else {
-		if err := acg.out.MovImm64("x8", 64); err != nil {
-			return err
-		}
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0xd4}) // svc #0
 	}
-
-	// Jump to end after printing zero (don't fall through to non-zero case)
-	zeroEndJump := acg.eb.text.Len()
-	if err := acg.out.Branch(0); err != nil {
-		return err
-	}
-
-	// non_zero:
-	nonZeroPos := acg.eb.text.Len()
-	acg.patchJumpOffset(nonZeroJump, int32(nonZeroPos-nonZeroJump))
-
-	// For non-zero numbers, call _tim_itoa helper
-	// x0 already has the integer value
-	// itoa uses global buffer, no need to allocate or pass buffer address
-
-	// Call _tim_itoa(x0=number) -> x1=buffer, x2=length
-	if err := acg.eb.GenerateCallInstruction("_tim_itoa"); err != nil {
-		return err
-	}
-
-	// On return: x1 = buffer pointer (global), x2 = length (excluding newline)
-	// Add newline at end: strb w3, [x1, x2] where w3 = '\n'
-	// mov x3, #10
-	acg.out.out.writer.WriteBytes([]byte{0x43, 0x01, 0x80, 0xd2})
-	// strb w3, [x1, x2]
-	acg.out.out.writer.WriteBytes([]byte{0x23, 0x68, 0x22, 0x38})
-	// add x2, x2, #1 (include newline in length)
-	acg.out.out.writer.WriteBytes([]byte{0x42, 0x04, 0x00, 0x91})
-
-	// Write syscall: write(1, buffer, length)
-	// mov x0, #1 (stdout)
-	if err := acg.out.MovImm64("x0", 1); err != nil {
-		return err
-	}
-	// x1 already has buffer pointer
-	// x2 already has length
-
-	// Syscall
-	if acg.eb.target.OS() == OSDarwin {
-		if err := acg.out.MovImm64("x16", 0x2000004); err != nil {
-			return err
-		}
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x10, 0x00, 0xd4}) // svc #0x80
-	} else {
-		if err := acg.out.MovImm64("x8", 64); err != nil {
-			return err
-		}
-		acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x00, 0xd4}) // svc #0
-	}
-
-	// Patch jump from zero case to here
-	endPos := acg.eb.text.Len()
-	acg.patchJumpOffset(zeroEndJump, int32(endPos-zeroEndJump))
-
+	acg.emitWords(0x9E6703E0) // fmov d0, xzr
 	return nil
 }
 
@@ -4511,6 +4241,11 @@ func (acg *ARM64CodeGen) compileWhileStatement(stmt *WhileStmt) error {
 	if err := acg.out.StrImm64("x16", "x29", spSlot); err != nil {
 		return err
 	}
+	acg.stackSize += 8
+	cntSlot := int32(16 + acg.stackSize - 8)
+	if err := acg.out.StrImm64("xzr", "x29", cntSlot); err != nil {
+		return err
+	}
 
 	loopStartPos := acg.eb.text.Len()
 	acg.activeLoops = append(acg.activeLoops, ARM64LoopInfo{
@@ -4520,17 +4255,31 @@ func (acg *ARM64CodeGen) compileWhileStatement(stmt *WhileStmt) error {
 		ContinuePatches: []int{},
 	})
 
+	li := len(acg.activeLoops) - 1
+	if stmt.MaxIterations != math.MaxInt64 {
+		// Leave the loop once it has run MaxIterations times, as on x86_64.
+		if err := acg.out.LdrImm64("x16", "x29", cntSlot); err != nil {
+			return err
+		}
+		if err := acg.out.MovImm64("x17", uint64(stmt.MaxIterations)); err != nil {
+			return err
+		}
+		acg.emitWords(0xEB11021F) // cmp x16, x17
+		acg.activeLoops[li].EndPatches = append(acg.activeLoops[li].EndPatches, acg.eb.text.Len())
+		acg.out.BranchCond("ge", 0)
+		acg.emitWords(0x91000610) // add x16, x16, #1
+		if err := acg.out.StrImm64("x16", "x29", cntSlot); err != nil {
+			return err
+		}
+	}
+
 	// Evaluate the condition (result in d0); exit the loop when it is zero.
 	if err := acg.compileExpression(stmt.Condition); err != nil {
 		return err
 	}
-	acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+	acg.emitTruthyA64(0, 0)
 	condJumpPos := acg.eb.text.Len()
-	if err := acg.out.BranchCond("eq", 0); err != nil { // condition == 0 → end
-		return err
-	}
-	li := len(acg.activeLoops) - 1
+	acg.emitWords(0xB4000000) // cbz x0, end
 	acg.activeLoops[li].EndPatches = append(acg.activeLoops[li].EndPatches, condJumpPos)
 
 	// Body.
@@ -4582,8 +4331,7 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 		return err
 	}
 
-	// Convert d0 (float64) to integer in x0: fcvtzs x0, d0
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
+	acg.emitNumToI64A64()
 
 	// Allocate stack space for start value
 	acg.stackSize += 8
@@ -4598,8 +4346,7 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 		return err
 	}
 
-	// Convert d0 (float64) to integer in x0: fcvtzs x0, d0
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e})
+	acg.emitNumToI64A64()
 
 	// For inclusive ranges (..=), add 1 to the end value
 	if rangeExpr.Inclusive {
@@ -5038,7 +4785,18 @@ func (acg *ARM64CodeGen) compileExitf(call *CallExpr) error {
 	return acg.compileExit(exitCall)
 }
 
-// compileTailCall compiles a tail-recursive call using the "me" keyword
+// compileInTail compiles e, marking it as the lambda's direct result when tail holds.
+func (acg *ARM64CodeGen) compileInTail(e Expression, tail bool) error {
+	if !tail {
+		return acg.compileExpression(e)
+	}
+	old := acg.tailExpr
+	acg.tailExpr = e
+	defer func() { acg.tailExpr = old }()
+	return acg.compileExpression(e)
+}
+
+// compileTailCall compiles a self call in tail position, or one spelled "me"
 func (acg *ARM64CodeGen) compileTailCall(call *CallExpr) error {
 	// Verify we're in a lambda
 	if acg.currentLambda == nil {
@@ -5083,7 +4841,9 @@ func (acg *ARM64CodeGen) compileTailCall(call *CallExpr) error {
 		}
 	}
 
-	// Jump back to the start of the lambda body
+	// Jump back to the start of the lambda body, dropping any match/temporary
+	// spills (sp == x29 there).
+	acg.emitWords(0x910003BF) // mov sp, x29
 	currentPos := acg.eb.text.Len()
 	jumpOffset := int32(acg.currentLambda.BodyStart - currentPos)
 	acg.out.Branch(jumpOffset)
@@ -5226,7 +4986,7 @@ func (acg *ARM64CodeGen) emitWriteLiteral(s string, fd uint64) error {
 
 // emitWriteInteger writes the integer value of d0 (truncated) in base 10.
 func (acg *ARM64CodeGen) emitWriteInteger(fd uint64) error {
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e}) // fcvtzs x0, d0
+	acg.emitNumToI64A64()
 	if err := acg.eb.GenerateCallInstruction("_tim_itoa"); err != nil {
 		return err
 	}
@@ -5236,169 +4996,98 @@ func (acg *ARM64CodeGen) emitWriteInteger(fd uint64) error {
 
 // emitWriteFloat writes d0 as "<int>.<precision digits>" using Tim's format
 // (fixed number of fractional digits, like %f).
-func (acg *ARM64CodeGen) emitWriteFloat(precision int, fd uint64, trim bool) error {
-	if precision < 1 {
-		precision = 6
+func (acg *ARM64CodeGen) emitWriteFloat(precision int, fd uint64) error {
+	precision = min(max(precision, 0), 15)
+	mult := uint64(1)
+	for range precision {
+		mult *= 10
 	}
-	if precision > 15 {
-		precision = 15
+	writeChar := func(c uint64) error {
+		if err := acg.out.MovImm64("x9", c); err != nil {
+			return err
+		}
+		acg.emitWords(0xF90007E9, 0x910023E1) // str x9, [sp, #8]; add x1, sp, #8
+		if err := acg.out.MovImm64("x2", 1); err != nil {
+			return err
+		}
+		return acg.emitSyscallWrite(fd)
 	}
-	acg.out.SubImm64("sp", "sp", 48)
-	if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil { // save value
+	// Frame: [sp] value, [sp+8] char, [sp+16..] digits, [sp+32] integer part, [sp+40] fraction.
+	acg.emitWords(0xD100C3FF, 0xFD0003E0, 0x9E660009, 0xF100013F) // sub sp, sp, #48; str d0, [sp]; fmov x9, d0; cmp x9, #0
+	positive := acg.newLabel()
+	positive.bcond("ge")
+	if err := writeChar('-'); err != nil {
 		return err
 	}
+	acg.emitWords(0xFD4003E0, 0x1E60C000, 0xFD0003E0) // ldr d0, [sp]; fabs d0, d0; str d0, [sp]
+	positive.bind()
 
-	// Leading '-' for values in (-1, 0): the integer part is 0, so _tim_itoa
-	// can't carry the sign. Emit it here when value < 0 and trunc(value) == 0.
-	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil { // intpart
+	// Integer part and fraction digits (rounded to nearest-even), carrying
+	// into the integer part when the digits round up to 10^precision.
+	if err := acg.out.MovImm64("x1", mult); err != nil {
 		return err
 	}
-	acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr (0.0)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
-	geJump := acg.eb.text.Len()
-	acg.out.BranchCond("ge", 0)                                   // value >= 0 -> no sign
-	acg.out.out.writer.WriteBytes([]byte{0x1f, 0x00, 0x00, 0xf1}) // cmp x0, #0
-	neJump := acg.eb.text.Len()
-	acg.out.BranchCond("ne", 0)                        // intpart != 0 -> itoa carries the sign
-	if err := acg.out.MovImm64("x9", 45); err != nil { // '-'
-		return err
-	}
-	if err := acg.out.StrImm64("x9", "sp", 8); err != nil {
-		return err
-	}
-	if err := acg.out.AddImm64("x1", "sp", 8); err != nil {
-		return err
-	}
-	if err := acg.out.MovImm64("x2", 1); err != nil {
-		return err
-	}
-	if err := acg.emitSyscallWrite(fd); err != nil {
-		return err
-	}
-	signHere := acg.eb.text.Len()
-	acg.patchJumpOffset(geJump, int32(signHere-geJump))
-	acg.patchJumpOffset(neJump, int32(signHere-neJump))
-
-	// Integer part via _tim_itoa.
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e}) // fcvtzs x0, d0
+	acg.emitWords(
+		0xFD4003E0, // ldr d0, [sp]
+		0x9E780000, // fcvtzs x0, d0
+		0xF90013E0, // str x0, [sp, #32]
+		0x9E620001, // scvtf d1, x0
+		0x1E613800, // fsub d0, d0, d1
+		0x9E620021, // scvtf d1, x1
+		0x1E610800, // fmul d0, d0, d1
+		0x9E600000, // fcvtns x0, d0
+		0xEB01001F, // cmp x0, x1
+	)
+	noCarry := acg.newLabel()
+	noCarry.bcond("lt")
+	acg.emitWords(
+		0xCB010000, // sub x0, x0, x1
+		0xF94013E2, // ldr x2, [sp, #32]
+		0x91000442, // add x2, x2, #1
+		0xF90013E2, // str x2, [sp, #32]
+	)
+	noCarry.bind()
+	acg.emitWords(0xF90017E0, 0xF94013E0) // str x0, [sp, #40]; ldr x0, [sp, #32]
 	if err := acg.eb.GenerateCallInstruction("_tim_itoa"); err != nil {
 		return err
 	}
 	if err := acg.emitSyscallWrite(fd); err != nil {
 		return err
 	}
-
-	// Decimal point.
-	if err := acg.out.MovImm64("x9", 46); err != nil { // '.'
-		return err
-	}
-	if err := acg.out.StrImm64("x9", "sp", 8); err != nil {
-		return err
-	}
-	if err := acg.out.AddImm64("x1", "sp", 8); err != nil {
-		return err
-	}
-	if err := acg.out.MovImm64("x2", 1); err != nil {
-		return err
-	}
-	if err := acg.emitSyscallWrite(fd); err != nil {
-		return err
-	}
-
-	// Fraction = |value - trunc(value)| scaled by 10^precision, rounded.
-	if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
-		return err
-	}
-	if err := acg.out.FcvtzsDoubleToInt64("x0", "d0"); err != nil {
-		return err
-	}
-	if err := acg.out.ScvtfInt64ToDouble("d1", "x0"); err != nil {
-		return err
-	}
-	if err := acg.out.FsubScalar64("d0", "d0", "d1"); err != nil {
-		return err
-	}
-	if err := acg.out.FabsScalar64("d0", "d0"); err != nil {
-		return err
-	}
-	mult := uint64(1)
-	for range precision {
-		mult *= 10
-	}
-	if err := acg.out.MovImm64("x0", mult); err != nil {
-		return err
-	}
-	if err := acg.out.ScvtfInt64ToDouble("d1", "x0"); err != nil {
-		return err
-	}
-	if err := acg.out.FmulScalar64("d0", "d0", "d1"); err != nil {
-		return err
-	}
-	if err := acg.out.FcvtnsDoubleToInt64("x0", "d0"); err != nil { // round to nearest
-		return err
-	}
-
-	if err := acg.out.MovImm64("x10", 10); err != nil {
-		return err
-	}
-	// Extract digits least-significant first into [sp+16 .. sp+16+precision).
-	for i := precision - 1; i >= 0; i-- {
-		if err := acg.out.UDiv64("x11", "x0", "x10"); err != nil {
+	if precision > 0 {
+		if err := writeChar('.'); err != nil {
 			return err
 		}
-		if err := acg.out.Msub64("x12", "x11", "x10", "x0"); err != nil { // x12 = x0 - x11*x10
+		acg.emitWords(0xF94017E0) // ldr x0, [sp, #40]
+		if err := acg.out.MovImm64("x10", 10); err != nil {
 			return err
 		}
-		if err := acg.out.AddImm64("x12", "x12", 48); err != nil { // '0' + digit
-			return err
+		for i := precision - 1; i >= 0; i-- {
+			if err := acg.out.UDiv64("x11", "x0", "x10"); err != nil {
+				return err
+			}
+			if err := acg.out.Msub64("x12", "x11", "x10", "x0"); err != nil {
+				return err
+			}
+			if err := acg.out.AddImm64("x12", "x12", 48); err != nil {
+				return err
+			}
+			if err := acg.out.StrbImm("x12", "sp", int32(16+i)); err != nil {
+				return err
+			}
+			if err := acg.out.MovReg64("x0", "x11"); err != nil {
+				return err
+			}
 		}
-		if err := acg.out.StrbImm("x12", "sp", int32(16+i)); err != nil {
-			return err
-		}
-		if err := acg.out.MovReg64("x0", "x11"); err != nil {
-			return err
-		}
-	}
-	// Length of the fraction to print, in x2. When trimming (used by println's
-	// smart format), drop trailing '0' digits, keeping at least one.
-	if trim {
-		if err := acg.out.MovImm64("x3", uint64(precision)); err != nil {
-			return err
-		}
-		trimLoop := acg.eb.text.Len()
-		acg.out.out.writer.WriteBytes([]byte{0x7f, 0x04, 0x00, 0xf1}) // cmp x3, #1
-		doneJump := acg.eb.text.Len()
-		acg.out.BranchCond("le", 0)
-		if err := acg.out.SubImm64("x4", "x3", 1); err != nil { // index of last digit
-			return err
-		}
-		if err := acg.out.AddImm64("x5", "sp", 16); err != nil {
-			return err
-		}
-		acg.out.out.writer.WriteBytes([]byte{0xa6, 0x68, 0x64, 0x38}) // ldrb w6, [x5, x4]
-		acg.out.out.writer.WriteBytes([]byte{0xdf, 0xc0, 0x00, 0x71}) // cmp w6, #48 ('0')
-		keepJump := acg.eb.text.Len()
-		acg.out.BranchCond("ne", 0)
-		if err := acg.out.SubImm64("x3", "x3", 1); err != nil {
-			return err
-		}
-		backPos := acg.eb.text.Len()
-		acg.out.Branch(0)
-		acg.patchJumpOffset(backPos, int32(trimLoop-backPos))
-		here := acg.eb.text.Len()
-		acg.patchJumpOffset(doneJump, int32(here-doneJump))
-		acg.patchJumpOffset(keepJump, int32(here-keepJump))
-		acg.out.out.writer.WriteBytes([]byte{0xe2, 0x03, 0x03, 0xaa}) // mov x2, x3
-	} else {
 		if err := acg.out.MovImm64("x2", uint64(precision)); err != nil {
 			return err
 		}
-	}
-	if err := acg.out.AddImm64("x1", "sp", 16); err != nil {
-		return err
-	}
-	if err := acg.emitSyscallWrite(fd); err != nil {
-		return err
+		if err := acg.out.AddImm64("x1", "sp", 16); err != nil {
+			return err
+		}
+		if err := acg.emitSyscallWrite(fd); err != nil {
+			return err
+		}
 	}
 	return acg.out.AddImm64("sp", "sp", 48)
 }
@@ -5407,45 +5096,8 @@ func (acg *ARM64CodeGen) emitWriteFloat(precision int, fd uint64, trim bool) err
 // no fractional part (42, -7), other values print with trailing zeros trimmed
 // (3.14159). This is Tim's libc-free equivalent of printf("%.15g").
 func (acg *ARM64CodeGen) emitWriteFloatSmart(fd uint64) error {
-	acg.out.SubImm64("sp", "sp", 16)
-	if err := acg.out.StrImm64Double("d0", "sp", 0); err != nil {
-		return err
-	}
-	// Whole-number test: trunc(value) == value ?
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e}) // fcvtzs x0, d0
-	acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x62, 0x9e}) // scvtf d1, x0
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
-	floatJump := acg.eb.text.Len()
-	acg.out.BranchCond("ne", 0)
-
-	// Whole: print integer and finish.
-	if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
-		return err
-	}
-	acg.out.AddImm64("sp", "sp", 16)
-	if err := acg.emitWriteInteger(fd); err != nil {
-		return err
-	}
-	endJump := acg.eb.text.Len()
-	acg.out.Branch(0)
-
-	// Fractional: print with trailing-zero trimming.
-	floatPos := acg.eb.text.Len()
-	acg.patchJumpOffset(floatJump, int32(floatPos-floatJump))
-	if err := acg.out.LdrImm64Double("d0", "sp", 0); err != nil {
-		return err
-	}
-	acg.out.AddImm64("sp", "sp", 16)
-	// 6 fractional digits with trailing-zero trim, matching the x86
-	// compileFloatToString path. Using 15 here would surface the double's
-	// binary-rounding noise (e.g. 123456.789 -> 123456.789000000004307).
-	if err := acg.emitWriteFloat(6, fd, true); err != nil {
-		return err
-	}
-
-	endPos := acg.eb.text.Len()
-	acg.patchJumpOffset(endJump, int32(endPos-endJump))
-	return nil
+	acg.emitNumToStringA64()
+	return acg.emitWriteTimString(fd)
 }
 
 // emitWriteTimString writes a Tim string (map[index]=charcode) held in d0,
@@ -5542,10 +5194,9 @@ func (acg *ARM64CodeGen) emitWriteBool(yesNo bool, fd uint64) error {
 	if yesNo {
 		t, f = "yes", "no"
 	}
-	acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+	acg.emitTruthyA64(0, 0)
 	falseJump := acg.eb.text.Len()
-	acg.out.BranchCond("eq", 0)
+	acg.emitWords(0xB4000000) // cbz x0
 	if err := acg.emitWriteLiteral(t, fd); err != nil {
 		return err
 	}
@@ -5640,14 +5291,24 @@ func (acg *ARM64CodeGen) compilePrintfNative(call *CallExpr, fd uint64) error {
 			if err := acg.compileExpression(arg); err != nil {
 				return err
 			}
-			if err := acg.emitWriteFloat(6, fd, false); err != nil {
+			var err error
+			switch acg.getExprType(arg) {
+			case "string":
+				err = acg.emitWriteTimString(fd)
+			case "list":
+				err = acg.emitWriteListA64(fd)
+			default:
+				err = acg.emitWriteFloatSmart(fd)
+			}
+			if err != nil {
 				return err
 			}
 		case 'f', 'F', 'g', 'G', 'e', 'E':
 			if err := acg.compileExpression(arg); err != nil {
 				return err
 			}
-			if err := acg.emitWriteFloat(precision, fd, false); err != nil {
+			acg.emitNumToFloatA64()
+			if err := acg.emitWriteFloat(precision, fd); err != nil {
 				return err
 			}
 		case 's':
@@ -5827,10 +5488,9 @@ func (acg *ARM64CodeGen) compilePrintf(call *CallExpr) error {
 			// Value now in d0; store it in the slot in the form printf expects.
 			if boolPositions[i] {
 				// %b -> %s: store pointer to "yes"/"no".
-				acg.out.out.writer.WriteBytes([]byte{0xe1, 0x03, 0x67, 0x9e}) // fmov d1, xzr
-				acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x61, 0x1e}) // fcmp d0, d1
+				acg.emitTruthyA64(0, 0)
 				noJump := acg.eb.text.Len()
-				acg.out.BranchCond("eq", 0)
+				acg.emitWords(0xB4000000) // cbz x0
 				off := uint64(acg.eb.text.Len())
 				acg.eb.pcRelocations = append(acg.eb.pcRelocations, PCRelocation{offset: off, symbolName: yesLabel})
 				acg.out.out.writer.WriteBytes([]byte{0x09, 0x00, 0x00, 0x90}) // ADRP x9, #0
@@ -6486,9 +6146,12 @@ func (acg *ARM64CodeGen) generateLambdaFunctions() error {
 		acg.pushDeferScope()
 
 		// Compile lambda body (result in d0)
+		oldTail := acg.tailExpr
+		acg.tailExpr = lambda.Body
 		if err := acg.compileExpression(lambda.Body); err != nil {
 			return err
 		}
+		acg.tailExpr = oldTail
 
 		// Pop defer scope and execute deferred expressions
 		if err := acg.popDeferScope(); err != nil {
@@ -6554,6 +6217,9 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 				return "list"
 			}
 		}
+		if e.Operator == "*" && acg.getExprType(e.Left) == "list" {
+			return "list"
+		}
 		return "number"
 	case *CallExpr:
 		// Function calls - check if function returns a string
@@ -6573,6 +6239,40 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 	case *ParallelExpr:
 		// Parallel expr returns a list
 		return "list"
+	case *CastExpr:
+		switch e.Type {
+		case "string", "str":
+			return "string"
+		case "list", "map":
+			return e.Type
+		}
+		return "number"
+	case *MatchExpr:
+		for _, cl := range e.Clauses {
+			if cl.Result != nil {
+				if t := acg.getExprType(cl.Result); t != "unknown" {
+					return t
+				}
+			}
+		}
+		if e.DefaultExpr != nil {
+			if t := acg.getExprType(e.DefaultExpr); t != "unknown" {
+				return t
+			}
+		}
+		return "number"
+	case *BlockExpr:
+		if n := len(e.Statements); n > 0 {
+			switch s := e.Statements[n-1].(type) {
+			case *ExpressionStmt:
+				return acg.getExprType(s.Expr)
+			case *JumpStmt:
+				if s.Value != nil {
+					return acg.getExprType(s.Value)
+				}
+			}
+		}
+		return "unknown"
 	default:
 		return "unknown"
 	}
@@ -7359,142 +7059,17 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 	if err := acg.generateTimMalloc(); err != nil {
 		return err
 	}
+	if acg.usesNumRuntime {
+		acg.generateNumRuntimeA64()
+	}
 
 	// Generate _tim_list_concat(left_ptr, right_ptr) -> new_ptr
 	// Arguments: x0 = left_ptr, x1 = right_ptr
 	// Returns: x0 = pointer to new concatenated list
 	// List format: [length (8 bytes)][elem0 (8 bytes)][elem1 (8 bytes)]...
 
-	acg.eb.MarkLabel("_tim_list_concat")
-
-	// Function prologue
-	// stp x29, x30, [sp, #-N]! (save fp and lr, pre-decrement sp by N)
-	// We need to save: x29, x30, x19-x28 (callee-saved)
-	// For simplicity, save x29, x30, x19, x20, x21, x22, x23 (7 regs = 56 bytes, round to 64)
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xbc, 0xa9}) // stp x29, x30, [sp, #-64]!
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x01, 0xa9}) // stp x19, x20, [sp, #16]
-	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x02, 0xa9}) // stp x21, x22, [sp, #32]
-	acg.out.out.writer.WriteBytes([]byte{0xf7, 0x03, 0x03, 0xa9}) // stp x23, x0, [sp, #48] (save x23 and use remaining slot for alignment)
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x03, 0x00, 0x91}) // mov x29, sp
-
-	// Save arguments
-	// x19 = left_ptr, x20 = right_ptr
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x03, 0x00, 0xaa}) // mov x19, x0
-	acg.out.out.writer.WriteBytes([]byte{0xf4, 0x03, 0x01, 0xaa}) // mov x20, x1
-
-	// Get left list length: ldr d0, [x19] then fcvtzs x21, d0
-	if err := acg.out.LdrImm64Double("d0", "x19", 0); err != nil {
-		return err
-	}
-	acg.out.out.writer.WriteBytes([]byte{0x15, 0x00, 0x78, 0x9e}) // fcvtzs x21, d0
-
-	// Get right list length: ldr d0, [x20] then fcvtzs x22, d0
-	if err := acg.out.LdrImm64Double("d0", "x20", 0); err != nil {
-		return err
-	}
-	acg.out.out.writer.WriteBytes([]byte{0x16, 0x00, 0x78, 0x9e}) // fcvtzs x22, d0
-
-	// Calculate total length: x23 = x21 + x22
-	acg.out.out.writer.WriteBytes([]byte{0xb7, 0x02, 0x16, 0x8b}) // add x23, x21, x22
-
-	// Calculate allocation size: x0 = 8 + x23 * 8
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0xf2, 0x7d, 0xd3}) // lsl x0, x23, #3 (multiply by 8)
-	acg.out.AddImm64("x0", "x0", 8)                               // add x0, x0, #8
-
-	// Align to 16 bytes: x0 = (x0 + 15) & ~15
-	acg.out.AddImm64("x0", "x0", 15)                              // add x0, x0, #15
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
-
-	// Call malloc(x0)
-	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
-		return err
-	}
-	// x0 now contains result pointer, save it to x9
-	acg.out.out.writer.WriteBytes([]byte{0xe9, 0x03, 0x00, 0xaa}) // mov x9, x0
-
-	// Write total length to result: scvtf d0, x23 then str d0, [x9]
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x02, 0x62, 0x9e}) // scvtf d0, x23
-	if err := acg.out.StrImm64Double("d0", "x9", 0); err != nil {
-		return err
-	}
-
-	// Copy left list elements
-	// x10 = counter (x21), x11 = src (x19 + 8), x12 = dst (x9 + 8)
-	acg.out.out.writer.WriteBytes([]byte{0xaa, 0x02, 0x15, 0x8b}) // add x10, x21, x21 (x10 = x21, counter)
-	acg.out.out.writer.WriteBytes([]byte{0x6b, 0x22, 0x00, 0x91}) // add x11, x19, #8
-	acg.out.out.writer.WriteBytes([]byte{0x2c, 0x21, 0x00, 0x91}) // add x12, x9, #8
-
-	// Actually just use x10 = x21 for counter
-	acg.out.out.writer.WriteBytes([]byte{0xea, 0x03, 0x15, 0xaa}) // mov x10, x21
-
-	// Loop to copy left elements
-	acg.eb.MarkLabel("_list_concat_copy_left_loop")
-	leftLoopStart := acg.eb.text.Len()
-
-	// cbz x10, skip_left (if zero, skip this loop)
-	leftSkipJumpPos := acg.eb.text.Len()
-	acg.out.out.writer.WriteBytes([]byte{0x0a, 0x00, 0x00, 0xb4}) // cbz x10, +0 (placeholder)
-
-	// ldr d0, [x11], str d0, [x12], increment pointers
-	if err := acg.out.LdrImm64Double("d0", "x11", 0); err != nil {
-		return err
-	}
-	if err := acg.out.StrImm64Double("d0", "x12", 0); err != nil {
-		return err
-	}
-	acg.out.AddImm64("x11", "x11", 8) // add x11, x11, #8
-	acg.out.AddImm64("x12", "x12", 8) // add x12, x12, #8
-	acg.out.SubImm64("x10", "x10", 1) // sub x10, x10, #1
-
-	// Branch back to loop start
-	leftLoopEnd := acg.eb.text.Len()
-	acg.out.Branch(int32(leftLoopStart - leftLoopEnd))
-
-	// Patch the cbz to jump here
-	leftSkipEndPos := acg.eb.text.Len()
-	acg.patchJumpOffset(leftSkipJumpPos, int32(leftSkipEndPos-leftSkipJumpPos))
-
-	// Copy right list elements
-	// x10 = counter (x22), x11 = src (x20 + 8), x12 already points to correct position
-	acg.out.out.writer.WriteBytes([]byte{0xea, 0x03, 0x16, 0xaa}) // mov x10, x22
-	acg.out.out.writer.WriteBytes([]byte{0x8b, 0x22, 0x00, 0x91}) // add x11, x20, #8
-
-	// Loop to copy right elements
-	acg.eb.MarkLabel("_list_concat_copy_right_loop")
-	rightLoopStart := acg.eb.text.Len()
-
-	// cbz x10, skip_right
-	rightSkipJumpPos := acg.eb.text.Len()
-	acg.out.out.writer.WriteBytes([]byte{0x0a, 0x00, 0x00, 0xb4}) // cbz x10, +0 (placeholder)
-
-	// ldr d0, [x11], str d0, [x12], increment pointers
-	if err := acg.out.LdrImm64Double("d0", "x11", 0); err != nil {
-		return err
-	}
-	if err := acg.out.StrImm64Double("d0", "x12", 0); err != nil {
-		return err
-	}
-	acg.out.AddImm64("x11", "x11", 8) // add x11, x11, #8
-	acg.out.AddImm64("x12", "x12", 8) // add x12, x12, #8
-	acg.out.SubImm64("x10", "x10", 1) // sub x10, x10, #1
-
-	// Branch back to loop start
-	rightLoopEnd := acg.eb.text.Len()
-	acg.out.Branch(int32(rightLoopStart - rightLoopEnd))
-
-	// Patch the cbz
-	rightSkipEndPos := acg.eb.text.Len()
-	acg.patchJumpOffset(rightSkipJumpPos, int32(rightSkipEndPos-rightSkipJumpPos))
-
-	// Return result pointer in x0
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x09, 0xaa}) // mov x0, x9
-
-	// Function epilogue - restore registers and return
-	acg.out.out.writer.WriteBytes([]byte{0xf7, 0x03, 0x43, 0xa9}) // ldp x23, x0, [sp, #48]
-	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x42, 0xa9}) // ldp x21, x22, [sp, #32]
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x41, 0xa9}) // ldp x19, x20, [sp, #16]
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc4, 0xa8}) // ldp x29, x30, [sp], #64
-	acg.out.Return("x30")
+	acg.emitListConcatA64()
+	acg.emitListRepeatA64()
 
 	if err := acg.generateListBuiltinHelpers(); err != nil {
 		return err
@@ -7837,89 +7412,6 @@ func (acg *ARM64CodeGen) generateRuntimeHelpers() error {
 
 	// Restore stack and return (buffer is global, so it's safe to deallocate)
 	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc2, 0xa8}) // ldp x29, x30, [sp], #32
-	acg.out.Return("x30")
-
-	// Generate _tim_str(float64) -> pointer (to map string)
-	// Converts float64 in d0 to a Tim string (map of indices to characters)
-	acg.eb.MarkLabel("_tim_str")
-
-	// Prologue
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xba, 0xa9}) // stp x29, x30, [sp, #-96]!
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x01, 0xa9}) // stp x19, x20, [sp, #16]
-	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x02, 0xa9}) // stp x21, x22, [sp, #32]
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x03, 0x00, 0x91}) // mov x29, sp
-
-	// Convert d0 to int64 in x0 for itoa
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x78, 0x9e}) // fcvtzs x0, d0
-
-	// Call itoa: x1=buf, x2=len
-	if err := acg.eb.GenerateCallInstruction("_tim_itoa"); err != nil {
-		return err
-	}
-
-	// Save itoa results
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x03, 0x01, 0xaa}) // mov x19, x1 (buf)
-	acg.out.out.writer.WriteBytes([]byte{0xf4, 0x03, 0x02, 0xaa}) // mov x20, x2 (len)
-
-	// Calculate allocation size for map: 8 + len * 16
-	acg.out.out.writer.WriteBytes([]byte{0x80, 0xf2, 0x7d, 0xd3}) // lsl x0, x20, #3 (len * 8)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf8, 0x7f, 0xd3}) // lsl x0, x0, #1 (len * 16)
-	acg.out.AddImm64("x0", "x0", 8)
-	acg.out.AddImm64("x0", "x0", 15)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xec, 0x7c, 0x92}) // and x0, x0, #0xfffffffffffffff0
-
-	// Call malloc
-	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
-		return err
-	}
-	// x0 = map pointer
-	acg.out.out.writer.WriteBytes([]byte{0xea, 0x03, 0x00, 0xaa}) // mov x10, x0 (map_ptr)
-
-	// Store length as float64 at [x10]
-	acg.out.out.writer.WriteBytes([]byte{0x80, 0x02, 0x62, 0x9e}) // scvtf d0, x20
-	if err := acg.out.StrImm64Double("d0", "x10", 0); err != nil {
-		return err
-	}
-
-	// Loop to fill map: key = index, val = char
-	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x03, 0x1f, 0xaa}) // mov x21, xzr (index)
-	acg.out.AddImm64("x11", "x10", 8)                             // x11 = dst pointer
-
-	acg.eb.MarkLabel("_tim_str_loop")
-	strLoopStart := acg.eb.text.Len()
-
-	// cmp x21, x20; b.ge end
-	acg.out.out.writer.WriteBytes([]byte{0xbf, 0x02, 0x14, 0xeb}) // subs xzr, x21, x20
-	endJumpPos := acg.eb.text.Len()
-	acg.out.BranchCond("ge", 0)
-
-	// key = float64(index)
-	acg.out.out.writer.WriteBytes([]byte{0xa0, 0x02, 0x62, 0x9e}) // scvtf d0, x21
-	if err := acg.out.StrImm64Double("d0", "x11", 0); err != nil {
-		return err
-	}
-
-	// val = float64(buf[index])
-	acg.out.out.writer.WriteBytes([]byte{0x68, 0x6a, 0x75, 0x38}) // ldrb w8, [x19, x21]
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x01, 0x62, 0x9e}) // scvtf d0, x8
-	if err := acg.out.StrImm64Double("d0", "x11", 8); err != nil {
-		return err
-	}
-
-	acg.out.AddImm64("x11", "x11", 16)
-	acg.out.AddImm64("x21", "x21", 1)
-	acg.out.Branch(int32(strLoopStart - acg.eb.text.Len()))
-
-	endPos := acg.eb.text.Len()
-	acg.patchJumpOffset(endJumpPos, int32(endPos-endJumpPos))
-
-	// Result in x0
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0a, 0xaa}) // mov x0, x10
-
-	// Epilogue
-	acg.out.out.writer.WriteBytes([]byte{0xf5, 0x5b, 0x42, 0xa9}) // ldp x21, x22, [sp, #32]
-	acg.out.out.writer.WriteBytes([]byte{0xf3, 0x53, 0x41, 0xa9}) // ldp x19, x20, [sp, #16]
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc6, 0xa8}) // ldp x29, x30, [sp], #96
 	acg.out.Return("x30")
 
 	return nil

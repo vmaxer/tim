@@ -514,6 +514,11 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	fc.out.PushReg("rbp")
 	fc.out.MovRegToReg("rbp", "rsp")
 	fc.out.SubImmFromReg("rsp", StackSlotSize) // Align stack to 16 bytes
+	// Reserve the same frame as the first pass: top-level variables live at
+	// rbp-offset and must stay above rsp, or any call would clobber them.
+	if fc.maxStackOffset > 0 {
+		fc.out.SubImmFromReg("rsp", int64((fc.maxStackOffset+4096+15)&^15))
+	}
 	fc.out.XorRegWithReg("rax", "rax")
 	fc.out.XorRegWithReg("rdi", "rdi")
 	fc.out.XorRegWithReg("rsi", "rsi")

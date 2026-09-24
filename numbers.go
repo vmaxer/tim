@@ -168,6 +168,31 @@ func (fc *TimCompiler) compileNumBuiltin(call *CallExpr) bool {
 		fc.compileExpression(&BinaryExpr{Left: call.Args[0], Operator: "**", Right: call.Args[1]})
 		return true
 	}
+	if (name == "min" || name == "max") && len(call.Args) == 2 {
+		fc.compileExpression(call.Args[0])
+		fc.out.SubImmFromReg("rsp", 16)
+		fc.out.MovXmmToMem("xmm0", "rsp", 0)
+		fc.compileExpression(call.Args[1])
+		fc.out.MovXmmToMem("xmm0", "rsp", 8)
+		fc.out.MovXmmToXmm("xmm1", "xmm0")
+		fc.out.MovMemToXmm("xmm0", "rsp", 0)
+		if name == "min" {
+			fc.emitNumBinop("<=")
+		} else {
+			fc.emitNumBinop(">=")
+		}
+		pickB, done := fc.newNumLabel(), fc.newNumLabel()
+		fc.out.MovqXmmToReg("rax", "xmm0")
+		fc.out.TestRegWithReg("rax", "rax")
+		pickB.jcc(JumpEqual)
+		fc.out.MovMemToXmm("xmm0", "rsp", 0)
+		done.jmp()
+		pickB.bind()
+		fc.out.MovMemToXmm("xmm0", "rsp", 8)
+		done.bind()
+		fc.out.AddImmToReg("rsp", 16)
+		return true
+	}
 	if len(call.Args) != 1 {
 		return false
 	}
@@ -408,6 +433,58 @@ func (fc *TimCompiler) emitNumToI64() {
 	done.bind()
 }
 
+// emitNumFromI64 converts the signed 64-bit integer in rax to a number in xmm0.
+func (fc *TimCompiler) emitNumFromI64() {
+	slow, done := fc.newNumLabel(), fc.newNumLabel()
+	fc.out.MovImmToReg("rcx", fmt.Sprint(numFixMax-1))
+	fc.out.AddRegToReg("rcx", "rax")
+	fc.out.MovImmToReg("rdx", fmt.Sprint(2*numFixMax-2))
+	fc.out.CmpRegToReg("rcx", "rdx")
+	slow.jcc(JumpAbove)
+	fc.out.Cvtsi2sd("xmm0", "rax")
+	done.jmp()
+	slow.bind()
+	fc.out.MovqRegToXmm("xmm0", "rax")
+	fc.emitNumCall(numOpFromI64)
+	done.bind()
+}
+
+var numBitwiseOps = map[string]bool{"|b": true, "&b": true, "^b": true, "<<b": true, ">>b": true, "<<<b": true, ">>>b": true, "?b": true}
+
+// emitBitwise computes xmm0 = xmm0 op xmm1 on 64-bit two's complement integers.
+func (fc *TimCompiler) emitBitwise(op string) {
+	fc.out.SubImmFromReg("rsp", 16)
+	fc.out.MovXmmToMem("xmm1", "rsp", 8)
+	fc.emitNumToI64()
+	fc.out.MovRegToMem("rax", "rsp", 0)
+	fc.out.MovMemToXmm("xmm0", "rsp", 8)
+	fc.emitNumToI64()
+	fc.out.MovRegToReg("rcx", "rax")
+	fc.out.MovMemToReg("rax", "rsp", 0)
+	fc.out.AddImmToReg("rsp", 16)
+	switch op {
+	case "|b":
+		fc.out.OrRegWithReg("rax", "rcx")
+	case "&b":
+		fc.out.AndRegWithReg("rax", "rcx")
+	case "^b":
+		fc.out.XorRegWithReg("rax", "rcx")
+	case "<<b":
+		fc.out.ShlClReg("rax", "cl")
+	case ">>b":
+		fc.out.ShrClReg("rax", "cl")
+	case "<<<b":
+		fc.out.RolClReg("rax", "cl")
+	case ">>>b":
+		fc.out.RorClReg("rax", "cl")
+	case "?b":
+		fc.out.BtRegReg("rax", "rcx")
+		fc.out.SetcReg("al")
+		fc.out.MovzxByteToQword("rax", "al")
+	}
+	fc.emitNumFromI64()
+}
+
 // emitNumToString replaces the number in xmm0 with a Tim string.
 func (fc *TimCompiler) emitNumToString() {
 	fc.emitNumCall(numOpStr)
@@ -435,6 +512,7 @@ func (fc *TimCompiler) generateNumRuntime() {
 	fc.out.MovqXmmToReg("rsi", "xmm0")
 	fc.out.MovqXmmToReg("rdx", "xmm1")
 	fc.out.LeaSymbolToReg("rcx", "_tim_num_alloc")
+	fc.out.XorRegWithReg("r8", "r8")
 	fc.out.CallSymbol("_tim_num_rt")
 	fc.out.MovqRegToXmm("xmm0", "rax")
 	for i := 1; i <= 15; i++ {
@@ -447,9 +525,66 @@ func (fc *TimCompiler) generateNumRuntime() {
 	fc.out.PopReg("rbp")
 	fc.out.Ret()
 
-	// _tim_num_alloc: SysV callback used by the runtime, rdi = size -> rax.
-	calleeSaved := []string{"rbx", "r12", "r13", "r14", "r15"}
+	// _tim_num_alloc: SysV callback used by the runtime, (rdi = ctx, rsi = size) -> rax.
 	fc.eb.MarkLabel("_tim_num_alloc")
+	fc.out.MovRegToReg("rdi", "rsi")
+	if fc.eb.target.OS() == OSLinux {
+		fc.emitNumBumpAlloc()
+	} else {
+		fc.emitNumArenaAlloc()
+	}
+
+	for fc.eb.text.Len()%64 != 0 {
+		fc.out.Write(0xCC)
+	}
+	fc.out.Emit(numRuntimeAMD64[:numRuntimeAMD64Entry])
+	fc.eb.MarkLabel("_tim_num_rt")
+	fc.out.Emit(numRuntimeAMD64[numRuntimeAMD64Entry:])
+}
+
+// emitNumBumpAlloc allocates from 1 MiB mmap chunks (never freed), so the
+// numeric runtime needs neither arenas nor libc on Linux.
+func (fc *TimCompiler) emitNumBumpAlloc() {
+	fc.eb.DefineWritable("_tim_num_heap", string(make([]byte, 16)))
+	refill := fc.newNumLabel()
+	fc.out.AddImmToReg("rdi", 15)
+	fc.out.AndRegWithImm("rdi", -16)
+	fc.out.LeaSymbolToReg("rcx", "_tim_num_heap")
+	fc.out.MovMemToReg("rax", "rcx", 0)
+	fc.out.LeaMemToReg("rsi", "rax", 0)
+	fc.out.AddRegToReg("rsi", "rdi")
+	fc.out.MovMemToReg("rdx", "rcx", 8)
+	fc.out.CmpRegToReg("rsi", "rdx")
+	refill.jcc(JumpAbove)
+	fc.out.MovRegToMem("rsi", "rcx", 0)
+	fc.out.Ret()
+	refill.bind()
+	fc.out.MovImmToReg("rsi", fmt.Sprint(1<<20))
+	fc.out.CmpRegToReg("rdi", "rsi")
+	fc.out.Cmova("rsi", "rdi")
+	fc.out.PushReg("rdi")
+	fc.out.PushReg("rsi")
+	fc.out.XorRegWithReg("rdi", "rdi")
+	fc.out.MovImmToReg("rdx", "3")
+	fc.out.MovImmToReg("r10", "34")
+	fc.out.MovImmToReg("r8", "-1")
+	fc.out.XorRegWithReg("r9", "r9")
+	fc.out.MovImmToReg("rax", "9")
+	fc.out.Syscall()
+	fc.out.PopReg("rsi")
+	fc.out.PopReg("rdi")
+	fc.out.LeaSymbolToReg("rcx", "_tim_num_heap")
+	fc.out.LeaMemToReg("rdx", "rax", 0)
+	fc.out.AddRegToReg("rdx", "rsi")
+	fc.out.MovRegToMem("rdx", "rcx", 8)
+	fc.out.LeaMemToReg("rdx", "rax", 0)
+	fc.out.AddRegToReg("rdx", "rdi")
+	fc.out.MovRegToMem("rdx", "rcx", 0)
+	fc.out.Ret()
+}
+
+func (fc *TimCompiler) emitNumArenaAlloc() {
+	calleeSaved := []string{"rbx", "r12", "r13", "r14", "r15"}
 	fc.out.PushReg("rbp")
 	fc.out.MovRegToReg("rbp", "rsp")
 	for _, r := range calleeSaved {
@@ -467,13 +602,6 @@ func (fc *TimCompiler) generateNumRuntime() {
 	}
 	fc.out.PopReg("rbp")
 	fc.out.Ret()
-
-	for fc.eb.text.Len()%64 != 0 {
-		fc.out.Write(0xCC)
-	}
-	fc.out.Emit(numRuntimeAMD64[:numRuntimeAMD64Entry])
-	fc.eb.MarkLabel("_tim_num_rt")
-	fc.out.Emit(numRuntimeAMD64[numRuntimeAMD64Entry:])
 }
 
 func mapIsStatic(e *MapExpr) bool {

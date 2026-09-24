@@ -328,5 +328,3 @@ func (fc *TimCompiler) writeMachOARM64(outputPath string) error {
 
 	return nil
 }
-
-// writeELFRiscv64 writes a RISC-V64 ELF executable

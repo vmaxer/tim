@@ -386,8 +386,8 @@ Arithmetic runs inline on the float64 fast path and calls a small runtime
 happens to be integral and below 2^53 is indistinguishable from the exact integer.
 Strings, lists and maps are pointers to ordered maps.
 
-Exact arithmetic is implemented in the x86_64 backend (Linux and Windows); the
-arm64 and riscv64 backends still approximate exact numbers with float64.
+All three backends (x86_64, arm64, riscv64) implement exact arithmetic with the
+same runtime, so a program prints the same numbers on every target.
 
 ### Type Annotations
 
@@ -1813,7 +1813,7 @@ See [PLATFORM_ARCHITECTURE.md](PLATFORM_ARCHITECTURE.md) for the full design rat
 | arm64-linux | arm64 | Linux | 🚧 90% (needs defer, dynamic linking) |
 | arm64-darwin | arm64 | macOS | ❌ Not started |
 | arm64-windows | arm64 | Windows | ❌ Not started |
-| riscv64-linux | riscv64 | Linux | 🚧 80% (needs testing) |
+| riscv64-linux | riscv64 | Linux | 🚧 Subset: numbers, strings, flat lists, top-level functions, match/if, loops, printing; no closures, maps or FFI |
 
 ### Syntax
 
@@ -2456,7 +2456,7 @@ tim --version
 
 - **x86_64** (AMD64) - Primary platform
 - **ARM64** (AArch64) - Full support
-- **RISCV64** - Full support
+- **RISCV64** - Subset (see Supported Targets)
 
 ### Compilation Process
 

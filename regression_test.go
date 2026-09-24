@@ -246,3 +246,54 @@ println(f(2 ** 70 + 1))
 		t.Errorf("got %q, want %q", got, want)
 	}
 }
+
+func TestListConcatRepeatUpdate(t *testing.T) {
+	code := `xs := [1, 2]
+ys = xs + [3, 1 / 3]
+println(#ys)
+println(ys)
+println(ys[3])
+zs := [0] * 4
+zs[2] <- 5
+println(zs)
+println([7, 1 / 2] * 2)
+println([1, 2] + [3, 4])
+acc := [1]
+@ i in 0..<3 {
+    acc <- acc + [i * 10]
+}
+println(acc)
+a := [1 / 3, 5, 9]
+@ i in 0..<3 {
+    println(i)
+    println(a[i] + 1)
+}
+`
+	want := "4\n[1, 2, 3, 1/3]\n1/3\n[0, 0, 5, 0]\n[7, 0.5, 7, 0.5]\n[1, 2, 3, 4]\n[1, 0, 10, 20]\n0\n4/3\n1\n6\n2\n10\n"
+	if got := compileAndRunTopLevel(t, code); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestBitwiseMinMaxBounds(t *testing.T) {
+	code := `println(1 <<b 62)
+println(1 <<b 63)
+println(0xFFFFFFFFFFFFFFFF &b 0xFF)
+println((2 ** 64 + 5) &b 7)
+println(0xcbf29ce484222325 ^b 97)
+println(~b 0)
+println(min(1 / 3, 0.3))
+println(max(2 ** 70, 2 ** 70 + 1))
+println(min(-1, -1 / 2))
+n = 10 ** 20 / 10 ** 19
+t := 0
+@ i in 0..<n {
+    t <- t + i
+}
+println(t)
+`
+	want := "4611686018427387904\n-9223372036854775808\n255\n5\n-3750763034362895548\n-1\n0.3\n1180591620717411303425\n-1\n45\n"
+	if got := compileAndRunTopLevel(t, code); got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}

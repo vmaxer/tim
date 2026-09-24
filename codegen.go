@@ -1843,31 +1843,14 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 
 		// Check if variable exists and is mutable
 		offset, exists := fc.variables[s.MapName]
-		isGlobal := false
-		if !exists {
-			// Check if it's a global variable
-			if _, globalExists := fc.globalVars[s.MapName]; globalExists {
-				isGlobal = true
-				if VerboseMode {
-					debugf("DEBUG MapUpdateStmt: '%s' is a global variable\n", s.MapName)
-				}
+		_, isGlobal := fc.globalVars[s.MapName]
+		isGlobal = isGlobal || (exists && offset == -1)
+		if !isGlobal && !exists {
+			suggestions := findSimilarIdentifiers(s.MapName, fc.variables, 3)
+			if len(suggestions) > 0 {
+				compilerError("undefined variable '%s'. Did you mean: %s?", s.MapName, strings.Join(suggestions, ", "))
 			} else {
-				suggestions := findSimilarIdentifiers(s.MapName, fc.variables, 3)
-				if len(suggestions) > 0 {
-					compilerError("undefined variable '%s'. Did you mean: %s?", s.MapName, strings.Join(suggestions, ", "))
-				} else {
-					compilerError("undefined variable '%s'", s.MapName)
-				}
-			}
-		} else if offset == -1 {
-			// offset == -1 means it's a global variable
-			isGlobal = true
-			if VerboseMode {
-				debugf("DEBUG MapUpdateStmt: '%s' is a global variable (offset -1)\n", s.MapName)
-			}
-		} else {
-			if VerboseMode {
-				debugf("DEBUG MapUpdateStmt: '%s' is a local variable at offset %d\n", s.MapName, offset)
+				compilerError("undefined variable '%s'", s.MapName)
 			}
 		}
 
@@ -2545,13 +2528,6 @@ func (fc *TimCompiler) compileIfStatement(stmt *IfStmt) {
 }
 
 func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
-	// SIMD AUTO-VECTORIZATION CHECK
-	// Try to vectorize this loop if possible
-	if fc.tryVectorizeLoop(stmt, rangeExpr) {
-		// Loop was successfully vectorized
-		return
-	}
-
 	// Fall back to scalar compilation
 	// REGISTER ALLOCATION OPTIMIZATION:
 	// Use rbx for loop counter, r12 for loop limit
@@ -2655,16 +2631,16 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 
 	// Evaluate range start and store in counter (register or stack)
 	fc.compileExpression(rangeExpr.Start)
+	fc.emitNumToI64()
 	if useRegister {
-		fc.out.Cvttsd2si(counterReg, "xmm0") // counter = start
+		fc.out.MovRegToReg(counterReg, "rax") // counter = start
 	} else {
-		fc.out.Cvttsd2si("rax", "xmm0")
 		fc.out.MovRegToMem("rax", "rbp", -counterOffset)
 	}
 
 	// Evaluate range end and store on stack (limit)
 	fc.compileExpression(rangeExpr.End)
-	fc.out.Cvttsd2si("rax", "xmm0") // rax = loop limit
+	fc.emitNumToI64() // rax = loop limit
 	// For inclusive ranges (..=), increment end by 1
 	if rangeExpr.Inclusive {
 		fc.out.IncReg("rax")
@@ -2837,140 +2813,6 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 	fc.activeLoops = fc.activeLoops[:len(fc.activeLoops)-1]
 }
 
-// tryVectorizeLoop attempts to vectorize a simple range loop
-// Returns true if loop was vectorized, false if should fall back to scalar
-func (fc *TimCompiler) tryVectorizeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) bool {
-	// Check if optimizer already marked this loop as vectorizable
-	if !stmt.Vectorized {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Loop not marked as vectorizable by optimizer\n")
-		}
-		return false
-	}
-
-	// Only vectorize on x86-64 with AVX support for now
-	if fc.platform.Arch != ArchX86_64 {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Not x86-64 architecture, skipping vectorization\n")
-		}
-		return false
-	}
-
-	// Only vectorize simple patterns for now:
-	// @ i in range(n) { result[i] <- a[i] + b[i] }
-	if len(stmt.Body) != 1 {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Loop body has %d statements, need exactly 1\n", len(stmt.Body))
-		}
-		return false // Only single-statement loops
-	}
-
-	// Handle both AssignStmt and MapUpdateStmt
-	var binExpr *BinaryExpr
-	var lhsName string
-
-	if assign, ok := stmt.Body[0].(*AssignStmt); ok {
-		// Check if LHS is also an index expression
-		lhsName = assign.Name
-		if !strings.Contains(lhsName, "[") {
-			if VerboseMode {
-				fmt.Fprintf(os.Stderr, "SIMD: LHS is not array access: '%s'\n", lhsName)
-			}
-			return false // LHS must be array access
-		}
-
-		// Check if RHS is a binary expression (a[i] + b[i])
-		var ok bool
-		binExpr, ok = assign.Value.(*BinaryExpr)
-		if !ok {
-			if VerboseMode {
-				fmt.Fprintf(os.Stderr, "SIMD: RHS is not a BinaryExpr: %T\n", assign.Value)
-			}
-			return false // Must be binary operation
-		}
-	} else if mapUpdate, ok := stmt.Body[0].(*MapUpdateStmt); ok {
-		// Array update: result[i] <- value
-		lhsName = mapUpdate.MapName + "[" + stmt.Iterator + "]"
-
-		// Check if value is a binary expression
-		var ok bool
-		binExpr, ok = mapUpdate.Value.(*BinaryExpr)
-		if !ok {
-			if VerboseMode {
-				fmt.Fprintf(os.Stderr, "SIMD: MapUpdate value is not a BinaryExpr: %T\n", mapUpdate.Value)
-			}
-			return false
-		}
-	} else {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Loop body is not AssignStmt or MapUpdateStmt: %T\n", stmt.Body[0])
-		}
-		return false
-	}
-
-	// Support addition, subtraction, and multiplication
-	if binExpr.Operator != "+" && binExpr.Operator != "-" && binExpr.Operator != "*" {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Unsupported operator: %s\n", binExpr.Operator)
-		}
-		return false
-	}
-
-	// Check if both operands are index expressions
-	leftIndex, leftOk := binExpr.Left.(*IndexExpr)
-	rightIndex, rightOk := binExpr.Right.(*IndexExpr)
-	if !leftOk || !rightOk {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Operands are not IndexExpr: left=%T, right=%T\n",
-				binExpr.Left, binExpr.Right)
-		}
-		return false
-	}
-
-	// Verify indices use the loop iterator
-	leftIdxIdent, leftIdxOk := leftIndex.Index.(*IdentExpr)
-	rightIdxIdent, rightIdxOk := rightIndex.Index.(*IdentExpr)
-	if !leftIdxOk || !rightIdxOk {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Indices are not IdentExpr: left=%T, right=%T\n",
-				leftIndex.Index, rightIndex.Index)
-		}
-		return false
-	}
-
-	if leftIdxIdent.Name != stmt.Iterator || rightIdxIdent.Name != stmt.Iterator {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Indices don't match iterator '%s': left='%s', right='%s'\n",
-				stmt.Iterator, leftIdxIdent.Name, rightIdxIdent.Name)
-		}
-		return false // Indices must use loop iterator
-	}
-
-	// Extract base array names
-	leftArray, leftArrayOk := leftIndex.List.(*IdentExpr)
-	rightArray, rightArrayOk := rightIndex.List.(*IdentExpr)
-	if !leftArrayOk || !rightArrayOk {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Array bases are not IdentExpr: left=%T, right=%T\n",
-				leftIndex.List, rightIndex.List)
-		}
-		return false
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "SIMD: Vectorizing loop - pattern: %s = %s[i] %s %s[i]\n",
-			lhsName, leftArray.Name, binExpr.Operator, rightArray.Name)
-		fmt.Fprintf(os.Stderr, "SIMD: Vector width: %d elements\n", stmt.VectorWidth)
-	}
-
-	// Emit vectorized code using the vector width from the optimizer
-	fc.emitVectorizedBinaryOpLoop(stmt, rangeExpr, lhsName, leftArray.Name, rightArray.Name,
-		binExpr.Operator, stmt.VectorWidth)
-
-	// Successfully vectorized
-	return true
-}
-
 // emitVectorizedBinaryOpLoop emits SIMD code for: result[i] = a[i] OP b[i]
 func (fc *TimCompiler) emitVectorizedBinaryOpLoop(stmt *LoopStmt, rangeExpr *RangeExpr,
 	resultName, leftArrayName, rightArrayName string, operator string, vectorWidth int) {
@@ -2998,10 +2840,12 @@ func (fc *TimCompiler) emitVectorizedBinaryOpLoop(stmt *LoopStmt, rangeExpr *Ran
 
 	// Evaluate and store range start and end
 	fc.compileExpression(rangeExpr.Start)
-	fc.out.Cvttsd2si("rbx", "xmm0") // rbx = loop counter (start)
+	fc.emitNumToI64()
+	fc.out.MovRegToReg("rbx", "rax") // rbx = loop counter (start)
 
 	fc.compileExpression(rangeExpr.End)
-	fc.out.Cvttsd2si("r12", "xmm0") // r12 = loop limit (end)
+	fc.emitNumToI64()
+	fc.out.MovRegToReg("r12", "rax") // r12 = loop limit (end)
 	if rangeExpr.Inclusive {
 		fc.out.IncReg("r12")
 	}
@@ -4019,6 +3863,9 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 				return "list"
 			}
 		}
+		if e.Operator == "*" && fc.getExprType(e.Left) == "list" {
+			return "list"
+		}
 		return "number"
 	case *CallExpr:
 		// Check if this is a C FFI call (namespace.function where namespace is a C import)
@@ -4988,10 +4835,9 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.out.XorRegWithImm("rax", 1)
 			fc.out.Cvtsi2sd("xmm0", "rax")
 		case "~b":
-			// Bitwise NOT: convert to int64, NOT, convert back
-			fc.out.Cvttsd2si("rax", "xmm0") // rax = int64(xmm0)
-			fc.out.NotReg("rax")            // rax = ~rax
-			fc.out.Cvtsi2sd("xmm0", "rax")  // xmm0 = float64(rax)
+			fc.emitNumToI64()
+			fc.out.NotReg("rax")
+			fc.emitNumFromI64()
 		case "#":
 			// Length operator: return length of list/map/string
 			// For numbers, return 1.0 (numbers are single-element maps)
@@ -5094,53 +4940,23 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				compilerError("or! operator requires a right-hand side expression or block")
 			}
 
-			// Compile left expression into xmm0
+			// Errors (positive NaNs) and 0 take the right-hand side; exact
+			// numbers are negative NaNs and stay.
 			fc.compileExpression(e.Left)
-
-			// Check if xmm0 is NaN by comparing with itself
-			fc.out.Ucomisd("xmm0", "xmm0") // Compare xmm0 with itself
-			// If NaN, parity flag is set (PF=1)
-			// Jump to execute_default if parity (i.e., if value is NaN)
-			executeDefaultPos1 := fc.eb.text.Len()
-			fc.out.JumpConditional(JumpParity, 0) // jp (jump if parity/NaN)
-
-			// Not NaN, now check if xmm0 == 0.0 (null pointer)
-			zeroReg := fc.regTracker.AllocXMM("or_bang_zero")
-			if zeroReg == "" {
-				zeroReg = "xmm2" // Fallback
-			}
-			fc.out.XorpdXmm(zeroReg, zeroReg) // zero register = 0.0
-			fc.out.Ucomisd("xmm0", zeroReg)   // Compare xmm0 with 0.0
-			fc.regTracker.FreeXMM(zeroReg)
-
-			// Jump to execute_default if equal (i.e., if value is 0/null)
-			executeDefaultPos2 := fc.eb.text.Len()
-			fc.out.JumpConditional(JumpEqual, 0) // je (jump if equal to 0)
-
-			// Value is valid (not NaN and not 0), skip to end without evaluating right side
-			skipDefaultPos := fc.eb.text.Len()
-			fc.out.JumpUnconditional(0) // jmp (unconditional jump to end)
-
-			// execute_default label: evaluate right expression (could be block or value)
-			executeDefaultLabel := fc.eb.text.Len()
-			fc.compileExpression(e.Right) // Result goes to xmm0
-
-			// End label
-			endLabel := fc.eb.text.Len()
-
-			// Patch the jumps
-			// Patch NaN check jump to execute_default
-			offset1 := int32(executeDefaultLabel - (executeDefaultPos1 + 6))
-			fc.patchJumpImmediate(executeDefaultPos1+2, offset1)
-
-			// Patch zero check jump to execute_default
-			offset2 := int32(executeDefaultLabel - (executeDefaultPos2 + 6))
-			fc.patchJumpImmediate(executeDefaultPos2+2, offset2)
-
-			// Patch skip jump to end
-			offset3 := int32(endLabel - (skipDefaultPos + 5))
-			fc.patchJumpImmediate(skipDefaultPos+1, offset3)
-
+			notNaN, useDefault, end := fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel()
+			fc.out.Ucomisd("xmm0", "xmm0")
+			notNaN.jcc(JumpNotParity)
+			fc.out.MovqXmmToReg("rax", "xmm0")
+			fc.out.TestRegWithReg("rax", "rax")
+			end.jcc(JumpLess)
+			useDefault.jmp()
+			notNaN.bind()
+			fc.out.XorpdXmm("xmm2", "xmm2")
+			fc.out.Ucomisd("xmm0", "xmm2")
+			end.jcc(JumpNotEqual)
+			useDefault.bind()
+			fc.compileExpression(e.Right)
+			end.bind()
 			// xmm0 now contains either original value (if not NaN/null) or result of right side
 			return
 		}
@@ -5180,6 +4996,9 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				// Call _tim_list_repeat(list_ptr in rdi, count in rdx)
 				// We need to implement this helper function
 				fc.out.SubImmFromReg("rsp", StackSlotSize)
+				fc.trackFunctionCall("_tim_list_repeat")
+				fc.trackFunctionCall("_tim_list_concat")
+				fc.usesArenas = true
 				fc.out.CallSymbol("_tim_list_repeat")
 				fc.out.AddImmToReg("rsp", StackSlotSize)
 
@@ -5312,8 +5131,8 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				// Align stack for call
 				fc.out.SubImmFromReg("rsp", StackSlotSize)
 
-				// Call the helper function
-				// Note: Don't track internal function calls (see comment at _tim_string_eq call)
+				fc.trackFunctionCall("_tim_list_concat")
+				fc.usesArenas = true
 				fc.out.CallSymbol("_tim_list_concat")
 
 				fc.out.AddImmToReg("rsp", StackSlotSize)
@@ -5515,6 +5334,10 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.emitNumBinop(e.Operator)
 			break
 		}
+		if numBitwiseOps[e.Operator] {
+			fc.emitBitwise(e.Operator)
+			break
+		}
 		// Perform scalar floating-point operation
 		switch e.Operator {
 		case "*+":
@@ -5561,57 +5384,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			// NOTE: or! is now handled specially before the operator switch (see above)
 			// This case should never be reached. If it is, there's a bug in the special handling.
 			compilerError("or! operator reached generic binary operation switch (should be handled specially)")
-		case "<<b":
-			// Shift left: convert to int64, shift, convert back
-			fc.out.Cvttsd2si("rax", "xmm0") // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1") // rcx = int64(xmm1)
-			fc.out.ShlClReg("rax", "cl")    // rax <<= cl
-			fc.out.Cvtsi2sd("xmm0", "rax")  // xmm0 = float64(rax)
-		case ">>b":
-			// Shift right: convert to int64, shift, convert back
-			fc.out.Cvttsd2si("rax", "xmm0") // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1") // rcx = int64(xmm1)
-			fc.out.ShrClReg("rax", "cl")    // rax >>= cl
-			fc.out.Cvtsi2sd("xmm0", "rax")  // xmm0 = float64(rax)
-		case "<<<b":
-			// Rotate left: convert to int64, rotate, convert back
-			fc.out.Cvttsd2si("rax", "xmm0") // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1") // rcx = int64(xmm1)
-			fc.out.RolClReg("rax", "cl")    // rol rax, cl
-			fc.out.Cvtsi2sd("xmm0", "rax")  // xmm0 = float64(rax)
-		case ">>>b":
-			// Rotate right: convert to int64, rotate, convert back
-			fc.out.Cvttsd2si("rax", "xmm0") // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1") // rcx = int64(xmm1)
-			fc.out.RorClReg("rax", "cl")    // ror rax, cl
-			fc.out.Cvtsi2sd("xmm0", "rax")  // xmm0 = float64(rax)
-		case "?b":
-			// Bit test: test if bit at position (xmm1) is set in value (xmm0)
-			// Returns 1.0 if bit is set, 0.0 otherwise
-			fc.out.Cvttsd2si("rax", "xmm0")      // rax = int64(value)
-			fc.out.Cvttsd2si("rcx", "xmm1")      // rcx = int64(bit_position)
-			fc.out.BtRegReg("rax", "rcx")        // BT rax, rcx (sets CF if bit is set)
-			fc.out.SetcReg("al")                 // al = CF ? 1 : 0
-			fc.out.MovzxByteToQword("rax", "al") // Zero-extend al to rax
-			fc.out.Cvtsi2sd("xmm0", "rax")       // xmm0 = float64(result)
-		case "|b":
-			// Bitwise OR: convert to int64, OR, convert back
-			fc.out.Cvttsd2si("rax", "xmm0")   // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1")   // rcx = int64(xmm1)
-			fc.out.OrRegWithReg("rax", "rcx") // rax |= rcx
-			fc.out.Cvtsi2sd("xmm0", "rax")    // xmm0 = float64(rax)
-		case "&b":
-			// Bitwise AND: convert to int64, AND, convert back
-			fc.out.Cvttsd2si("rax", "xmm0")    // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1")    // rcx = int64(xmm1)
-			fc.out.AndRegWithReg("rax", "rcx") // rax &= rcx
-			fc.out.Cvtsi2sd("xmm0", "rax")     // xmm0 = float64(rax)
-		case "^b":
-			// Bitwise XOR: convert to int64, XOR, convert back
-			fc.out.Cvttsd2si("rax", "xmm0")    // rax = int64(xmm0)
-			fc.out.Cvttsd2si("rcx", "xmm1")    // rcx = int64(xmm1)
-			fc.out.XorRegWithReg("rax", "rcx") // rax ^= rcx
-			fc.out.Cvtsi2sd("xmm0", "rax")     // xmm0 = float64(rax)
 		case "::":
 			// Cons: prepend element to list
 			// xmm0 = element, xmm1 = list pointer
@@ -8306,7 +8078,8 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 
 	// String runtime functions (string_concat, string_to_cstr) use arena allocation.
 	// If they're needed but arenas weren't explicitly used in the source, set up arenas now.
-	if !fc.usesArenas && (fc.usedFunctions["_tim_string_concat"] || fc.usedFunctions["_tim_string_to_cstr"] || fc.usedFunctions["_tim_num"]) {
+	numNeedsArena := fc.usedFunctions["_tim_num"] && fc.eb.target.OS() != OSLinux
+	if !fc.usesArenas && (fc.usedFunctions["_tim_string_concat"] || fc.usedFunctions["_tim_string_to_cstr"] || numNeedsArena) {
 		fc.usesArenas = true
 		fc.eb.DefineWritable("_tim_arena_meta", "\x00\x00\x00\x00\x00\x00\x00\x00")
 		fc.eb.DefineWritable("_tim_arena_meta_cap", "\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -8993,70 +8766,41 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		fc.out.MovRegToReg("r12", "rdi") // r12 = left_ptr
 		fc.out.MovRegToReg("r13", "rsi") // r13 = right_ptr
 
-		// Get left list length
-		fc.out.MovMemToXmm("xmm0", "r12", 0)              // load length as float64
-		fc.out.Emit([]byte{0xf2, 0x4c, 0x0f, 0x2c, 0xf0}) // cvttsd2si r14, xmm0
-
-		// Get right list length
-		fc.out.MovMemToXmm("xmm0", "r13", 0)              // load length as float64
-		fc.out.Emit([]byte{0xf2, 0x4c, 0x0f, 0x2c, 0xf8}) // cvttsd2si r15, xmm0
-
-		// Calculate total length: rbx = r14 + r15
+		fc.out.MovMemToXmm("xmm0", "r12", 0)
+		fc.out.Cvttsd2si("r14", "xmm0") // left length
+		fc.out.MovMemToXmm("xmm0", "r13", 0)
+		fc.out.Cvttsd2si("r15", "xmm0") // right length
 		fc.out.MovRegToReg("rbx", "r14")
-		fc.out.Emit([]byte{0x4c, 0x01, 0xfb}) // add rbx, r15
+		fc.out.AddRegToReg("rbx", "r15")
 
-		// Calculate allocation size: rax = 8 + rbx * 8
-		fc.out.MovRegToReg("rax", "rbx")
-		fc.out.Emit([]byte{0x48, 0xc1, 0xe0, 0x03}) // shl rax, 3 (multiply by 8)
-		fc.out.Emit([]byte{0x48, 0x83, 0xc0, 0x08}) // add rax, 8
-
-		// Align to 16 bytes for safety
-		fc.out.Emit([]byte{0x48, 0x83, 0xc0, 0x0f}) // add rax, 15
-		fc.out.Emit([]byte{0x48, 0x83, 0xe0, 0xf0}) // and rax, ~15
-
-		// Call malloc(rax)
-		fc.out.MovRegToReg("rdi", "rax")
-		// Allocate from arena
+		// [count][key0][val0]... : 8 + total*16 bytes
+		fc.out.MovRegToReg("rdi", "rbx")
+		fc.out.ShlImmReg("rdi", 4)
+		fc.out.AddImmToReg("rdi", 8)
 		fc.callArenaAlloc()
-		fc.out.MovRegToReg("r10", "rax") // r10 = result pointer
-
-		// Write total length to result
-		fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2a, 0xc3}) // cvtsi2sd xmm0, rbx
+		fc.out.MovRegToReg("r10", "rax")
+		fc.out.Cvtsi2sd("xmm0", "rbx")
 		fc.out.MovXmmToMem("xmm0", "r10", 0)
 
-		// Copy left list elements
-		// memcpy(r10 + 8, r12 + 8, r14 * 8)
-		fc.out.Emit([]byte{0x4d, 0x89, 0xf1})             // mov r9, r14 (counter)
-		fc.out.Emit([]byte{0x49, 0x8d, 0x74, 0x24, 0x08}) // lea rsi, [r12 + 8]
-		fc.out.Emit([]byte{0x49, 0x8d, 0x7a, 0x08})       // lea rdi, [r10 + 8]
-
-		// Loop to copy left elements
-		fc.eb.MarkLabel("_list_concat_copy_left_loop")
-		fc.out.Emit([]byte{0x4d, 0x85, 0xc9}) // test r9, r9
-		fc.out.Emit([]byte{0x74, 0x17})       // jz +23 bytes (skip loop body)
-
-		fc.out.MovMemToXmm("xmm0", "rsi", 0)        // load element (4 bytes)
-		fc.out.MovXmmToMem("xmm0", "rdi", 0)        // store element (4 bytes)
-		fc.out.Emit([]byte{0x48, 0x83, 0xc6, 0x08}) // add rsi, 8 (4 bytes)
-		fc.out.Emit([]byte{0x48, 0x83, 0xc7, 0x08}) // add rdi, 8 (4 bytes)
-		fc.out.Emit([]byte{0x49, 0xff, 0xc9})       // dec r9 (3 bytes)
-		fc.out.Emit([]byte{0xeb, 0xe4})             // jmp back -28 bytes (2 bytes)
-
-		// Copy right list elements
-		// memcpy(r10 + 8 + r14*8, r13 + 8, r15 * 8)
-		fc.out.Emit([]byte{0x49, 0x8d, 0x75, 0x08}) // lea rsi, [r13 + 8]
-		// rdi already points to correct position
-
-		fc.eb.MarkLabel("_list_concat_copy_right_loop")
-		fc.out.Emit([]byte{0x4d, 0x85, 0xff}) // test r15, r15
-		fc.out.Emit([]byte{0x74, 0x17})       // jz +23 bytes (skip loop body)
-
-		fc.out.MovMemToXmm("xmm0", "rsi", 0)        // load element (4 bytes)
-		fc.out.MovXmmToMem("xmm0", "rdi", 0)        // store element (4 bytes)
-		fc.out.Emit([]byte{0x48, 0x83, 0xc6, 0x08}) // add rsi, 8 (4 bytes)
-		fc.out.Emit([]byte{0x48, 0x83, 0xc7, 0x08}) // add rdi, 8 (4 bytes)
-		fc.out.Emit([]byte{0x49, 0xff, 0xcf})       // dec r15 (3 bytes)
-		fc.out.Emit([]byte{0xeb, 0xe4})             // jmp back -28 bytes (2 bytes)
+		fc.out.XorRegWithReg("rcx", "rcx") // next key
+		fc.out.LeaMemToReg("rdi", "r10", 8)
+		for _, side := range []struct{ list, n string }{{"r12", "r14"}, {"r13", "r15"}} {
+			fc.out.LeaMemToReg("rsi", side.list, 16)
+			fc.out.XorRegWithReg("r8", "r8")
+			loop := fc.eb.text.Len()
+			done := fc.newNumLabel()
+			fc.out.CmpRegToReg("r8", side.n)
+			done.jcc(JumpGreaterOrEqual)
+			fc.out.MovRegToMem("rcx", "rdi", 0)
+			fc.out.MovMemToXmm("xmm0", "rsi", 0)
+			fc.out.MovXmmToMem("xmm0", "rdi", 8)
+			fc.out.AddImmToReg("rsi", 16)
+			fc.out.AddImmToReg("rdi", 16)
+			fc.out.AddImmToReg("rcx", 1)
+			fc.out.AddImmToReg("r8", 1)
+			fc.out.JumpUnconditional(int32(loop - (fc.eb.text.Len() + 5)))
+			done.bind()
+		}
 
 		// Return result pointer in rax
 		fc.out.MovRegToReg("rax", "r10")
@@ -9094,63 +8838,23 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		fc.out.MovRegToReg("r12", "rdi") // r12 = original list_ptr
 		fc.out.MovRegToReg("r13", "rdx") // r13 = count
 
-		// If count <= 0, return empty list
+		// result = [] ++ list ++ list ... (count times), always a fresh heap list
+		fc.eb.Define("_tim_empty_list", "\x00\x00\x00\x00\x00\x00\x00\x00")
+		fc.out.LeaSymbolToReg("rbx", "_tim_empty_list")
+		loop := fc.eb.text.Len()
+		done := fc.newNumLabel()
 		fc.out.TestRegReg("r13", "r13")
-		emptyJumpPos := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpLessOrEqual, 0)
-
-		// If count == 1, return original list (already heap-allocated from literal)
-		// Actually no, we need to copy it to ensure it's mutable
-		// Start with result = original list
-		fc.out.MovRegToReg("rbx", "r12") // rbx = result (start with first copy)
-
-		// Dec count since we already have one copy
-		fc.out.Emit([]byte{0x49, 0xff, 0xcd}) // dec r13
-
-		// Loop: concat result with original list (count-1) times
-		loopStart := fc.eb.text.Len()
-		fc.out.TestRegReg("r13", "r13")
-		loopEndJumpPos := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpEqual, 0)
-
-		// Call _tim_list_concat(result, original)
-		fc.out.MovRegToReg("rdi", "rbx") // first arg = result so far
-		fc.out.MovRegToReg("rsi", "r12") // second arg = original list
+		done.jcc(JumpLessOrEqual)
+		fc.out.MovRegToReg("rdi", "rbx")
+		fc.out.MovRegToReg("rsi", "r12")
 		fc.out.SubImmFromReg("rsp", StackSlotSize)
 		fc.out.CallSymbol("_tim_list_concat")
 		fc.out.AddImmToReg("rsp", StackSlotSize)
-		fc.out.MovRegToReg("rbx", "rax") // update result
-
-		fc.out.Emit([]byte{0x49, 0xff, 0xcd}) // dec r13
-		backJumpPos := fc.eb.text.Len()
-		fc.out.JumpUnconditional(0)
-
-		// Patch loop jump
-		repeatLoopEnd := fc.eb.text.Len()
-		offset1 := int32(repeatLoopEnd - (loopEndJumpPos + ConditionalJumpSize))
-		fc.patchJumpImmediate(loopEndJumpPos+2, offset1)
-		offset2 := int32(loopStart - (backJumpPos + UnconditionalJumpSize))
-		fc.patchJumpImmediate(backJumpPos+1, offset2)
-
-		// Return result
+		fc.out.MovRegToReg("rbx", "rax")
+		fc.out.SubImmFromReg("r13", 1)
+		fc.out.JumpUnconditional(int32(loop - (fc.eb.text.Len() + 5)))
+		done.bind()
 		fc.out.MovRegToReg("rax", "rbx")
-		doneJumpPos := fc.eb.text.Len()
-		fc.out.JumpUnconditional(0)
-
-		// Empty list case: return an empty list
-		emptyLabel := fc.eb.text.Len()
-		fc.out.XorRegWithReg("rax", "rax") // return NULL for now
-
-		// Patch empty jump
-		offset3 := int32(emptyLabel - (emptyJumpPos + ConditionalJumpSize))
-		fc.patchJumpImmediate(emptyJumpPos+2, offset3)
-
-		// Done
-		doneLabel := fc.eb.text.Len()
-		offset4 := int32(doneLabel - (doneJumpPos + UnconditionalJumpSize))
-		fc.patchJumpImmediate(doneJumpPos+1, offset4)
-
-		// Restore registers
 		fc.out.PopReg("r13")
 		fc.out.PopReg("r12")
 		fc.out.PopReg("rbx")
@@ -13476,17 +13180,13 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			fc.out.MovMemToReg(argReg, "rsp", 0)
 			fc.out.AddImmToReg("rsp", 8)
 
+			shadowSpace := fc.allocateShadowSpace()
 			if fc.eb.target.OS() == OSLinux {
-				// Call syscall-based helper
-				shadowSpace := fc.allocateShadowSpace()
 				fc.callFunction("_tim_print_syscall", "")
-				fc.deallocateShadowSpace(shadowSpace)
 			} else {
-				// Call Windows helper (printf-based)
-				shadowSpace := fc.allocateShadowSpace()
-				fc.callFunction("_tim_print_syscall", "")
-				fc.deallocateShadowSpace(shadowSpace)
+				fc.callFunction("_tim_string_print", "")
 			}
+			fc.deallocateShadowSpace(shadowSpace)
 			fc.out.XorRegWithReg("rax", "rax")
 			fc.out.Cvtsi2sd("xmm0", "rax")
 			return
@@ -13507,15 +13207,13 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			fc.out.MovMemToReg(argReg, "rsp", 0)
 			fc.out.AddImmToReg("rsp", 8)
 
+			shadowSpace := fc.allocateShadowSpace()
 			if fc.eb.target.OS() == OSLinux {
-				shadowSpace := fc.allocateShadowSpace()
 				fc.callFunction("_tim_print_syscall", "")
-				fc.deallocateShadowSpace(shadowSpace)
 			} else {
-				shadowSpace := fc.allocateShadowSpace()
-				fc.callFunction("_tim_print_syscall", "")
-				fc.deallocateShadowSpace(shadowSpace)
+				fc.callFunction("_tim_string_print", "")
 			}
+			fc.deallocateShadowSpace(shadowSpace)
 			fc.out.XorRegWithReg("rax", "rax")
 			fc.out.Cvtsi2sd("xmm0", "rax")
 			return
@@ -19649,16 +19347,11 @@ func (fc *TimCompiler) compileARM64(program *Program, outputPath string) error {
 
 // compileRiscv64 compiles a program for RISC-V64 architecture
 func (fc *TimCompiler) compileRiscv64(program *Program, outputPath string) error {
-	// Create RISC-V64 code generator
-	rcg := NewRiscvCodeGen(fc.eb)
-
-	// Generate code
-	if err := rcg.CompileProgram(program); err != nil {
+	img, err := compileRV64(program)
+	if err != nil {
 		return err
 	}
-
-	// Write ELF file
-	return fc.writeELFRiscv64(outputPath)
+	return os.WriteFile(outputPath, img, 0o755)
 }
 
 // writeMachOARM64 writes an ARM64 Mach-O executable for macOS
