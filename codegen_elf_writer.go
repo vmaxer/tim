@@ -371,6 +371,10 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	fc.buildHotFunctionTable()
 	fc.generateHotFunctionTable()
 
+	// Size the layout with the runtime helpers included; this pass's text is
+	// discarded and regenerated below, but the helpers must fit before .dynamic.
+	fc.generateRuntimeHelpers()
+
 	rodataSymbols := fc.eb.RodataSection()
 
 	// Create sorted list of symbol names for deterministic ordering

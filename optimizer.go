@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"math"
+	"math/big"
 	"os"
 	"slices"
 	"strings"
@@ -192,33 +193,19 @@ func foldConstantExpr(expr Expression) Expression {
 		rightNum, rightOk := e.Right.(*NumberExpr)
 
 		if leftOk && rightOk {
-			// Both are constants - fold them
-			var result float64
-			switch e.Operator {
-			case "+":
-				result = leftNum.Value + rightNum.Value
-			case "-":
-				result = leftNum.Value - rightNum.Value
-			case "*":
-				result = leftNum.Value * rightNum.Value
-			case "/":
-				if rightNum.Value == 0 {
-					// Don't fold constant division by zero - let runtime handle it
-					// This allows error handling with or! operator
-					return e
-				}
-				result = leftNum.Value / rightNum.Value
-			case "mod", "%":
-				if rightNum.Value == 0 {
-					// Don't fold constant modulo by zero - let runtime handle it
-					// This allows error handling with or! operator
-					return e
-				}
-				result = math.Mod(leftNum.Value, rightNum.Value)
-			default:
-				return e // Don't fold comparisons
+			if folded := foldNumbers(e.Operator, leftNum, rightNum); folded != nil {
+				return folded
 			}
-			return &NumberExpr{Value: result}
+		}
+		return e
+
+	case *UnaryExpr:
+		e.Operand = foldConstantExpr(e.Operand)
+		if n, ok := e.Operand.(*NumberExpr); ok && e.Operator == "-" {
+			if r, exact := n.Rat(); exact {
+				return newExactNumber(new(big.Rat).Neg(r))
+			}
+			return &NumberExpr{Value: -n.Value}
 		}
 		return e
 
@@ -304,6 +291,9 @@ func areExpressionsEqual(e1, e2 Expression) bool {
 	switch expr1 := e1.(type) {
 	case *NumberExpr:
 		if expr2, ok := e2.(*NumberExpr); ok {
+			if expr1.Exact != nil || expr2.Exact != nil {
+				return expr1.Exact != nil && expr2.Exact != nil && expr1.Exact.Cmp(expr2.Exact) == 0
+			}
 			return expr1.Value == expr2.Value
 		}
 	case *IdentExpr:
@@ -416,6 +406,8 @@ func strengthReduceExpr(expr Expression) Expression {
 		// Check for patterns we can optimize
 		leftNum, leftIsNum := e.Left.(*NumberExpr)
 		rightNum, rightIsNum := e.Right.(*NumberExpr)
+		leftIsNum = leftIsNum && leftNum.Exact == nil
+		rightIsNum = rightIsNum && rightNum.Exact == nil
 
 		switch e.Operator {
 		case "*":
@@ -899,7 +891,7 @@ func propagateConstants(stmt Statement, constMap map[string]*NumberExpr) Stateme
 		if !s.Mutable && !s.IsUpdate {
 			if numExpr, ok := s.Value.(*NumberExpr); ok {
 				// Clone the number expression to avoid mutation issues
-				constMap[s.Name] = &NumberExpr{Value: numExpr.Value}
+				constMap[s.Name] = &NumberExpr{Value: numExpr.Value, Exact: numExpr.Exact}
 			} else {
 				// Variable is not assigned a constant, remove from map
 				delete(constMap, s.Name)
@@ -944,7 +936,7 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 		// Check if this variable has a known constant value
 		if constVal, exists := constMap[e.Name]; exists {
 			// Substitute with the constant value
-			return &NumberExpr{Value: constVal.Value}
+			return &NumberExpr{Value: constVal.Value, Exact: constVal.Exact}
 		}
 		return e
 
@@ -2004,7 +1996,7 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 func deepCopyExpr(expr Expression) Expression {
 	switch e := expr.(type) {
 	case *NumberExpr:
-		return &NumberExpr{Value: e.Value}
+		return &NumberExpr{Value: e.Value, Exact: e.Exact}
 	case *StringExpr:
 		return &StringExpr{Value: e.Value}
 	case *IdentExpr:

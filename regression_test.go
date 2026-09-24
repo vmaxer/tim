@@ -79,12 +79,15 @@ println(-2147483649)
 println(9223372036854775807)
 println(1e20)
 println(-2.5e19)
-println(1.5e300)
 println(1e-7)
-println(0.0001)
 println(3.25)
 println(0)
-y := 1e308
+f = 1e20 as float64
+println(f)
+println(-2.5e19 as float64)
+println(1.5e300 as float64)
+println(1e-7 as float64)
+y := 1e308 as float64
 println(y * 10)
 println(-(y * 10))
 println(0 / 0)
@@ -92,17 +95,81 @@ println(0 / 0)
 	want := `4294967297
 123456789012
 -2147483649
-9.223372e+18
+9223372036854775807
+100000000000000000000
+-25000000000000000000
+0.0000001
+3.25
+0
 1e+20
 -2.5e+19
 1.5e+300
 1e-07
-0.0001
-3.25
-0
 inf
 -inf
 nan
+`
+	if got := compileAndRunTopLevel(t, code); got != want {
+		t.Errorf("got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestExactNumbers(t *testing.T) {
+	code := `println(0.1 + 0.2 == 0.3)
+println(0.1 + 0.2)
+println(1 / 3 + 1 / 6)
+println(22 / 7)
+println(7 / 2)
+println(2 ** 100)
+println(2 ** -3)
+println(10 ** 30 + 1 - 10 ** 30)
+println(100000000 * 100000000 * 100000000)
+x := 9007199254740991
+x <- x + 2
+println(x)
+println(x - 2)
+println(-(2 ** 70))
+println(floor(-7 / 2))
+println(ceil(7 / 2))
+println(round(5 / 2))
+println(abs(-1 / 3))
+println(pow(3, 40))
+println(1 / 3 < 0.34)
+println((1 / 3) as float64)
+println(sqrt(1 / 4))
+println(17 % 5)
+println((10 ** 20 + 7) % 10)
+println(-7 / 2 % 2)
+println(f"{1 / 3} and {2 ** 64}")
+println((3.75 as str) + "!")
+println(1 / 0 or! 42)
+`
+	want := `1
+0.3
+0.5
+22/7
+3.5
+1267650600228229401496703205376
+0.125
+1
+1000000000000000000000000
+9007199254740993
+9007199254740991
+-1180591620717411303424
+-4
+4
+3
+1/3
+12157665459056928801
+1
+0.333333
+0.5
+2
+7
+-1.5
+1/3 and 18446744073709551616
+3.75!
+42
 `
 	if got := compileAndRunTopLevel(t, code); got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
@@ -151,5 +218,31 @@ func TestArityMismatch(t *testing.T) {
 	err := CompileTimWithOptions(src, filepath.Join(dir, "main"), GetDefaultPlatform(), 0, false, false)
 	if err == nil || !strings.Contains(err.Error(), "expects 1 argument(s), got 2") {
 		t.Errorf("expected arity error, got %v", err)
+	}
+}
+
+func TestNumberTruthiness(t *testing.T) {
+	code := `t = x -> x { => 1 ~> 0 }
+println(t(0))
+println(t(1 / 3))
+println(t(2 ** 80))
+println(t(10 / 0))
+println(t(1 / 3 - 1 / 3))
+println(not (1 / 3))
+println((1 / 3) and (2 ** 80))
+println(0 or (1 / 3))
+if 1 / 3 { println("if") }
+f = x -> x {
+    0.5 => "half"
+    2 ** 70 => "big"
+    ~> "other"
+}
+println(f(1 / 2))
+println(f(2 ** 70))
+println(f(2 ** 70 + 1))
+`
+	want := "0\n1\n1\n0\n0\n0\n1\n1\nif\nhalf\nbig\nother\n"
+	if got := compileAndRunTopLevel(t, code); got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }

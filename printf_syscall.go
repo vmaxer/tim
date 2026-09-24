@@ -547,13 +547,12 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 			switch next {
 			case 'd', 'i', 'l', 'u': // Integer/long/unsigned
 				fc.compileExpression(arg)
-				// xmm0 contains the number - convert to int and print
-				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.emitNumToI64()
 				fc.emitSyscallPrintInteger()
 
-			case 'v': // Value (uses 6-decimal float format like %f)
+			case 'v':
 				fc.compileExpression(arg)
-				fc.emitSyscallPrintFloatPrecise(6)
+				fc.emitPrintNumber()
 
 			case 's': // String
 				fc.compileExpression(arg)
@@ -562,13 +561,12 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 
 			case 'f', 'g': // Float
 				fc.compileExpression(arg)
-				// xmm0 contains float - use precise formatter
+				fc.emitNumToFloat()
 				fc.emitSyscallPrintFloatPrecise(precision)
 
 			case 'p': // Pointer (hex)
 				fc.compileExpression(arg)
-				// xmm0 contains the address as float - convert to int
-				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.emitNumToI64()
 				fc.emitSyscallPrintHex()
 
 			case 't', 'b': // Boolean (t=true/false, b=yes/no)
@@ -651,12 +649,7 @@ func (fc *TimCompiler) emitSyscallPrintList(isMap bool) {
 	fc.out.ShlImmReg("rcx", 4)
 	fc.out.AddRegToReg("rax", "rcx")
 	fc.out.MovMemToXmm("xmm0", "rax", 16)
-	fc.out.MovRegToReg("r15", "rsp")
-	fc.compileFloatToString("xmm0", "r15")
-	fc.out.SubImmFromReg("rdx", 1)
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
-	fc.out.Syscall()
+	fc.emitPrintNumber()
 
 	fc.out.MovMemToReg("rcx", "rsp", 56)
 	fc.out.AddImmToReg("rcx", 1)
