@@ -613,6 +613,62 @@ func (fc *TimCompiler) emitSyscallPrintLiteral(str string) {
 	fc.out.Syscall()
 }
 
+// emitSyscallPrintList prints the values of the list/map whose pointer is in xmm0
+// as "[a, b, c]" (or "{a, b, c}" for maps) using write syscalls.
+// Layout: [count f64][key0][val0][key1][val1]...
+func (fc *TimCompiler) emitSyscallPrintList(isMap bool) {
+	open, closing := "[", "]"
+	if isMap {
+		open, closing = "{", "}"
+	}
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.SubImmFromReg("rsp", 64) // [rsp+0..47] float buffer, [rsp+48] ptr, [rsp+56] index
+	fc.out.MovRegToMem("rax", "rsp", 48)
+	fc.out.XorRegWithReg("rcx", "rcx")
+	fc.out.MovRegToMem("rcx", "rsp", 56)
+	fc.emitSyscallPrintLiteral(open)
+
+	loop := fc.eb.text.Len()
+	fc.out.MovMemToReg("rax", "rsp", 48)
+	fc.out.TestRegWithReg("rax", "rax")
+	nullDone := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpEqual, 0)
+	fc.out.MovMemToXmm("xmm0", "rax", 0)
+	fc.out.Cvttsd2si("rdx", "xmm0")
+	fc.out.MovMemToReg("rcx", "rsp", 56)
+	fc.out.CmpRegToReg("rcx", "rdx")
+	done := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
+
+	fc.out.TestRegWithReg("rcx", "rcx")
+	first := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpEqual, 0)
+	fc.emitSyscallPrintLiteral(", ")
+	fc.patchJumpOffset(first+2, fc.eb.text.Len())
+
+	fc.out.MovMemToReg("rax", "rsp", 48)
+	fc.out.MovMemToReg("rcx", "rsp", 56)
+	fc.out.ShlImmReg("rcx", 4)
+	fc.out.AddRegToReg("rax", "rcx")
+	fc.out.MovMemToXmm("xmm0", "rax", 16)
+	fc.out.MovRegToReg("r15", "rsp")
+	fc.compileFloatToString("xmm0", "r15")
+	fc.out.SubImmFromReg("rdx", 1)
+	fc.out.MovImmToReg("rax", "1")
+	fc.out.MovImmToReg("rdi", "1")
+	fc.out.Syscall()
+
+	fc.out.MovMemToReg("rcx", "rsp", 56)
+	fc.out.AddImmToReg("rcx", 1)
+	fc.out.MovRegToMem("rcx", "rsp", 56)
+	fc.out.JumpUnconditional(int32(loop - (fc.eb.text.Len() + 5)))
+
+	fc.patchJumpOffset(done+2, fc.eb.text.Len())
+	fc.patchJumpOffset(nullDone+2, fc.eb.text.Len())
+	fc.emitSyscallPrintLiteral(closing)
+	fc.out.AddImmToReg("rsp", 64)
+}
+
 // emitSyscallPrintChar emits code to print a single character
 func (fc *TimCompiler) emitSyscallPrintChar(ch rune) {
 	fc.out.SubImmFromReg("rsp", 8)

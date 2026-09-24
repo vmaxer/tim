@@ -44,6 +44,7 @@ func optimizeProgram(program *Program) *Program {
 	inlineReinlineDepth = 0
 	inlineTempCounter = 0
 	inlineBudget = inlineBudgetMax
+	clear(inlineActive)
 
 	// Pass 1: Constant folding (2 + 3 → 5)
 	for i, stmt := range program.Statements {
@@ -1721,7 +1722,9 @@ func collectInlineCandidates(stmt Statement, candidates map[string]*LambdaExpr) 
 		if !s.Mutable && !s.IsUpdate {
 			if lambda, ok := s.Value.(*LambdaExpr); ok {
 				// Only inline simple lambdas (single expression body, no blocks)
-				if !isComplexExpression(lambda.Body) {
+				selfCalls := make(map[string]int)
+				countCallsExpr(lambda.Body, selfCalls)
+				if !isComplexExpression(lambda.Body) && selfCalls[s.Name] == 0 {
 					// Store a copy to avoid mutation
 					candidates[s.Name] = &LambdaExpr{
 						Params:            lambda.Params,
@@ -1887,8 +1890,10 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 			// Only inline if:
 			// 1. Parameter count matches
 			// 2. Called at least once
-			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 && inlineBudget > 0 {
+			if len(e.Args) == len(lambda.Params) && callCounts[e.Function] > 0 && inlineBudget > 0 && !inlineActive[e.Function] {
 				inlineBudget--
+				inlineActive[e.Function] = true
+				defer delete(inlineActive, e.Function)
 				// Inline the body, let-binding any non-trivial argument so it is
 				// evaluated exactly once (naive substitution would duplicate e.g.
 				// `vscale(b,s)` into each `.x/.y/.z` use — quadratic blowup and
@@ -2066,6 +2071,8 @@ var inlineTempCounter int
 // inlineReinlineDepth bounds re-inlining of an inlined body (so nested candidate
 // calls collapse) without looping forever on self-recursive one-liner candidates.
 var inlineReinlineDepth int
+
+var inlineActive = map[string]bool{}
 
 // inlineBudget caps the TOTAL number of inline substitutions per program. Each
 // re-inline of an inlined body re-walks the (growing) result, so a deep chain of

@@ -110,9 +110,7 @@ func compileAndRun(t *testing.T, code string) string {
 	// We only fail if there's an actual execution error (not just non-zero exit)
 	if err != nil {
 		// Check if it's just a non-zero exit code (which is normal for Tim)
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			// Non-zero exit but program ran successfully - return output
-			_ = exitErr
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() >= 0 {
 			return strings.ReplaceAll(string(runOutput), "\r\n", "\n")
 		}
 		// Actual execution error (program didn't run)

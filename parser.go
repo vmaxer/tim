@@ -407,6 +407,7 @@ func (p *Parser) ParseProgram() *Program {
 	// Apply optimizations here so every ParseProgram caller (main file,
 	// siblings, dependencies, incremental) gets an optimized AST without
 	// having to remember a separate phase call.
+	uniquifyLocalFunctions(program)
 	program = optimizeProgram(program)
 
 	return program

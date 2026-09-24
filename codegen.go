@@ -11802,22 +11802,12 @@ func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
 
 	// If calling a non-function value with no args, just return the value
 	if !isCallable && len(call.Args) == 0 {
-		offset := fc.variables[call.Function]
-		if VerboseMode {
-			debugf("DEBUG compileStoredFunctionCall: returning plain value from offset %d\n", offset)
-		}
-		fc.out.MovMemToXmm("xmm0", "rbp", -offset)
+		fc.compileExpression(&IdentExpr{Name: call.Function})
 		return
 	}
 
 	// Load closure object pointer from variable
-	offset := fc.variables[call.Function]
-	if fc.debug {
-		if VerboseMode {
-			debugf("DEBUG compileStoredFunctionCall: calling '%s' at offset %d, args=%d\n", call.Function, offset, len(call.Args))
-		}
-	}
-	fc.out.MovMemToXmm("xmm0", "rbp", -offset)
+	fc.compileExpression(&IdentExpr{Name: call.Function})
 
 	// Convert function pointer from float64 to integer in rax
 	fc.out.SubImmFromReg("rsp", 16)
@@ -12641,6 +12631,20 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	// Save the float value in a temporary location (we'll use the end of the buffer)
 	fc.out.MovXmmToMem(xmmReg, bufPtr, 24)
 
+	var exits []int
+	exit := func() {
+		exits = append(exits, fc.eb.text.Len())
+		fc.out.JumpUnconditional(0)
+	}
+	fc.out.Ucomisd(xmmReg, xmmReg)
+	notNaN := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotParity, 0)
+	fc.out.MovRegToReg("rsi", bufPtr)
+	fc.out.Emit([]byte{0xC7, 0x06, 'n', 'a', 'n', '\n'}) // mov dword [rsi], "nan\n"
+	fc.out.MovImmToReg("rdx", "4")
+	exit()
+	fc.patchJumpImmediate(notNaN+2, int32(fc.eb.text.Len()-(notNaN+6)))
+
 	// Check if negative by testing sign bit
 	// We'll load 0.0 by converting integer 0
 	fc.out.XorRegWithReg("rax", "rax")
@@ -12683,6 +12687,8 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 
 	// Now rsi points to where we write, load the (now positive) float
 	fc.out.MovMemToXmm("xmm0", bufPtr, 24)
+
+	fc.compileLargeFloatToString(bufPtr, exit)
 
 	// Check if it's a whole number
 	fc.out.Cvttsd2si("rax", "xmm0")
@@ -12862,6 +12868,137 @@ func (fc *TimCompiler) compileFloatToString(xmmReg, bufPtr string) {
 	// End
 	wholeEnd := fc.eb.text.Len()
 	fc.patchJumpImmediate(wholeEndJump+1, int32(wholeEnd-wholeEndEnd))
+	for _, j := range exits {
+		fc.patchJumpImmediate(j+1, int32(wholeEnd-(j+5)))
+	}
+}
+
+// compileLargeFloatToString prints values the fixed-point path cannot: |x| >= 2^63
+// (cvttsd2si overflows), Inf, and 0 < |x| < 1e-4 (would print as 0).
+// Input: xmm0 = |x|, rsi = write position. Prints d.dddddde±NN or inf.
+func (fc *TimCompiler) compileLargeFloatToString(bufPtr string, exit func()) {
+	fc.loadFloatConstant("xmm4", 0x1p63)
+	fc.out.Ucomisd("xmm0", "xmm4")
+	large := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpAboveOrEqual, 0)
+	fc.loadFloatConstant("xmm4", 1e-4)
+	fc.out.Ucomisd("xmm0", "xmm4")
+	small := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpAboveOrEqual, 0)
+	fc.out.XorpdXmm("xmm4", "xmm4")
+	fc.out.Ucomisd("xmm0", "xmm4")
+	zero := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpEqual, 0)
+	fc.patchJumpImmediate(large+2, int32(fc.eb.text.Len()-(large+6)))
+
+	fc.loadFloatConstant("xmm4", math.Inf(1))
+	fc.out.Ucomisd("xmm0", "xmm4")
+	finite := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotEqual, 0)
+	fc.out.Emit([]byte{0xC7, 0x06, 'i', 'n', 'f', 0}) // mov dword [rsi], "inf"
+	fc.out.AddImmToReg("rsi", 3)
+	infDone := fc.eb.text.Len()
+	fc.out.JumpUnconditional(0)
+	fc.patchJumpImmediate(finite+2, int32(fc.eb.text.Len()-(finite+6)))
+
+	fc.out.XorRegWithReg("r11", "r11")
+	fc.out.MovImmToReg("r8", "43") // '+'
+	fc.loadFloatConstant("xmm3", 10.0)
+	down := fc.eb.text.Len()
+	fc.out.Ucomisd("xmm0", "xmm3")
+	downDone := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpBelow, 0)
+	fc.out.DivsdXmm("xmm0", "xmm3")
+	fc.out.IncReg("r11")
+	fc.out.JumpUnconditional(int32(down - (fc.eb.text.Len() + 5)))
+	fc.patchJumpImmediate(downDone+2, int32(fc.eb.text.Len()-(downDone+6)))
+	fc.loadFloatConstant("xmm4", 1.0)
+	up := fc.eb.text.Len()
+	fc.out.Ucomisd("xmm0", "xmm4")
+	upDone := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpAboveOrEqual, 0)
+	fc.out.MulsdXmm("xmm0", "xmm3")
+	fc.out.IncReg("r11")
+	fc.out.MovImmToReg("r8", "45") // '-'
+	fc.out.JumpUnconditional(int32(up - (fc.eb.text.Len() + 5)))
+	fc.patchJumpImmediate(upDone+2, int32(fc.eb.text.Len()-(upDone+6)))
+
+	fc.loadFloatConstant("xmm3", 1e6)
+	fc.out.MulsdXmm("xmm0", "xmm3")
+	fc.loadFloatConstant("xmm3", 0.5)
+	fc.out.AddsdXmm("xmm0", "xmm3")
+	fc.out.Cvttsd2si("rax", "xmm0")
+	fc.out.Emit([]byte{0x48, 0x3D, 0x80, 0x96, 0x98, 0x00}) // cmp rax, 10000000
+	noCarry := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpLess, 0)
+	fc.out.MovImmToReg("rax", "1000000")
+	fc.out.CmpRegToImm("r8", 45)
+	positive := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotEqual, 0)
+	fc.out.DecReg("r11")
+	decDone := fc.eb.text.Len()
+	fc.out.JumpUnconditional(0)
+	fc.patchJumpImmediate(positive+2, int32(fc.eb.text.Len()-(positive+6)))
+	fc.out.IncReg("r11")
+	fc.patchJumpImmediate(decDone+1, int32(fc.eb.text.Len()-(decDone+5)))
+	fc.patchJumpImmediate(noCarry+2, int32(fc.eb.text.Len()-(noCarry+6)))
+
+	digits := func(positions ...byte) {
+		for _, pos := range positions {
+			fc.out.Emit([]byte{
+				0xB9, 0x0A, 0x00, 0x00, 0x00, // mov ecx, 10
+				0x31, 0xD2, // xor edx, edx
+				0x48, 0xF7, 0xF1, // div rcx
+				0x83, 0xC2, 0x30, // add edx, '0'
+				0x88, 0x56, pos, // mov [rsi+pos], dl
+			})
+		}
+	}
+	digits(7, 6, 5, 4, 3, 2, 0)
+	fc.out.Emit([]byte{0xC6, 0x46, 0x01, '.'}) // mov byte [rsi+1], '.'
+	fc.out.AddImmToReg("rsi", 8)
+
+	strip := fc.eb.text.Len()
+	fc.out.Emit([]byte{0x80, 0x7E, 0xFF, '0'}) // cmp byte [rsi-1], '0'
+	stripped := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotEqual, 0)
+	fc.out.SubImmFromReg("rsi", 1)
+	fc.out.JumpUnconditional(int32(strip - (fc.eb.text.Len() + 5)))
+	fc.patchJumpImmediate(stripped+2, int32(fc.eb.text.Len()-(stripped+6)))
+	fc.out.Emit([]byte{0x80, 0x7E, 0xFF, '.'}) // cmp byte [rsi-1], '.'
+	keepDot := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpNotEqual, 0)
+	fc.out.SubImmFromReg("rsi", 1)
+	fc.patchJumpImmediate(keepDot+2, int32(fc.eb.text.Len()-(keepDot+6)))
+
+	fc.out.MovImmToReg("r10", "101") // 'e'
+	fc.out.MovByteRegToMem("r10", "rsi", 0)
+	fc.out.MovByteRegToMem("r8", "rsi", 1)
+	fc.out.AddImmToReg("rsi", 2)
+	fc.out.MovRegToReg("rax", "r11")
+	fc.out.CmpRegToImm("r11", 100)
+	twoDigits := fc.eb.text.Len()
+	fc.out.JumpConditional(JumpLess, 0)
+	digits(2, 1, 0)
+	fc.out.AddImmToReg("rsi", 3)
+	expDone := fc.eb.text.Len()
+	fc.out.JumpUnconditional(0)
+	fc.patchJumpImmediate(twoDigits+2, int32(fc.eb.text.Len()-(twoDigits+6)))
+	digits(1, 0)
+	fc.out.AddImmToReg("rsi", 2)
+
+	fc.patchJumpImmediate(expDone+1, int32(fc.eb.text.Len()-(expDone+5)))
+	fc.patchJumpImmediate(infDone+1, int32(fc.eb.text.Len()-(infDone+5)))
+	fc.out.MovImmToReg("r10", "10")
+	fc.out.MovByteRegToMem("r10", "rsi", 0)
+	fc.out.AddImmToReg("rsi", 1)
+	fc.out.MovRegToReg("rdx", "rsi")
+	fc.out.SubRegFromReg("rdx", bufPtr)
+	fc.out.MovRegToReg("rsi", bufPtr)
+	exit()
+
+	fc.patchJumpImmediate(small+2, int32(fc.eb.text.Len()-(small+6)))
+	fc.patchJumpImmediate(zero+2, int32(fc.eb.text.Len()-(zero+6)))
 }
 
 // loadFloatConstant loads a float constant into an XMM register
@@ -13793,6 +13930,10 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		return
 	}
 
+	if sig := fc.functionSignatures[call.Function]; sig != nil && !sig.IsVariadic && len(call.Args) != sig.ParamCount {
+		compilerError("%s expects %d argument(s), got %d", call.Function, sig.ParamCount, len(call.Args))
+	}
+
 	// Check if this is a recursive call (function name matches current lambda)
 	isRecursive := fc.currentLambda != nil && call.Function == fc.currentLambda.Name
 
@@ -14336,6 +14477,12 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			fc.out.XorRegWithReg("rax", "rax")
 			fc.out.Cvtsi2sd("xmm0", "rax")
 			return
+		} else if (argType == "list" || argType == "map") && fc.eb.target.OS() == OSLinux {
+			fc.compileExpression(arg)
+			fc.emitSyscallPrintList(argType == "map")
+			fc.out.XorRegWithReg("rax", "rax")
+			fc.out.Cvtsi2sd("xmm0", "rax")
+			return
 		} else if fstrExpr, ok := arg.(*FStringExpr); ok {
 			// F-string - compile it and then print
 			fc.compileExpression(fstrExpr)
@@ -14519,96 +14666,101 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 				fc.deallocateShadowSpace(shadowSpace)
 			} else if argType == "list" || argType == "map" {
 				// Print list/map - note: for multi-arg println, lists/maps print inline without their usual newlines
-				// Compile the expression to get map pointer
-				fc.compileExpression(arg)
-				// xmm0 now contains the map pointer as float64
+				if fc.eb.target.OS() == OSLinux {
+					fc.compileExpression(arg)
+					fc.emitSyscallPrintList(argType == "map")
+				} else {
+					// Compile the expression to get map pointer
+					fc.compileExpression(arg)
+					// xmm0 now contains the map pointer as float64
 
-				// Convert map pointer from xmm0 to rax (integer pointer)
-				fc.out.SubImmFromReg("rsp", StackSlotSize)
-				fc.out.MovXmmToMem("xmm0", "rsp", 0)
-				fc.out.MovMemToReg("rax", "rsp", 0)
-				fc.out.AddImmToReg("rsp", StackSlotSize)
+					// Convert map pointer from xmm0 to rax (integer pointer)
+					fc.out.SubImmFromReg("rsp", StackSlotSize)
+					fc.out.MovXmmToMem("xmm0", "rsp", 0)
+					fc.out.MovMemToReg("rax", "rsp", 0)
+					fc.out.AddImmToReg("rsp", StackSlotSize)
 
-				// Save map pointer on the stack (printf clobbers most registers!)
-				// We need: map pointer, length, index - all must survive printf calls
-				fc.out.SubImmFromReg("rsp", 24)     // 3 * 8 bytes for map_ptr, length, index
-				fc.out.MovRegToMem("rax", "rsp", 0) // [rsp+0] = map pointer
+					// Save map pointer on the stack (printf clobbers most registers!)
+					// We need: map pointer, length, index - all must survive printf calls
+					fc.out.SubImmFromReg("rsp", 24)     // 3 * 8 bytes for map_ptr, length, index
+					fc.out.MovRegToMem("rax", "rsp", 0) // [rsp+0] = map pointer
 
-				// Get the length of the map (stored at offset 0 as float64)
-				fc.out.MovMemToXmm("xmm0", "rax", 0)
-				fc.out.Cvttsd2si("rcx", "xmm0")     // rcx = length (as integer)
-				fc.out.MovRegToMem("rcx", "rsp", 8) // [rsp+8] = length
+					// Get the length of the map (stored at offset 0 as float64)
+					fc.out.MovMemToXmm("xmm0", "rax", 0)
+					fc.out.Cvttsd2si("rcx", "xmm0")     // rcx = length (as integer)
+					fc.out.MovRegToMem("rcx", "rsp", 8) // [rsp+8] = length
 
-				// Initialize index to 0 (iterate forward from 0 to length-1)
-				fc.out.MovImmToReg("rcx", "0")
-				fc.out.MovRegToMem("rcx", "rsp", 16) // [rsp+16] = index = 0
+					// Initialize index to 0 (iterate forward from 0 to length-1)
+					fc.out.MovImmToReg("rcx", "0")
+					fc.out.MovRegToMem("rcx", "rsp", 16) // [rsp+16] = index = 0
 
-				// Create format string for numbers (use %g for smart formatting, no newline in multi-arg mode)
-				fmtLabel := fmt.Sprintf("println_fmt_%d", fc.stringCounter)
-				fc.stringCounter++
-				fc.eb.Define(fmtLabel, "%g\x00")
+					// Create format string for numbers (use %g for smart formatting, no newline in multi-arg mode)
+					fmtLabel := fmt.Sprintf("println_fmt_%d", fc.stringCounter)
+					fc.stringCounter++
+					fc.eb.Define(fmtLabel, "%g\x00")
 
-				// Get current position for loop start
-				loopStartPos := fc.eb.text.Len()
+					// Get current position for loop start
+					loopStartPos := fc.eb.text.Len()
 
-				// Load index and length from stack
-				fc.out.MovMemToReg("rcx", "rsp", 16) // rcx = index
-				fc.out.MovMemToReg("rdx", "rsp", 8)  // rdx = length
+					// Load index and length from stack
+					fc.out.MovMemToReg("rcx", "rsp", 16) // rcx = index
+					fc.out.MovMemToReg("rdx", "rsp", 8)  // rdx = length
 
-				// Check if index >= length (loop exit condition)
-				fc.out.CmpRegToReg("rcx", "rdx") // Compare index with length
-				// Jump to end if index >= length
-				loopEndJumpPos := fc.eb.text.Len()
-				fc.out.JumpConditional(JumpGreaterOrEqual, 0) // Placeholder, will be patched
+					// Check if index >= length (loop exit condition)
+					fc.out.CmpRegToReg("rcx", "rdx") // Compare index with length
+					// Jump to end if index >= length
+					loopEndJumpPos := fc.eb.text.Len()
+					fc.out.JumpConditional(JumpGreaterOrEqual, 0) // Placeholder, will be patched
 
-				// Load map pointer from stack
-				fc.out.MovMemToReg("rax", "rsp", 0) // rax = map pointer
+					// Load map pointer from stack
+					fc.out.MovMemToReg("rax", "rsp", 0) // rax = map pointer
 
-				// Calculate element address: map_base + 8 + (index * 8)
-				// The map structure is: [length (8 bytes)] [element0] [element1] ...
-				fc.out.MovRegToReg("rbx", "rax") // rbx = map base
-				fc.out.AddImmToReg("rbx", 8)     // rbx = map base + 8 (skip length)
-				fc.out.MovRegToReg("rsi", "rcx") // rsi = index
-				fc.out.ShlImmReg("rsi", 3)       // rsi = index * 8
-				fc.out.AddRegToReg("rbx", "rsi") // rbx = element address
+					// Calculate element address: map_base + 8 + (index * 8)
+					// The map structure is: [length (8 bytes)] [element0] [element1] ...
+					fc.out.MovRegToReg("rbx", "rax") // rbx = map base
+					fc.out.AddImmToReg("rbx", 16)    // rbx = first value (skip count and key0)
+					fc.out.MovRegToReg("rsi", "rcx") // rsi = index
+					fc.out.ShlImmReg("rsi", 4)       // rsi = index * 16 ([key][value] pairs)
+					fc.out.AddRegToReg("rbx", "rsi") // rbx = element address
 
-				// Load the element value into xmm0
-				fc.out.MovMemToXmm("xmm0", "rbx", 0)
+					// Load the element value into xmm0
+					fc.out.MovMemToXmm("xmm0", "rbx", 0)
 
-				// Print using printf (printf clobbers rax, rcx, rdx, rsi, rdi, r8-r11)
-				shadowSpace := fc.allocateShadowSpace()
-				fc.out.LeaSymbolToReg(fc.getIntArgReg(0), fmtLabel)
+					// Print using printf (printf clobbers rax, rcx, rdx, rsi, rdi, r8-r11)
+					shadowSpace := fc.allocateShadowSpace()
+					fc.out.LeaSymbolToReg(fc.getIntArgReg(0), fmtLabel)
 
-				// Windows requires float args in BOTH integer and XMM registers for variadic functions
-				if fc.eb.target.OS() == OSWindows {
-					// Move xmm0 to xmm1 (2nd parameter position)
-					fc.out.MovXmmToXmm("xmm1", "xmm0")
-					// Also copy to integer register (2nd parameter)
-					fc.out.MovqXmmToReg(fc.getIntArgReg(1), "xmm0")
+					// Windows requires float args in BOTH integer and XMM registers for variadic functions
+					if fc.eb.target.OS() == OSWindows {
+						// Move xmm0 to xmm1 (2nd parameter position)
+						fc.out.MovXmmToXmm("xmm1", "xmm0")
+						// Also copy to integer register (2nd parameter)
+						fc.out.MovqXmmToReg(fc.getIntArgReg(1), "xmm0")
+					}
+
+					// Set rax = 1 (one vector register used) for variadic printf
+					fc.out.MovImmToReg("rax", "1")
+					fc.callFunction("printf", "")
+					fc.deallocateShadowSpace(shadowSpace)
+
+					// Increment index on stack
+					fc.out.MovMemToReg("rcx", "rsp", 16) // Load current index
+					fc.out.AddImmToReg("rcx", 1)         // Increment
+					fc.out.MovRegToMem("rcx", "rsp", 16) // Store back
+
+					// Jump back to loop start
+					loopBackJumpPos := fc.eb.text.Len()
+					backOffset := int32(loopStartPos - (loopBackJumpPos + 5)) // 5 bytes for unconditional jump
+					fc.out.JumpUnconditional(backOffset)
+
+					// Patch the loop end jump to point here
+					loopEndPos := fc.eb.text.Len()
+					endOffset := int32(loopEndPos - (loopEndJumpPos + 6)) // 6 bytes for conditional jump
+					fc.patchJumpImmediate(loopEndJumpPos+2, endOffset)
+
+					// Clean up stack
+					fc.out.AddImmToReg("rsp", 24)
 				}
-
-				// Set rax = 1 (one vector register used) for variadic printf
-				fc.out.MovImmToReg("rax", "1")
-				fc.callFunction("printf", "")
-				fc.deallocateShadowSpace(shadowSpace)
-
-				// Increment index on stack
-				fc.out.MovMemToReg("rcx", "rsp", 16) // Load current index
-				fc.out.AddImmToReg("rcx", 1)         // Increment
-				fc.out.MovRegToMem("rcx", "rsp", 16) // Store back
-
-				// Jump back to loop start
-				loopBackJumpPos := fc.eb.text.Len()
-				backOffset := int32(loopStartPos - (loopBackJumpPos + 5)) // 5 bytes for unconditional jump
-				fc.out.JumpUnconditional(backOffset)
-
-				// Patch the loop end jump to point here
-				loopEndPos := fc.eb.text.Len()
-				endOffset := int32(loopEndPos - (loopEndJumpPos + 6)) // 6 bytes for conditional jump
-				fc.patchJumpImmediate(loopEndJumpPos+2, endOffset)
-
-				// Clean up stack
-				fc.out.AddImmToReg("rsp", 24)
 
 			} else {
 				// Print number using pure assembly (no libc) - no newline in multi-arg mode
