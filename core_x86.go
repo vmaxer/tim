@@ -33,12 +33,13 @@ func (x *x86) newLabel() label {
 	return label(len(x.labels) - 1)
 }
 
-func (x *x86) bind(l label)   { x.labels[l] = len(x.buf) }
-func (x *x86) pos() int       { return len(x.buf) }
-func (x *x86) code() []byte   { return x.buf }
-func (x *x86) b(bs ...byte)   { x.buf = append(x.buf, bs...) }
-func (x *x86) u32(v uint32)   { x.buf = binary.LittleEndian.AppendUint32(x.buf, v) }
-func (x *x86) emit(bs []byte) { x.buf = append(x.buf, bs...) }
+func (x *x86) bindAt(l label, p int) { x.labels[l] = p }
+func (x *x86) bind(l label)          { x.labels[l] = len(x.buf) }
+func (x *x86) pos() int              { return len(x.buf) }
+func (x *x86) code() []byte          { return x.buf }
+func (x *x86) b(bs ...byte)          { x.buf = append(x.buf, bs...) }
+func (x *x86) u32(v uint32)          { x.buf = binary.LittleEndian.AppendUint32(x.buf, v) }
+func (x *x86) emit(bs []byte)        { x.buf = append(x.buf, bs...) }
 
 func (x *x86) align(n int) {
 	for len(x.buf)%n != 0 {
@@ -121,8 +122,13 @@ func (x *x86) tailJumpLabel(l label) {
 	x.rel32(l, 0)
 }
 
-func (x *x86) start(main, blob label, off int) {
-	x.b(0x48, 0x89, 0xE7)       // mov rdi, rsp
+func (x *x86) start(main, blob label, off int, imports label, os OS) {
+	if os == OSWindows {
+		x.b(0x48, 0x8D, 0x3D) // lea rdi, [rip+imports]
+		x.rel32(imports, 0)
+	} else {
+		x.b(0x48, 0x89, 0xE7) // mov rdi, rsp
+	}
 	x.b(0x48, 0x8D, 0x35)       // lea rsi, [rip+main]
 	x.rel32(main, 0)            //
 	x.b(0x48, 0x83, 0xE4, 0xF0) // and rsp, -16

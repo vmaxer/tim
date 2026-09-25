@@ -98,22 +98,13 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 			fmt.Fprintf(os.Stderr, "core: legacy backend (%s)\n", why)
 		}
 	}()
-	if os.Getenv("TIM_LEGACY") != "" || p.OS != OSLinux {
-		why = "requested or not Linux"
+	if os.Getenv("TIM_LEGACY") != "" {
+		why = "requested"
 		return false, nil
 	}
-	var blob []byte
-	var syms map[string]int
-	var a asm
-	switch p.Arch {
-	case ArchX86_64:
-		blob, syms, a = rtLinuxAMD64, rtLinuxAMD64Syms, newX86()
-	case ArchARM64:
-		blob, syms, a = rtLinuxARM64, rtLinuxARM64Syms, newA64()
-	case ArchRiscv64:
-		blob, syms, a = rtLinuxRISCV64, rtLinuxRISCV64Syms, newRV()
-	default:
-		why = "architecture"
+	t, a, write := coreTargetFor(p)
+	if a == nil {
+		why = "platform " + p.FullString()
 		return false, nil
 	}
 	defer func() {
@@ -148,10 +139,36 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 		why = strings.Join(c.Unsupported, ", ")
 		return false, nil
 	}
-	code, entry, err := compileCore(c, a, blob, syms)
+	code, entry, err := compileCore(c, a, t)
 	if err != nil {
 		why = err.Error()
 		return false, nil
 	}
-	return true, writeCoreELF(out, p.Arch, code, entry)
+	return true, write(out, p.Arch, code, entry)
+}
+
+// coreTargetFor returns what the core needs for a platform, or a nil asm.
+func coreTargetFor(p Platform) (coreTarget, asm, func(string, Arch, []byte, int) error) {
+	t := coreTarget{os: p.OS}
+	switch {
+	case p.OS == OSLinux && p.Arch == ArchX86_64:
+		t.blob, t.syms = rtLinuxAMD64, rtLinuxAMD64Syms
+		return t, newX86(), writeCoreELF
+	case p.OS == OSLinux && p.Arch == ArchARM64:
+		t.blob, t.syms = rtLinuxARM64, rtLinuxARM64Syms
+		return t, newA64(), writeCoreELF
+	case p.OS == OSLinux && p.Arch == ArchRiscv64:
+		t.blob, t.syms = rtLinuxRISCV64, rtLinuxRISCV64Syms
+		return t, newRV(), writeCoreELF
+	case p.OS == OSWindows && p.Arch == ArchX86_64:
+		t.blob, t.syms, t.importsAt = rtWindowsAMD64, rtWindowsAMD64Syms, peImportsAt
+		return t, newX86(), writeCorePE
+	case p.OS == OSWindows && p.Arch == ArchARM64:
+		t.blob, t.syms, t.importsAt = rtWindowsARM64, rtWindowsARM64Syms, peImportsAt
+		return t, newA64(), writeCorePE
+	case p.OS == OSDarwin && p.Arch == ArchARM64:
+		t.blob, t.syms, t.importsAt = rtDarwinARM64, rtDarwinARM64Syms, machoImportsAt
+		return t, newA64(), writeCoreMachO
+	}
+	return t, nil, nil
 }

@@ -37,11 +37,12 @@ func (a *a64) newLabel() label {
 	return label(len(a.labels) - 1)
 }
 
-func (a *a64) bind(l label)   { a.labels[l] = len(a.buf) }
-func (a *a64) pos() int       { return len(a.buf) }
-func (a *a64) code() []byte   { return a.buf }
-func (a *a64) emit(bs []byte) { a.buf = append(a.buf, bs...) }
-func (a *a64) i(w uint32)     { a.buf = binary.LittleEndian.AppendUint32(a.buf, w) }
+func (a *a64) bindAt(l label, p int) { a.labels[l] = p }
+func (a *a64) bind(l label)          { a.labels[l] = len(a.buf) }
+func (a *a64) pos() int              { return len(a.buf) }
+func (a *a64) code() []byte          { return a.buf }
+func (a *a64) emit(bs []byte)        { a.buf = append(a.buf, bs...) }
+func (a *a64) i(w uint32)            { a.buf = binary.LittleEndian.AppendUint32(a.buf, w) }
 
 func (a *a64) align(n int) {
 	for len(a.buf)%n != 0 {
@@ -121,9 +122,19 @@ func (a *a64) tailJumpLabel(l label) {
 	a.i(0x14000000)
 }
 
-func (a *a64) start(main, blob label, off int) {
-	a.i(0x910003E0) // mov x0, sp
-	a.adr(1, main, 0)
+func (a *a64) start(main, blob label, off int, imports label, os OS) {
+	switch os {
+	case OSWindows:
+		a.adr(0, imports, 0)
+		a.adr(1, main, 0)
+	case OSDarwin:
+		// dyld passes argc, argv and envp in x0-x2
+		a.adr(3, imports, 0)
+		a.adr(4, main, 0)
+	default:
+		a.i(0x910003E0) // mov x0, sp
+		a.adr(1, main, 0)
+	}
 	a.ref(0, blob, off)
 	a.i(0x94000000) // bl rt_start
 	a.i(0xD4200000) // brk #0

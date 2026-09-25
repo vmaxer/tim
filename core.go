@@ -90,9 +90,20 @@ type coreGen struct {
 	f        *frame
 }
 
+// coreTarget describes where generated code will run.
+type coreTarget struct {
+	os   OS
+	blob []byte
+	syms map[string]int
+	// importsAt returns where the loader's import table will be, as an
+	// offset from the start of the code, given the code's length.
+	importsAt func(codeLen int) int
+}
+
 // compileCore generates the whole program and returns the code, starting
 // with the entry point.
-func compileCore(c *Checked, a asm, blob []byte, syms map[string]int) (code []byte, entry int, err error) {
+func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, err error) {
+	blob, syms := t.blob, t.syms
 	defer func() {
 		if r := recover(); r != nil {
 			ce, ok := r.(coreError)
@@ -104,9 +115,9 @@ func compileCore(c *Checked, a asm, blob []byte, syms map[string]int) (code []by
 	}()
 	g := &coreGen{c: c, a: a, syms: syms, blob: a.newLabel(), fnLabels: map[*Fun]label{},
 		strs: map[string]label{}, hoisted: map[Statement]bool{}, wrappers: map[string]*Var{}, nglobals: len(c.Globals)}
-	main := a.newLabel()
+	main, imports := a.newLabel(), a.newLabel()
 	entry = a.pos()
-	a.start(main, g.blob, g.sym("rt_start"))
+	a.start(main, g.blob, g.sym("rt_start"), imports, t.os)
 	a.bind(main)
 	g.genTop()
 	for len(g.queue) > 0 {
@@ -120,6 +131,11 @@ func compileCore(c *Checked, a asm, blob []byte, syms map[string]int) (code []by
 	a.align(8)
 	for i := 0; i < len(g.consts); i++ {
 		g.consts[i]()
+	}
+	if t.importsAt != nil {
+		a.bindAt(imports, t.importsAt(a.pos()))
+	} else {
+		a.bindAt(imports, 0)
 	}
 	if err := a.resolve(); err != nil {
 		return nil, 0, err

@@ -723,8 +723,8 @@ func (k *checker) binary(e *BinaryExpr) Type {
 			k.errorf(e.Pos, "cannot add a %s and a %s", l, r)
 		}
 		return TAny
-	case op == "*" && l == TList:
-		return TList
+	case op == "*" && (l == TList || l == TStr) && (r == TNum || r == TAny):
+		return l
 	case numericOps[op]:
 		for _, t := range []Type{l, r} {
 			if t != TAny && t != TNum {

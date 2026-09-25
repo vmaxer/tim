@@ -689,7 +689,7 @@ func (p *Parser) loop() Statement {
 	var iterator, iterType string
 	var iterable, cond Expression
 	switch {
-	case p.at(TOKEN_LBRACE):
+	case p.at(TOKEN_LBRACE), p.at(TOKEN_BANG):
 	case p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_IN,
 		p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_COLON && p.peekAt(2).Type == TOKEN_IDENT && p.peekAt(3).Type == TOKEN_IN:
 		iterator = p.advance().Value

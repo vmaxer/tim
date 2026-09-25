@@ -42,11 +42,12 @@ func (a *rv) newLabel() label {
 	return label(len(a.labels) - 1)
 }
 
-func (a *rv) bind(l label)   { a.labels[l] = len(a.buf) }
-func (a *rv) pos() int       { return len(a.buf) }
-func (a *rv) code() []byte   { return a.buf }
-func (a *rv) emit(bs []byte) { a.buf = append(a.buf, bs...) }
-func (a *rv) i(w uint32)     { a.buf = binary.LittleEndian.AppendUint32(a.buf, w) }
+func (a *rv) bindAt(l label, p int) { a.labels[l] = p }
+func (a *rv) bind(l label)          { a.labels[l] = len(a.buf) }
+func (a *rv) pos() int              { return len(a.buf) }
+func (a *rv) code() []byte          { return a.buf }
+func (a *rv) emit(bs []byte)        { a.buf = append(a.buf, bs...) }
+func (a *rv) i(w uint32)            { a.buf = binary.LittleEndian.AppendUint32(a.buf, w) }
 
 func (a *rv) align(n int) {
 	for len(a.buf)%n != 0 {
@@ -134,8 +135,8 @@ func (a *rv) prologue() int {
 	a.i(cvS(3, xSP, xFP, 0))
 	a.addi(xFP, xSP, 0)
 	h := len(a.buf)
-	a.i(xT6<<7 | 0x37)                   // lui t6, hi
-	a.i(cvI(0x13, 0, xT6, xT6, 0))    // addi t6, t6, lo
+	a.i(xT6<<7 | 0x37)               // lui t6, hi
+	a.i(cvI(0x13, 0, xT6, xT6, 0))   // addi t6, t6, lo
 	a.i(cvR(0x20, 0, xSP, xSP, xT6)) // sub sp, sp, t6
 	return h
 }
@@ -167,7 +168,7 @@ func (a *rv) tailJump(t reg) {
 
 func (a *rv) far(link uint32, l label, off int) {
 	a.ref(1, l, off)
-	a.i(xT5<<7 | 0x17)                // auipc t5
+	a.i(xT5<<7 | 0x17)              // auipc t5
 	a.i(cvI(0x67, 0, link, xT5, 0)) // jalr link, lo(t5)
 }
 
@@ -176,7 +177,7 @@ func (a *rv) tailJumpLabel(l label) {
 	a.far(xZero, l, 0)
 }
 
-func (a *rv) start(main, blob label, off int) {
+func (a *rv) start(main, blob label, off int, imports label, os OS) {
 	a.addi(10, xSP, 0) // a0 = sp
 	a.adr(11, main)
 	a.far(xRA, blob, off)
@@ -185,7 +186,7 @@ func (a *rv) start(main, blob label, off int) {
 
 func (a *rv) adr(rd uint32, l label) {
 	a.ref(1, l, 0)
-	a.i(rd<<7 | 0x17)              // auipc
+	a.i(rd<<7 | 0x17)            // auipc
 	a.i(cvI(0x13, 0, rd, rd, 0)) // addi
 }
 

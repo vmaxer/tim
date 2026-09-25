@@ -75,18 +75,22 @@ type label int
 type asm interface {
 	newLabel() label
 	bind(l label)
+	bindAt(l label, pos int) // bind l to an offset from the start of the code, such as a data segment
 	pos() int
 	code() []byte
 	resolve() error // patch all label references
 
 	// Frames: fp points at the saved fp, [fp+8] holds the return address
 	// and the incoming arguments start at [fp+16].
-	prologue() int                   // returns a handle for setFrame
-	setFrame(handle, n int)          // reserve n bytes below fp (a multiple of 16)
-	epilogue()                       // return to the caller
-	tailJump(target reg)             // pop the frame and jump
-	tailJumpLabel(l label)           // pop the frame and jump
-	start(main, blob label, off int) // the process entry point: calls blob+off (rt_start) with sp and main
+	prologue() int          // returns a handle for setFrame
+	setFrame(handle, n int) // reserve n bytes below fp (a multiple of 16)
+	epilogue()              // return to the caller
+	tailJump(target reg)    // pop the frame and jump
+	tailJumpLabel(l label)  // pop the frame and jump
+	// start is the process entry point. It calls rt_start at blob+off with
+	// the initial stack (Linux), or with the import table (Windows), or
+	// with main's arguments and the import table (macOS), and then main.
+	start(main, blob label, off int, imports label, os OS)
 
 	load(dst, base reg, off int32)
 	store(src, base reg, off int32)

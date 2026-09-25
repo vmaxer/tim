@@ -54,16 +54,19 @@ enum {
 	OP_BOR, OP_BAND, OP_BXOR, OP_SHL, OP_SHR, OP_BIT, OP_ROTL, OP_ROTR,
 };
 
-// OS services supplied by the program's start code.
-typedef struct {
-	i64 (*write)(i64 fd, const void *buf, u64 n);
-	i64 (*read)(i64 fd, void *buf, u64 n);
-	i64 (*open)(const char *path, i64 write);
-	i64 (*close)(i64 fd);
-	void (*exit)(i64 code);
-	void *(*pages)(u64 bytes);
-	i64 (*random)(void *buf, u64 n);
-} OS;
+// OS services supplied by the program's start code. Each takes the OS
+// itself, whose imports hold the system functions a loader resolved.
+typedef struct OS OS;
+struct OS {
+	i64 (*write)(const OS *, i64 fd, const void *buf, u64 n);
+	i64 (*read)(const OS *, i64 fd, void *buf, u64 n);
+	i64 (*open)(const OS *, const char *path, i64 write);
+	i64 (*close)(const OS *, i64 fd);
+	void (*exit)(const OS *, i64 code);
+	void *(*pages)(const OS *, u64 bytes);
+	i64 (*random)(const OS *, void *buf, u64 n);
+	void *const *imports;
+};
 
 // The heap is a list of chunks. Each has a bitmap with a bit set at the
 // first word of every object, which finds an object from an interior pointer.
@@ -203,7 +206,7 @@ static Chunk *new_chunk(R *r, u64 words) {
 	u64 n = words > CHUNK_WORDS ? (words + 511) & ~511ull : CHUNK_WORDS;
 	if (r->nchunks == MAX_CHUNKS)
 		fatal(r, "out of memory");
-	u64 *p = r->os->pages(n * 8), *bits = r->os->pages(n / 8 + 8);
+	u64 *p = r->os->pages(r->os, n * 8), *bits = r->os->pages(r->os, n / 8 + 8);
 	if (!p || !bits)
 		fatal(r, "out of memory");
 	Chunk *c = &r->chunks[r->nchunks++];
@@ -1123,7 +1126,7 @@ static u64 bitwise(R *c, u64 op, u64 av, u64 bv) {
 	case OP_BAND: r = a & b; break;
 	case OP_BXOR: r = a ^ b; break;
 	case OP_SHL: r = b >= 64 ? 0 : a << b; break;
-	case OP_SHR: r = b >= 64 ? 0 : a >> b; break;
+	case OP_SHR: r = b >= 64 ? ((i64)a < 0 ? ~0ull : 0) : (u64)((i64)a >> b); break; // arithmetic
 	case OP_BIT: r = b >= 64 ? 0 : (a >> b) & 1; break;
 	case OP_ROTL: b &= 63; r = b ? (a << b) | (a >> (64 - b)) : a; break;
 	case OP_ROTR: b &= 63; r = b ? (a >> b) | (a << (64 - b)) : a; break;
@@ -1812,7 +1815,7 @@ static u64 utf8_encode(u8 *out, u64 cp);
 static void out_flush(R *r) {
 	u64 off = 0;
 	while (off < r->outn) {
-		i64 n = r->os->write(1, r->out + off, r->outn - off);
+		i64 n = r->os->write(r->os, 1, r->out + off, r->outn - off);
 		if (n <= 0)
 			break;
 		off += (u64)n;
@@ -1824,7 +1827,7 @@ static void out_write(R *r, u64 fd, const u8 *s, u64 n) {
 	if (fd != 1) {
 		out_flush(r);
 		while (n) {
-			i64 k = r->os->write((i64)fd, s, n);
+			i64 k = r->os->write(r->os, (i64)fd, s, n);
 			if (k <= 0)
 				return;
 			s += k;
@@ -1847,19 +1850,19 @@ static void out_write(R *r, u64 fd, const u8 *s, u64 n) {
 
 static void fatal(R *r, const char *msg) {
 	out_flush(r);
-	r->os->write(2, "tim: ", 5);
-	r->os->write(2, msg, strlen_(msg));
-	r->os->write(2, "\n", 1);
-	r->os->exit(70);
+	r->os->write(r->os, 2, "tim: ", 5);
+	r->os->write(r->os, 2, msg, strlen_(msg));
+	r->os->write(r->os, 2, "\n", 1);
+	r->os->exit(r->os, 70);
 }
 
 // The API used by generated code. Every function takes the runtime first.
 
 R *rt_init(const OS *os, u64 argc, char **argv, char **envp) {
-	R *r = os->pages((sizeof(R) + 4095) & ~4095ull);
+	R *r = os->pages(os, (sizeof(R) + 4095) & ~4095ull);
 	if (!r) {
-		os->write(2, "tim: out of memory\n", 19);
-		os->exit(70);
+		os->write(os, 2, "tim: out of memory\n", 19);
+		os->exit(os, 70);
 	}
 	memset(r, 0, sizeof *r);
 	r->os = os;
@@ -1876,7 +1879,7 @@ void rt_flush(R *r) { out_flush(r); }
 void rt_exit(R *r, u64 code) {
 	out_flush(r);
 	i64 c = is_num(code) ? to_i64(r, code) : (is_err(code) ? 1 : 0);
-	r->os->exit(c & 0xFF);
+	r->os->exit(r->os, c & 0xFF);
 }
 
 static void put_a(Buf *b, u64 v) {
@@ -2511,7 +2514,7 @@ static u64 rotl64(u64 x, int k) { return (x << k) | (x >> (64 - k)); }
 
 static u64 next_random(R *r) {
 	if (!r->seeded) {
-		if (r->os->random(r->rng, sizeof r->rng) != sizeof r->rng)
+		if (r->os->random(r->os, r->rng, sizeof r->rng) != sizeof r->rng)
 			r->rng[0] = 0x9E3779B97F4A7C15ull ^ (u64)r;
 		if (!(r->rng[0] | r->rng[1] | r->rng[2] | r->rng[3]))
 			r->rng[0] = 1;
@@ -2953,7 +2956,7 @@ static int refill(R *r) {
 	if (r->ineof)
 		return 0;
 	out_flush(r);
-	i64 n = r->os->read(0, r->in, sizeof r->in);
+	i64 n = r->os->read(r->os, 0, r->in, sizeof r->in);
 	if (n <= 0) {
 		r->ineof = 1;
 		return 0;
@@ -2984,40 +2987,40 @@ u64 rt_readln(R *r) {
 
 u64 rt_read_file(R *r, u64 path) {
 	STR(path, "read_file");
-	i64 fd = r->os->open((const char *)str_data(path), 0);
+	i64 fd = r->os->open(r->os, (const char *)str_data(path), 0);
 	if (fd < 0)
 		return ERR_IO;
 	Buf b = buf_new(r, 4096);
 	for (;;) {
 		buf_grow(&b, 4096);
-		i64 n = r->os->read(fd, b.p + b.n, b.cap - b.n);
+		i64 n = r->os->read(r->os, fd, b.p + b.n, b.cap - b.n);
 		if (n < 0) {
-			r->os->close(fd);
+			r->os->close(r->os, fd);
 			return ERR_IO;
 		}
 		if (!n)
 			break;
 		b.n += (u64)n;
 	}
-	r->os->close(fd);
+	r->os->close(r->os, fd);
 	return buf_str(&b);
 }
 
 u64 rt_write_file(R *r, u64 path, u64 data) {
 	STR(path, "write_file");
 	u64 s = to_str(r, data);
-	i64 fd = r->os->open((const char *)str_data(path), 1);
+	i64 fd = r->os->open(r->os, (const char *)str_data(path), 1);
 	if (fd < 0)
 		return ERR_IO;
 	for (u64 off = 0; off < str_len(s);) {
-		i64 n = r->os->write(fd, str_data(s) + off, str_len(s) - off);
+		i64 n = r->os->write(r->os, fd, str_data(s) + off, str_len(s) - off);
 		if (n <= 0) {
-			r->os->close(fd);
+			r->os->close(r->os, fd);
 			return ERR_IO;
 		}
 		off += (u64)n;
 	}
-	r->os->close(fd);
+	r->os->close(r->os, fd);
 	return num((double)str_len(s));
 }
 
@@ -3047,7 +3050,7 @@ static u64 *obj_start(Chunk *c, u64 *a) {
 static void push_mark(R *r, u64 *p) {
 	if (r->nmarks == r->capmarks) {
 		u64 cap = r->capmarks ? r->capmarks * 2 : 65536;
-		u64 *m = r->os->pages(cap * 8);
+		u64 *m = r->os->pages(r->os, cap * 8);
 		if (!m)
 			fatal(r, "out of memory");
 		memcpy(m, r->marks, r->nmarks * 8);

@@ -30,19 +30,21 @@ static i64 sys6(i64 n, i64 a, i64 b, i64 c, i64 d, i64 e, i64 f) {
 }
 #endif
 
-static i64 os_write(i64 fd, const void *b, u64 n) { return sys6(SYS_write, fd, (i64)b, (i64)n, 0, 0, 0); }
-static i64 os_read(i64 fd, void *b, u64 n) { return sys6(SYS_read, fd, (i64)b, (i64)n, 0, 0, 0); }
-static i64 os_open(const char *p, i64 w) { return sys6(SYS_openat, -100, (i64)p, w ? 01 | 0100 | 01000 : 0, 0644, 0, 0); }
-static i64 os_close(i64 fd) { return sys6(SYS_close, fd, 0, 0, 0, 0, 0); }
-static void os_exit(i64 c) {
+static i64 os_write(const OS *o, i64 fd, const void *b, u64 n) { (void)o; return sys6(SYS_write, fd, (i64)b, (i64)n, 0, 0, 0); }
+static i64 os_read(const OS *o, i64 fd, void *b, u64 n) { (void)o; return sys6(SYS_read, fd, (i64)b, (i64)n, 0, 0, 0); }
+static i64 os_open(const OS *o, const char *p, i64 w) { (void)o; return sys6(SYS_openat, -100, (i64)p, w ? 01 | 0100 | 01000 : 0, 0644, 0, 0); }
+static i64 os_close(const OS *o, i64 fd) { (void)o; return sys6(SYS_close, fd, 0, 0, 0, 0, 0); }
+static void os_exit(const OS *o, i64 c) {
+	(void)o;
 	for (;;)
 		sys6(SYS_exit_group, c, 0, 0, 0, 0, 0);
 }
-static void *os_pages(u64 n) {
+static void *os_pages(const OS *o, u64 n) {
+	(void)o;
 	i64 p = sys6(SYS_mmap, 0, (i64)n, 3, 0x22, -1, 0);
 	return p < 0 && p > -4096 ? 0 : (void *)p;
 }
-static i64 os_random(void *b, u64 n) { return sys6(SYS_getrandom, (i64)b, (i64)n, 0, 0, 0, 0); }
+static i64 os_random(const OS *o, void *b, u64 n) { (void)o; return sys6(SYS_getrandom, (i64)b, (i64)n, 0, 0, 0, 0); }
 
 // rt_start is the program entry: sp points at argc, argv and envp.
 void rt_start(u64 *sp, u64 (*main)(R *)) {
@@ -54,6 +56,7 @@ void rt_start(u64 *sp, u64 (*main)(R *)) {
 	os.exit = os_exit;
 	os.pages = os_pages;
 	os.random = os_random;
+	os.imports = 0;
 	char **argv = (char **)(sp + 1);
 	R *r = rt_init(&os, sp[0], argv, argv + sp[0] + 1);
 	rt_exit(r, main(r));

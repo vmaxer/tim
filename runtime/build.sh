@@ -54,3 +54,6 @@ build() {
 build linux amd64 LinuxAMD64 x86_64-unknown-none-elf x86_64 -mno-red-zone
 build linux arm64 LinuxARM64 aarch64-unknown-none-elf aarch64 -mcmodel=tiny -ffixed-x18
 build linux riscv64 LinuxRISCV64 riscv64-unknown-none-elf rv64 -march=rv64gc -mabi=lp64d -mcmodel=medany
+build windows amd64 WindowsAMD64 x86_64-unknown-none-elf x86_64 -mno-red-zone
+build windows arm64 WindowsARM64 aarch64-unknown-none-elf aarch64 -mcmodel=tiny -ffixed-x18
+build darwin arm64 DarwinARM64 aarch64-unknown-none-elf aarch64 -mcmodel=tiny -ffixed-x18
