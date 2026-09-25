@@ -88,34 +88,43 @@ func writeCorePE(path string, arch Arch, code []byte, entry int) error {
 	idata, dirOff, dirSize, iatSize := peIdata(idataRVA)
 	textRaw := alignUp(len(code), peFileAlgn)
 	idataRaw := alignUp(len(idata), peFileAlgn)
-	imageSize := alignUp(idataRVA+len(idata), 0x1000)
+	// The code is position independent, so the relocation table has one
+	// empty block: ARM64 Windows loads only images that allow ASLR.
+	relocRVA := alignUp(idataRVA+len(idata), 0x1000)
+	reloc := make([]byte, 12)
+	le.PutUint32(reloc[0:], peTextRVA)
+	le.PutUint32(reloc[4:], 12)
+	relocRaw := alignUp(len(reloc), peFileAlgn)
+	imageSize := alignUp(relocRVA+len(reloc), 0x1000)
 
-	b := make([]byte, peHeaders+textRaw+idataRaw)
+	b := make([]byte, peHeaders+textRaw+idataRaw+relocRaw)
 	copy(b, "MZ")
 	le.PutUint32(b[0x3C:], 0x40)
 	copy(b[0x40:], "PE\x00\x00")
 	coff := b[0x44:]
 	le.PutUint16(coff[0:], machine)
-	le.PutUint16(coff[2:], 2)
+	le.PutUint16(coff[2:], 3)
 	le.PutUint16(coff[16:], 240)
-	le.PutUint16(coff[18:], 0x0023) // relocations stripped, executable, large address aware
+	le.PutUint16(coff[18:], 0x0022) // executable, large address aware
 
 	opt := b[0x58:]
 	le.PutUint16(opt[0:], 0x20B)
 	opt[2] = 14
 	le.PutUint32(opt[4:], uint32(textRaw))
-	le.PutUint32(opt[8:], uint32(idataRaw))
+	le.PutUint32(opt[8:], uint32(idataRaw+relocRaw))
 	le.PutUint32(opt[16:], uint32(peTextRVA+entry))
 	le.PutUint32(opt[20:], peTextRVA)
 	le.PutUint64(opt[24:], peImage)
 	le.PutUint32(opt[32:], 0x1000)
 	le.PutUint32(opt[36:], peFileAlgn)
 	le.PutUint16(opt[40:], 6)
+	le.PutUint16(opt[42:], 2)
 	le.PutUint16(opt[48:], 6)
+	le.PutUint16(opt[50:], 2)
 	le.PutUint32(opt[56:], uint32(imageSize))
 	le.PutUint32(opt[60:], peHeaders)
 	le.PutUint16(opt[68:], 3)      // console
-	le.PutUint16(opt[70:], 0x8100) // NX compatible, terminal server aware
+	le.PutUint16(opt[70:], 0x8160) // high entropy VA, dynamic base, NX compatible, terminal server aware
 	// The whole stack is committed up front, so frames of any size need no probes.
 	le.PutUint64(opt[72:], 8<<20)
 	le.PutUint64(opt[80:], 8<<20)
@@ -138,9 +147,13 @@ func writeCorePE(path string, arch Arch, code []byte, entry int) error {
 	}
 	section(0x148, ".text", len(code), peTextRVA, textRaw, peHeaders, 0x60000020)
 	section(0x148+40, ".idata", len(idata), idataRVA, idataRaw, peHeaders+textRaw, 0xC0000040)
+	section(0x148+80, ".reloc", len(reloc), relocRVA, relocRaw, peHeaders+textRaw+idataRaw, 0x42000040)
+	le.PutUint32(opt[112+5*8:], uint32(relocRVA))
+	le.PutUint32(opt[112+5*8+4:], uint32(len(reloc)))
 
 	copy(b[peHeaders:], code)
 	copy(b[peHeaders+textRaw:], idata)
+	copy(b[peHeaders+textRaw+idataRaw:], reloc)
 	if err := os.WriteFile(path, b, 0o755); err != nil {
 		return err
 	}
