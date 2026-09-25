@@ -82,11 +82,13 @@ func findSimilarIdentifiers(name string, availableVars map[string]int, maxSugges
 	}
 
 	var suggestions []suggestion
-	threshold := 3 // Maximum edit distance for suggestions
+	// Allow about one edit per three characters, so short names only match
+	// near-identical ones.
+	threshold := min(3, (len(name)+1)/3)
 
 	for varName := range availableVars {
 		dist := levenshteinDistance(name, varName)
-		if dist <= threshold && dist > 0 {
+		if dist <= threshold && dist > 0 && dist < len(varName) {
 			suggestions = append(suggestions, suggestion{varName, dist})
 		}
 	}

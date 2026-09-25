@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"reflect"
 	"strings"
 )
@@ -128,7 +129,7 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 	c, err := Check(prog, path, string(src))
 	if err != nil {
 		var ce *CheckError
-		if errors.As(err, &ce) && ce.OnlyUndefined {
+		if errors.As(err, &ce) && ce.OnlyUndefined && hasSiblings(path) {
 			why = "undefined names, perhaps defined by a sibling file"
 			return false, nil
 		}
@@ -171,4 +172,16 @@ func coreTargetFor(p Platform) (coreTarget, asm, func(string, Arch, []byte, int)
 		return t, newA64(), writeCoreMachO
 	}
 	return t, nil, nil
+}
+
+// hasSiblings reports whether other .tim files sit next to path; the legacy
+// driver loads them to find functions a program does not define.
+func hasSiblings(path string) bool {
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tim"))
+	for _, m := range matches {
+		if filepath.Base(m) != filepath.Base(path) {
+			return true
+		}
+	}
+	return false
 }

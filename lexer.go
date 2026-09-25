@@ -298,6 +298,15 @@ func (l *lexer) next() {
 		l.advance(1)
 		s := l.stringBody(line, col)
 		l.emit(TOKEN_STRING, s, line, col)
+	case c == '`':
+		end := strings.IndexByte(rest[1:], '`')
+		if end < 0 {
+			l.fail(line, col, "unterminated raw string")
+			l.advance(len(rest))
+			return
+		}
+		l.advance(end + 2)
+		l.emit(TOKEN_STRING, strings.ReplaceAll(rest[1:end+1], "\r\n", "\n"), line, col)
 	case c == 'f' && len(rest) > 1 && rest[1] == '"':
 		l.advance(2)
 		l.fstring(line, col)

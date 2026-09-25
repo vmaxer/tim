@@ -125,7 +125,9 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 		k.c.Unsupported = append(k.c.Unsupported, f)
 	}
 	sort.Strings(k.c.Unsupported)
-	if k.errs.HasErrors() {
+	// A program that uses legacy features is checked by the legacy backends,
+	// since errors here may only reflect what this checker cannot model.
+	if k.errs.HasErrors() && len(k.c.Unsupported) == 0 {
 		ce := &CheckError{Plain: strings.TrimSpace(k.errs.Report(false)), Color: k.errs.Report(true), OnlyUndefined: true}
 		for _, e := range k.errs.errors {
 			if !strings.HasPrefix(e.Message, "undefined ") {
@@ -246,10 +248,32 @@ func (k *checker) names() map[string]int {
 
 func (k *checker) undefined(pos Pos, what, name string) {
 	msg := fmt.Sprintf("undefined %s '%s'", what, name)
+	if hint, ok := foreignHints[name]; ok {
+		k.errorf(pos, "%s; %s", msg, hint)
+		return
+	}
 	if sugg := findSimilarIdentifiers(name, k.names(), 1); len(sugg) > 0 {
 		msg += "; did you mean " + strings.Join(quoteAll(sugg), " or ") + "?"
 	}
 	k.errorf(pos, "%s", msg)
+}
+
+// foreignHints answer names people bring from other languages.
+var foreignHints = map[string]string{
+	"len":     "the length of x is #x",
+	"length":  "the length of x is #x",
+	"size":    "the length of x is #x",
+	"append":  "use push(xs, v), or xs + [v] for a new list",
+	"int":     "use x as int64 or trunc(x)",
+	"float64": "use x as float64 or float(x)",
+	"string":  "use str(x) or x as str",
+	"input":   "use readln()",
+	"range":   "use a..<b or a..=b",
+	"nil":     "Tim has no nil; use 0, an error or an empty value",
+	"null":    "Tim has no null; use 0, an error or an empty value",
+	"true":    "use yes",
+	"false":   "use no",
+	"print_r": "use println(x)",
 }
 
 func quoteAll(xs []string) []string {
@@ -790,7 +814,7 @@ func (k *checker) call(e *CallExpr) Type {
 	}
 	b, ok := builtins[name]
 	if !ok {
-		if legacyBuiltins[name] {
+		if legacyBuiltins[name] || builtinFunctionNames[name] {
 			k.unsupported("legacy builtin " + name)
 		} else {
 			k.undefined(e.Pos, "function", name)

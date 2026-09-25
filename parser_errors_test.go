@@ -42,13 +42,13 @@ func TestParserDiagnostics(t *testing.T) {
 		{
 			name:     "undefined function suggests similar name",
 			code:     "main = { prinltn(42) }\n",
-			wantErr:  "undefined function: prinltn",
+			wantErr:  "undefined function 'prinltn'",
 			wantErr2: "println",
 		},
 		{
 			name:     "undefined user function suggests defined one",
 			code:     "helper = x -> x * 2\nmain = { println(helpr(3)) }\n",
-			wantErr:  "undefined function: helpr",
+			wantErr:  "undefined function 'helpr'",
 			wantErr2: "helper",
 		},
 	}

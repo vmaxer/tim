@@ -938,7 +938,7 @@ func TestDiagnosticsNotNoisy(t *testing.T) {
 	if !strings.Contains(msg, "undefined variable 'veloctiy'") {
 		t.Errorf("expected an 'undefined variable' message, got: %q", msg)
 	}
-	if !strings.Contains(msg, "Did you mean: velocity?") {
+	if !strings.Contains(msg, "did you mean 'velocity'?") {
 		t.Errorf("expected a 'Did you mean' suggestion for a near name, got: %q", msg)
 	}
 }

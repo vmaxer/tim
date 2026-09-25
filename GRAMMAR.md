@@ -34,7 +34,7 @@ IDENT    = ( letter | "_" ) { letter | digit | "_" } ;     (* letter: any Unicod
 NUMBER   = DECIMAL | "0x" HEX { [ "_" ] HEX } | "0o" OCT { [ "_" ] OCT } | "0b" BIN { [ "_" ] BIN } ;
 DECIMAL  = DIGITS [ "." DIGITS ] [ ( "e" | "E" ) [ "+" | "-" ] DIGITS ] ;
 DIGITS   = digit { [ "_" ] digit } ;
-STRING   = '"' { char | escape } '"' ;
+STRING   = '"' { char | escape } '"' | "`" { char } "`" ;   (* raw: no escapes, may span lines *)
 FSTRING  = 'f"' { char | escape | "{{" | "}}" | "{" expr "}" } '"' ;
 escape   = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\{" | "\x" HEX HEX | "\u{" HEX { HEX } "}" ;
 ```
@@ -42,7 +42,8 @@ escape   = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\{" | "\x" HEX HEX | "\u{"
 - **Comments:** `// to end of line` and `/* block */` (block comments do not nest).
 - **Numbers** are exact: `0.1` is the rational 1/10, `1e-9` is 1/10⁹. `_` separates
   digit groups: `1_000_000`.
-- **Strings** are UTF-8 byte strings; `\u{1F600}` encodes a code point.
+- **Strings** are UTF-8 byte strings; `\u{1F600}` encodes a code point. A raw
+  string in backquotes has no escapes and may span lines.
 - **Newlines** end statements, except (1) inside `( )` and `[ ]`, (2) after a token
   that cannot end an expression (a binary operator, `,`, `(`, `[`, `{`, `->`, `=>`,
   `~>`, `=`, `:=`, `<-`, `|>`), and (3) before a line that starts with `|>`,
