@@ -40,10 +40,10 @@ type Var struct {
 	Name    string
 	Kind    SymKind
 	Mutable bool
-	Boxed   bool      // a mutable variable captured by a closure: it lives in a heap cell
-	Index   int       // global number, local slot, parameter number or capture number
+	Boxed   bool // a mutable variable captured by a closure: it lives in a heap cell
+	Index   int  // global number, local slot, parameter number or capture number
 	Fn      *Fun // the function whose frame or closure holds it (nil for globals)
-	Outer   *Var   // for captures: the symbol captured from the enclosing function
+	Outer   *Var // for captures: the symbol captured from the enclosing function
 	Func    *Fun // the function literal it is bound to, when known
 	Type    Type
 	Pos     Pos
