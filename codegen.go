@@ -16931,6 +16931,12 @@ func CompileTimWithOptions(inputPath string, outputPath string, platform Platfor
 		return fmt.Errorf("failed to read %s: %v", inputPath, readErr)
 	}
 
+	if !depsOnly {
+		if handled, err := tryCore(content, inputPath, outputPath, platform); handled {
+			return err
+		}
+	}
+
 	// Parse main file
 	parser := NewParserWithFilename(string(content), inputPath)
 	program := parser.ParseProgram()

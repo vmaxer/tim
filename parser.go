@@ -1389,6 +1389,8 @@ func (p *Parser) mapLiteral() Expression {
 			switch t := p.advance(); t.Type {
 			case TOKEN_IDENT:
 				key = &NumberExpr{Value: float64(hashStringKey(t.Value))}
+				m.Names = append(m.Names, make([]string, len(m.Keys)+1-len(m.Names))...)
+				m.Names[len(m.Keys)] = t.Value
 			case TOKEN_STRING:
 				key = &StringExpr{Value: t.Value}
 			case TOKEN_NUMBER:

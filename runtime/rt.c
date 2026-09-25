@@ -1203,7 +1203,7 @@ static void put_double(Buf *b, double x) {
 	}
 	char dig[20];
 	int n, k = shortest_digits(b->r, x, dig, &n);
-	if (k - 1 < -4 || k - 1 >= 21) {
+	if (k - 1 < -4 || k - 1 >= 16) {
 		put(b, (u8)dig[0]);
 		if (n > 1) {
 			put(b, '.');
@@ -2122,7 +2122,7 @@ static void put_fixed(R *r, Buf *b, u64 v, int prec) {
 	}
 }
 
-// rt_printf formats with %d %i %u %x %X %f %.Nf %e %g %s %v %c %q %%.
+// rt_sprintf formats with %d %i %u %x %X %f %.Nf %e %g %s %v %c %q %b (yes or no) %%.
 u64 rt_sprintf(R *r, u64 fmt, const u64 *args, u64 n) {
 	if (tag_of(fmt) != TAG_STR)
 		return type_error(r, "format with", fmt, 0);
@@ -2184,6 +2184,9 @@ u64 rt_sprintf(R *r, u64 fmt, const u64 *args, u64 n) {
 			break;
 		case 'q':
 			put_val(r, &one, v, 1, 0);
+			break;
+		case 'b':
+			puts_(&one, rt_truthy(r, v) ? "yes" : "no");
 			break;
 		default: // s, v
 			put_val(r, &one, v, 0, 0);
@@ -2903,3 +2906,9 @@ u64 rt_write_file(R *r, u64 path, u64 data) {
 	r->os->close(fd);
 	return num((double)str_len(s));
 }
+
+// rt_globals allocates the program's global variables, all 0.
+u64 *rt_globals(R *r, u64 n) { return raw(r, n * 8 + 8); }
+
+// rt_bound converts a range bound to a plain double for a counting loop.
+u64 rt_bound(R *r, u64 v) { return is_num(v) ? num(to_double(r, v)) : num(0); }

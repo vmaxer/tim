@@ -68,6 +68,8 @@ var builtins = map[string]builtin{
 	"any":     {2, 2, ""}, "all": {2, 2, ""},
 	"zip":       {2, 2, "pairs of corresponding elements"},
 	"enumerate": {1, 1, "pairs of index and element"},
+
+	"__sort_keys": {2, 2, ""}, // sort(xs, key) in the prelude
 }
 
 // legacyBuiltins are low-level functions only the legacy code generators

@@ -600,6 +600,7 @@ type MapExpr struct {
 	Pos    Pos
 	Keys   []Expression
 	Values []Expression
+	Names  []string // Names[i] is the identifier written for key i, which legacy backends hash
 }
 
 func (m *MapExpr) String() string {

@@ -35,21 +35,21 @@ main = {
     value = 0b11111111  // All bits set in lower byte
     
     // Test with variable bit positions
-    pos = 0
+    pos := 0
     result0 = bit(value, pos)
     result0 == 1 or exit(1)
     
-    pos = 3
+    pos <- 3
     result3 = bit(value, pos)
     result3 == 1 or exit(2)
     
-    pos = 7
+    pos <- 7
     result7 = bit(value, pos)
     result7 == 1 or exit(3)
     
     // Test with no bits set
     zero = 0
-    pos = 5
+    pos <- 5
     result_zero = bit(zero, pos)
     result_zero == 0 or exit(4)
 }

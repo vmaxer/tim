@@ -92,8 +92,15 @@ type checker struct {
 	unsupp map[string]bool
 }
 
-// Check analyses a parsed program. It returns an error when the program is
-// invalid; the error has already been printed with source context.
+// CheckError lists everything wrong with a program.
+type CheckError struct {
+	Plain, Color  string
+	OnlyUndefined bool // every error is an undefined name, which a sibling file or import may define
+}
+
+func (e *CheckError) Error() string { return e.Plain }
+
+// Check analyses a parsed program and returns a *CheckError when it is invalid.
 func Check(prog *Program, file, src string) (*Checked, error) {
 	top := &Fun{Name: "<top>"}
 	k := &checker{
@@ -119,7 +126,13 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 	}
 	sort.Strings(k.c.Unsupported)
 	if k.errs.HasErrors() {
-		return nil, newReportedError(strings.TrimSpace(k.errs.Report(false)))
+		ce := &CheckError{Plain: strings.TrimSpace(k.errs.Report(false)), Color: k.errs.Report(true), OnlyUndefined: true}
+		for _, e := range k.errs.errors {
+			if !strings.HasPrefix(e.Message, "undefined ") {
+				ce.OnlyUndefined = false
+			}
+		}
+		return nil, ce
 	}
 	return k.c, nil
 }
@@ -269,9 +282,11 @@ func (k *checker) stmt(s Statement) {
 			k.errorf(s.Pos, "cannot unpack a %s into %d names; the right side must be a list", t, len(s.Names))
 		}
 		if s.IsUpdate {
+			var syms []*Var
 			for _, n := range s.Names {
-				k.updateTarget(s.Pos, n)
+				syms = append(syms, k.updateTarget(s.Pos, n))
 			}
+			k.c.Defs[s] = syms
 			return
 		}
 		var syms []*Var
@@ -328,6 +343,7 @@ func (k *checker) stmt(s Statement) {
 			k.expr(s.Value)
 		}
 	case *DeferStmt:
+		k.unsupported("defer")
 		k.expr(s.Call)
 	case *ArenaStmt:
 		k.block(s.Body)
@@ -365,12 +381,46 @@ func (k *checker) assign(s *AssignStmt) {
 		sym.Func = k.lambda(lambda, s.Name)
 		sym.Type = TFn
 		k.c.Types[lambda] = TFn
+		for _, c := range sym.Func.Captures {
+			if c.Outer == sym {
+				sym.Boxed = true // the closure must see its own value, set after it is made
+			}
+		}
 	} else {
+		k.checkLoopShadow(s)
 		t := k.expr(s.Value)
 		sym = k.define(s.Name, s.Mutable, s.Pos)
 		sym.Type = t
 	}
 	k.c.Defs[s] = []*Var{sym}
+}
+
+// checkLoopShadow rejects `x = x + 1` in a loop body when x belongs to an
+// outer block: the new x would vanish at the end of each iteration.
+func (k *checker) checkLoopShadow(s *AssignStmt) {
+	if k.loops == 0 || s.Mutable {
+		return
+	}
+	for sc := k.sc.parent; sc != nil; sc = sc.parent {
+		prev, ok := sc.names[s.Name]
+		if !ok {
+			continue
+		}
+		reads := false
+		walkNodes(s.Value, func(n any) {
+			if id, ok := n.(*IdentExpr); ok && id.Name == s.Name {
+				reads = true
+			}
+		})
+		if reads {
+			how := fmt.Sprintf("bind it with ':=' at line %d and write '%s <- ...'", prev.Pos.Line, s.Name)
+			if prev.Mutable {
+				how = fmt.Sprintf("write '%s <- ...'", s.Name)
+			}
+			k.errorf(s.Pos, "'%s = ...' here makes a new '%s' that disappears at the end of the block; to update '%s', %s", s.Name, s.Name, s.Name, how)
+		}
+		return
+	}
 }
 
 func (k *checker) updateTarget(pos Pos, name string) *Var {

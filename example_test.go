@@ -154,16 +154,16 @@ func TestLoopWithLabel(t *testing.T) {
 // TestQuickSort tests building lists with append operator
 func TestQuickSort(t *testing.T) {
 	code := `
-// Demonstrate building a list with += append operator
+// Build a list with push
 result := []
-result += 1
-result += 1
-result += 2
-result += 3
-result += 4
-result += 5
-result += 6
-result += 9
+push(result, 1)
+push(result, 1)
+push(result, 2)
+push(result, 3)
+push(result, 4)
+push(result, 5)
+push(result, 6)
+push(result, 9)
 
 printf("Sorted: %v %v %v %v %v %v %v %v\n", result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7])
 `
@@ -207,10 +207,10 @@ printf("Sum from 1 to 10: %v\n", result)
 // TestInsertionSort tests list building with append operator
 func TestInsertionSort(t *testing.T) {
 	code := `
-// Build a list using += append operator in a loop
+// Build a list in a loop
 result := []
 @ i in 1..<9 {
-	result += i
+	push(result, i)
 }
 
 printf("Sorted: %v %v %v %v %v %v %v %v\n", result[0], result[1], result[2], result[3], result[4], result[5], result[6], result[7])

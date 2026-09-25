@@ -810,13 +810,13 @@ func TestEvaluation(t *testing.T) {
 			// fresh shadow slot (which used to make only the first step "stick").
 			code: `
 				main = {
-					acc = 0.0
-					@ i in 1..=5 { acc = acc + i }
-					lo = 0.0
-					hi = 10.0
+					acc := 0.0
+					@ i in 1..=5 { acc <- acc + i }
+					lo := 0.0
+					hi := 10.0
 					@ k in 0..<6 {
 						m = 0.5 * (lo + hi)
-						if m < 5.0 { lo = m } else { hi = m }
+						if m < 5.0 { lo <- m } else { hi <- m }
 					}
 					println(acc)
 					println(lo + hi)
