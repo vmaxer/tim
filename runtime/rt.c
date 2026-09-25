@@ -65,9 +65,29 @@ typedef struct {
 	i64 (*random)(void *buf, u64 n);
 } OS;
 
+// The heap is a list of chunks. Each has a bitmap with a bit set at the
+// first word of every object, which finds an object from an interior pointer.
+typedef struct {
+	u64 *start, *top, *end, *bits;
+} Chunk;
+
+#define MAX_CHUNKS 1024
+#define CHUNK_WORDS (8ull << 20)
+#define MIN_GC_WORDS (4ull << 20)
+#define SMALL 64
+
 typedef struct {
 	const OS *os;
-	u64 *heap, *heap_end;
+	Chunk chunks[MAX_CHUNKS];
+	u64 nchunks;
+	Chunk *cur;              // the chunk being filled
+	u64 lo, hi;              // bounds of all chunks
+	u64 *small[SMALL + 1];   // free blocks by size in words
+	u64 *big;                // larger free blocks
+	u64 allocated, threshold; // words allocated since the last collection
+	u64 *stack_top;
+	u64 *globals, nglobals;
+	u64 *marks, nmarks, capmarks;
 	u64 argc;
 	char **argv, **envp;
 	u64 outn, inpos, inlen;
@@ -142,17 +162,109 @@ static inline double neg_d(double x) { return 0.0 - x; }
 
 static void fatal(R *r, const char *msg);
 
-static u64 *alloc_obj(R *r, int kind, u64 words) {
-	if (r->heap + words > r->heap_end) {
-		u64 bytes = words * 8 > (64ull << 20) ? words * 8 : (64ull << 20);
-		u64 *p = r->os->pages(bytes);
-		if (!p)
-			fatal(r, "out of memory");
-		r->heap = p;
-		r->heap_end = p + bytes / 8;
+#define K_FREE 15
+#define MARK 0x80ull
+
+static void gc(R *r);
+
+static void set_start(Chunk *c, u64 *p) {
+	u64 i = (u64)(p - c->start);
+	c->bits[i >> 6] |= 1ull << (i & 63);
+}
+
+static void clear_start(Chunk *c, u64 *p) {
+	u64 i = (u64)(p - c->start);
+	c->bits[i >> 6] &= ~(1ull << (i & 63));
+}
+
+static Chunk *chunk_of(R *r, u64 a) {
+	if (a < r->lo || a >= r->hi)
+		return 0;
+	for (u64 i = 0; i < r->nchunks; i++) {
+		Chunk *c = &r->chunks[i];
+		if (a >= (u64)c->start && a < (u64)c->top)
+			return c;
 	}
-	u64 *p = r->heap;
-	r->heap += words;
+	return 0;
+}
+
+static void free_block(R *r, u64 *p, u64 words) {
+	p[0] = K_FREE | words << 8;
+	if (words <= SMALL) {
+		p[1] = (u64)r->small[words];
+		r->small[words] = p;
+	} else {
+		p[1] = (u64)r->big;
+		r->big = p;
+	}
+}
+
+static Chunk *new_chunk(R *r, u64 words) {
+	u64 n = words > CHUNK_WORDS ? (words + 511) & ~511ull : CHUNK_WORDS;
+	if (r->nchunks == MAX_CHUNKS)
+		fatal(r, "out of memory");
+	u64 *p = r->os->pages(n * 8), *bits = r->os->pages(n / 8 + 8);
+	if (!p || !bits)
+		fatal(r, "out of memory");
+	Chunk *c = &r->chunks[r->nchunks++];
+	c->start = c->top = p;
+	c->end = p + n;
+	c->bits = bits;
+	if (!r->lo || (u64)p < r->lo)
+		r->lo = (u64)p;
+	if ((u64)c->end > r->hi)
+		r->hi = (u64)c->end;
+	return c;
+}
+
+// take_big returns a free block of at least words from the big list, split.
+static u64 *take_big(R *r, u64 words) {
+	for (u64 **link = &r->big; *link; link = (u64 **)&(*link)[1]) {
+		u64 *p = *link, have = p[0] >> 8;
+		if (have != words && have < words + 2)
+			continue;
+		*link = (u64 *)p[1];
+		if (have > words) {
+			u64 *rest = p + words;
+			set_start(chunk_of(r, (u64)p), rest);
+			free_block(r, rest, have - words);
+		}
+		return p;
+	}
+	return 0;
+}
+
+static u64 *alloc_obj(R *r, int kind, u64 words) {
+	if (words < 2)
+		words = 2;
+	if (r->allocated > r->threshold)
+		gc(r);
+	u64 *p;
+	if (words <= SMALL && r->small[words]) {
+		p = r->small[words];
+		r->small[words] = (u64 *)p[1];
+	} else if (r->cur && r->cur->top + words <= r->cur->end) {
+		p = r->cur->top;
+		r->cur->top += words;
+		set_start(r->cur, p);
+	} else if (!(p = take_big(r, words))) {
+		Chunk *c = new_chunk(r, words);
+		if (words <= CHUNK_WORDS / 4) {
+			Chunk *old = r->cur;
+			if (old && old->end - old->top >= 2) {
+				// keep the old chunk's tail as a free block
+				u64 *tail = old->top;
+				old->top = old->end;
+				set_start(old, tail);
+				free_block(r, tail, (u64)(old->end - tail));
+			}
+			r->cur = c;
+		}
+		p = c->top;
+		c->top += words;
+		set_start(c, p);
+	}
+	r->allocated += words;
 	p[0] = (u64)kind | words << 8;
 	return p;
 }
@@ -1751,6 +1863,8 @@ R *rt_init(const OS *os, u64 argc, char **argv, char **envp) {
 	}
 	memset(r, 0, sizeof *r);
 	r->os = os;
+	r->threshold = MIN_GC_WORDS;
+	r->stack_top = (u64 *)(argv - 1);
 	r->argc = argc;
 	r->argv = argv;
 	r->envp = envp;
@@ -2908,7 +3022,149 @@ u64 rt_write_file(R *r, u64 path, u64 data) {
 }
 
 // rt_globals allocates the program's global variables, all 0.
-u64 *rt_globals(R *r, u64 n) { return raw(r, n * 8 + 8); }
+u64 *rt_globals(R *r, u64 n) {
+	r->globals = raw(r, n * 8 + 8);
+	r->nglobals = n;
+	return r->globals;
+}
+
+// Garbage collection: mark and sweep, not moving. The machine stack is
+// scanned conservatively, so a word that looks like a pointer into an object
+// keeps it alive; inside objects, only fields that hold values are traced.
+
+// obj_start finds the object containing address a in chunk c.
+static u64 *obj_start(Chunk *c, u64 *a) {
+	u64 i = (u64)(a - c->start), wi = i >> 6;
+	u64 m = c->bits[wi] & (~0ull >> (63 - (i & 63)));
+	while (!m) {
+		if (!wi)
+			return 0;
+		m = c->bits[--wi];
+	}
+	return c->start + (wi << 6) + 63 - clz64(m);
+}
+
+static void push_mark(R *r, u64 *p) {
+	if (r->nmarks == r->capmarks) {
+		u64 cap = r->capmarks ? r->capmarks * 2 : 65536;
+		u64 *m = r->os->pages(cap * 8);
+		if (!m)
+			fatal(r, "out of memory");
+		memcpy(m, r->marks, r->nmarks * 8);
+		r->marks = m;
+		r->capmarks = cap;
+	}
+	r->marks[r->nmarks++] = (u64)p;
+}
+
+static void mark_addr(R *r, u64 a) {
+	Chunk *c = chunk_of(r, a);
+	if (!c)
+		return;
+	u64 *p = obj_start(c, (u64 *)a);
+	if (!p)
+		return;
+	u64 h = p[0];
+	if ((h & MARK) || (h & 0x7F) == K_FREE || a >= (u64)(p + (h >> 8)))
+		return;
+	p[0] = h | MARK;
+	push_mark(r, p);
+}
+
+static void mark_val(R *r, u64 v) {
+	switch (tag_of(v)) {
+	case TAG_BIG: case TAG_RAT: case TAG_STR: case TAG_LIST: case TAG_MAP: case TAG_FN: case TAG_CELL: case TAG_ERRMSG:
+		mark_addr(r, v & PTR_MASK);
+	}
+}
+
+// mark_word treats a stack word as a value or as a raw pointer.
+static void mark_word(R *r, u64 w) {
+	if (tag_of(w))
+		mark_val(r, w);
+	else
+		mark_addr(r, w);
+}
+
+static void trace(R *r, u64 *p) {
+	u64 w = p[0] >> 8;
+	switch (p[0] & 0x7F) {
+	case K_LIST:
+		mark_addr(r, p[3]);
+		break;
+	case K_MAP:
+		mark_addr(r, p[4]);
+		mark_addr(r, p[5]);
+		break;
+	case K_ARR:
+		for (u64 i = 1; i < w; i++)
+			mark_val(r, p[i]);
+		break;
+	case K_FN:
+		for (u64 i = 0; i < p[3] && 4 + i < w; i++)
+			mark_val(r, p[4 + i]);
+		break;
+	case K_CELL:
+		mark_val(r, p[1]);
+		break;
+	}
+}
+
+__attribute__((noinline)) static void scan_stack(R *r) {
+	u64 here = 0;
+	for (u64 *p = (u64 *)((u64)&here & ~7ull); p < r->stack_top; p++)
+		mark_word(r, *p);
+}
+
+static void sweep(R *r) {
+	u64 live = 0;
+	memset(r->small, 0, sizeof r->small);
+	r->big = 0;
+	for (u64 i = 0; i < r->nchunks; i++) {
+		Chunk *c = &r->chunks[i];
+		u64 *run = 0;
+		for (u64 *p = c->start; p < c->top;) {
+			u64 h = p[0], w = h >> 8;
+			if (h & MARK) {
+				p[0] = h & ~MARK;
+				live += w;
+				if (run) {
+					free_block(r, run, (u64)(p - run));
+					run = 0;
+				}
+			} else if (!run) {
+				run = p;
+			} else {
+				clear_start(c, p);
+			}
+			p += w;
+		}
+		if (run && c == r->cur) {
+			clear_start(c, run);
+			c->top = run;
+		} else if (run) {
+			free_block(r, run, (u64)(c->top - run));
+		}
+	}
+	r->allocated = 0;
+	r->threshold = live > MIN_GC_WORDS ? live : MIN_GC_WORDS;
+}
+
+static void gc(R *r) {
+	__builtin_unwind_init(); // callee-saved registers may hold pointers: spill them
+	scan_stack(r);
+	mark_addr(r, (u64)r->globals);
+	for (u64 i = 0; i < r->nglobals; i++)
+		mark_val(r, r->globals[i]);
+	while (r->nmarks)
+		trace(r, (u64 *)r->marks[--r->nmarks]);
+	sweep(r);
+}
+
+u64 rt_gc(R *r) {
+	gc(r);
+	return 0;
+}
 
 // rt_bound converts a range bound to a plain double for a counting loop.
 u64 rt_bound(R *r, u64 v) { return is_num(v) ? num(to_double(r, v)) : num(0); }
