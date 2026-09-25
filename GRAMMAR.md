@@ -315,9 +315,10 @@ The value of `unsafe` is the return register (`rax`, `x0`, `a0`) read as `ctype`
 ## 7. Program execution
 
 Top-level statements run in order. If the program defines a function `main` and
-never calls it at top level, `main()` runs after the top level. The exit code is the
-value of the last top-level statement (or of `main()`), truncated to an integer; a
-non-number exits with 0. `ret v` at top level exits with `v`.
+never calls it at top level, `main()` runs after the top level. The exit code is 0,
+unless the program calls `exit(n)`, returns `ret n` at top level, or `main` gives a
+number, which is truncated to an integer; an error exits with 1. Deferred calls run
+when the program ends, last first, as they do when a function returns.
 
 ## 8. What changed from Tim 1
 

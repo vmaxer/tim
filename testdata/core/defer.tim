@@ -1,0 +1,19 @@
+println("Start")
+defer println("Deferred last")
+f(n) = {
+    defer println(f"leave {n}")
+    defer println(f"cleanup {n}")
+    n > 1 { ret f(n - 1) + 1 }
+    println("bottom")
+    0
+}
+println(f(3))
+x := 1
+defer println(f"x is {x}")
+x <- 2
+g() = {
+    defer println("g done")
+    @ i in 0..<3 { i == 1 { ret "early" } }
+    "late"
+}
+println(g())

@@ -58,6 +58,7 @@ type Fun struct {
 	Variadic *Var
 	Locals   []*Var
 	Captures []*Var
+	Defers   bool // the function has defer statements
 }
 
 // Checked is the result of checking a program.
@@ -71,6 +72,7 @@ type Checked struct {
 	Updates     map[Statement]*Var   // the variable updated by an update statement
 	Callees     map[*CallExpr]*Var   // calls through a variable; absent for builtins
 	Fns         map[*LambdaExpr]*Fun
+	Deferred    map[*DeferStmt]*Fun // the deferred expression as a function of no arguments
 	Types       map[Expression]Type
 	Unsupported []string // features the core code generator does not handle yet
 }
@@ -107,7 +109,7 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 		c: &Checked{
 			Program: prog, Top: top, Funcs: []*Fun{top},
 			Uses: map[*IdentExpr]*Var{}, Defs: map[Statement][]*Var{}, Updates: map[Statement]*Var{},
-			Callees: map[*CallExpr]*Var{}, Fns: map[*LambdaExpr]*Fun{}, Types: map[Expression]Type{},
+			Callees: map[*CallExpr]*Var{}, Fns: map[*LambdaExpr]*Fun{}, Deferred: map[*DeferStmt]*Fun{}, Types: map[Expression]Type{},
 		},
 		file:   file,
 		errs:   NewErrorCollector(20),
@@ -367,8 +369,8 @@ func (k *checker) stmt(s Statement) {
 			k.expr(s.Value)
 		}
 	case *DeferStmt:
-		k.unsupported("defer")
-		k.expr(s.Call)
+		k.fn.Defers = true
+		k.c.Deferred[s] = k.lambda(&LambdaExpr{Pos: s.Pos, Body: s.Call}, "")
 	case *ArenaStmt:
 		k.block(s.Body)
 	case *CStructDecl:

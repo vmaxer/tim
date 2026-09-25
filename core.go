@@ -70,7 +70,8 @@ type frame struct {
 	temps    int
 	maxTemps int
 	maxOut   int
-	variadic int // slot of the variadic parameter
+	variadic int   // slot of the variadic parameter
+	defers   int32 // offset of the list of deferred functions, or 0
 	loops    []loopLabels
 }
 
@@ -228,6 +229,7 @@ func (g *coreGen) genTop() {
 	g.f = &frame{fn: g.c.Top, top: true}
 	// slots: 0 saved runtime register, 1 saved globals register, then locals
 	g.f.fixed = 2 + len(g.c.Top.Locals)
+	g.reserveDefers()
 	h := g.a.prologue()
 	g.a.store(rRT, rFP, slotOff(0))
 	g.a.store(rGlob, rFP, slotOff(1))
@@ -237,6 +239,7 @@ func (g *coreGen) genTop() {
 	g.callRT("rt_globals", rt(), slot(countSlot))
 	g.free(1)
 	g.a.mov(rGlob, rA)
+	g.initDefers()
 
 	stmts := g.c.Program.Statements
 	for _, s := range stmts {
@@ -251,20 +254,10 @@ func (g *coreGen) genTop() {
 		}
 	}
 	g.a.imm(rA, 0)
-	last := -1
-	for i, s := range stmts {
-		switch s.(type) {
-		case *ExportStmt, *CStructDecl, *ImportStmt, *CImportStmt:
-		default:
-			last = i
-		}
-	}
-	for i, s := range stmts {
+	for _, s := range stmts {
 		g.stmt(s, false)
-		if i == last {
-			g.stmtValue(s)
-		}
 	}
+	g.a.imm(rA, 0)
 	if v := g.mainToRun(); v != nil && v.Func != nil {
 		g.callVar(v, nil, false)
 	} else if v != nil {
@@ -282,6 +275,7 @@ func (g *coreGen) genTop() {
 		g.a.bind(done)
 		g.free(1)
 	}
+	g.runDefers()
 	g.a.load(rRT, rFP, slotOff(0))
 	g.a.load(rGlob, rFP, slotOff(1))
 	g.a.epilogue()
@@ -342,9 +336,11 @@ func (g *coreGen) genFun(f *Fun) {
 		g.f.variadic = g.f.fixed
 		g.f.fixed++
 	}
+	g.reserveDefers()
 	g.a.bind(g.fnLabels[f])
 	h := g.a.prologue()
 	g.a.store(rEnv, rFP, slotOff(0))
+	g.initDefers()
 	if f.Variadic != nil {
 		np := len(f.Params)
 		g.a.addImm(rA, rArgc, int32(-np))
@@ -356,12 +352,50 @@ func (g *coreGen) genFun(f *Fun) {
 		g.a.store(rA, rFP, slotOff(g.f.variadic))
 	}
 	if f.Lambda != nil {
-		g.expr(f.Lambda.Body, true)
+		g.expr(f.Lambda.Body, g.f.defers == 0)
 	} else {
 		g.builtinBody(f)
 	}
+	g.runDefers()
 	g.a.epilogue()
 	g.a.setFrame(h, g.frameSize())
+}
+
+// Deferred calls: a function with defer statements keeps a list of
+// functions of no arguments, run last first when it returns.
+
+func (g *coreGen) reserveDefers() {
+	if g.f.fn.Defers {
+		g.f.defers = slotOff(g.f.fixed)
+		g.f.fixed++
+	}
+}
+
+func (g *coreGen) initDefers() {
+	if g.f.defers != 0 {
+		g.callRT("rt_list", rt(), immv(0), immv(0))
+		g.a.store(rA, rFP, g.f.defers)
+	}
+}
+
+// runDefers calls the deferred functions, keeping rA.
+func (g *coreGen) runDefers() {
+	if g.f.defers == 0 {
+		return
+	}
+	saved, fn := g.tmp(), g.tmp()
+	g.a.store(rA, rFP, saved)
+	loop, done := g.a.newLabel(), g.a.newLabel()
+	g.a.bind(loop)
+	g.callRT("rt_len", rt(), slot(g.f.defers))
+	g.a.brZero(rA, done)
+	g.callRT("rt_pop", rt(), slot(g.f.defers))
+	g.a.store(rA, rFP, fn)
+	g.timCall(nil, fn, nil, false)
+	g.a.jmp(loop)
+	g.a.bind(done)
+	g.a.load(rA, rFP, saved)
+	g.free(2)
 }
 
 // Variables.
@@ -528,6 +562,12 @@ func (g *coreGen) stmt(s Statement, tail bool) {
 		g.jump(s.IsBreak, s.Label, s.Value)
 	case *ArenaStmt:
 		g.stmts(s.Body, false)
+	case *DeferStmt:
+		g.closure(g.c.Deferred[s])
+		t := g.tmp()
+		g.a.store(rA, rFP, t)
+		g.callRT("rt_push", rt(), slot(g.f.defers), slot(t))
+		g.free(1)
 	case *ExportStmt:
 	default:
 		unsupportedf("statement %T", s)
@@ -568,10 +608,11 @@ func (g *coreGen) setIndex(_ func(), index, value Expression) {
 func (g *coreGen) jump(isBreak bool, lbl int, value Expression) {
 	if isBreak && lbl == 0 {
 		if value != nil {
-			g.expr(value, !g.f.top)
+			g.expr(value, !g.f.top && g.f.defers == 0)
 		} else {
 			g.a.imm(rA, 0)
 		}
+		g.runDefers()
 		if g.f.top {
 			g.callRT("rt_exit", rt(), inA())
 			return
@@ -1226,7 +1267,7 @@ func (g *coreGen) timCall(f *Fun, fnSlot int32, args []Expression, tail bool) {
 		g.a.store(rA, rFP, code)
 	}
 	cur := g.f.fn
-	isTail := tail && !g.f.top && n <= len(cur.Params)
+	isTail := tail && !g.f.top && g.f.defers == 0 && n <= len(cur.Params)
 	for i := 0; i < n; i++ {
 		g.a.load(rB, rFP, base+int32(8*i))
 		if isTail {
