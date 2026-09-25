@@ -542,13 +542,3 @@ func TestMachOPermissions(t *testing.T) {
 		t.Errorf("File not executable: permissions = %o", info.Mode().Perm())
 	}
 }
-
-// Helper function to check if string contains substring
-func machoContains(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

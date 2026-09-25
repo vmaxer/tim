@@ -17,8 +17,8 @@ func TestCStructPrograms(t *testing.T) {
 		{
 			name: "simple_cstruct",
 			source: `cstruct Point {
-    x as float64,
-    y as float64
+    x: float64,
+    y: float64
 }
 
 println(Point.size)
@@ -30,9 +30,9 @@ println(Point.y.offset)
 		{
 			name: "packed_cstruct",
 			source: `cstruct Data packed {
-    a as uint8,
-    b as uint32,
-    c as uint8
+    a: uint8,
+    b: uint32,
+    c: uint8
 }
 
 println(Data.size)
@@ -60,8 +60,8 @@ func TestCStructFieldAccess(t *testing.T) {
 			source: `import libc as c
 
 cstruct Point {
-    x as uint32
-    y as uint32
+    x: uint32
+    y: uint32
 }
 
 p := c.malloc(8) as Point
@@ -78,8 +78,8 @@ c.free(p)
 			source: `import libc as c
 
 cstruct Vec {
-    a as float64
-    b as float64
+    a: float64
+    b: float64
 }
 
 v := c.malloc(16) as Vec
@@ -104,7 +104,7 @@ c.free(v)
 // struct to a function and re-tagging the param with `as`, returning a struct,
 // and inferred return typing (no cast needed on the call result).
 func TestCStructByValue(t *testing.T) {
-	source := `cstruct Vec { x as float64, y as float64 }
+	source := `cstruct Vec { x: float64, y: float64 }
 
 vadd = (a, b) -> {
     aa = a as Vec
@@ -158,19 +158,19 @@ c.free(buf)
 // the already-inlined argument bindings. If that regresses, this test hangs
 // instead of returning a value — a clear signal in CI.
 func TestChainedCStructMethodsCompileFast(t *testing.T) {
-	source := `cstruct V3 { x as float64, y as float64, z as float64 }
+	source := `cstruct V3 { x: float64, y: float64, z: float64 }
 
-fun V3.add(o: V3)   = V3(self.x+o.x, self.y+o.y, self.z+o.z)
-fun V3.sub(o: V3)   = V3(self.x-o.x, self.y-o.y, self.z-o.z)
-fun V3.scale(s)     = V3(self.x*s, self.y*s, self.z*s)
-fun V3.dot(o: V3)   = self.x*o.x + self.y*o.y + self.z*o.z
-fun V3.cross(o: V3) = V3(self.y*o.z-self.z*o.y, self.z*o.x-self.x*o.z, self.x*o.y-self.y*o.x)
-fun V3.norm() {
+V3.add(self, o: V3) = V3(self.x+o.x, self.y+o.y, self.z+o.z)
+V3.sub(self, o: V3) = V3(self.x-o.x, self.y-o.y, self.z-o.z)
+V3.scale(self, s) = V3(self.x*s, self.y*s, self.z*s)
+V3.dot(self, o: V3) = self.x*o.x + self.y*o.y + self.z*o.z
+V3.cross(self, o: V3) = V3(self.y*o.z-self.z*o.y, self.z*o.x-self.x*o.z, self.x*o.y-self.y*o.x)
+V3.norm(self) = {
     l = sqrt(self.x*self.x + self.y*self.y + self.z*self.z)
     if l > 0.0 { V3(self.x/l, self.y/l, self.z/l) } else { V3(0.0,0.0,0.0) }
 }
 
-fun build(t) {
+build(t) = {
     a = V3(1.0, 2.0, 3.0)
     b = V3(4.0, 5.0, 6.0)
     // A long chain of struct-returning methods, the shape that used to explode.
@@ -195,12 +195,12 @@ main = {
 // form and was reported as an undefined function (and, in heavier scenes,
 // showed up as a segfault once worked around). It must resolve to V_add now.
 func TestCStructMethodOnLocalInIfArm(t *testing.T) {
-	source := `cstruct V { x as float64, y as float64, z as float64 }
+	source := `cstruct V { x: float64, y: float64, z: float64 }
 
-fun V.add(o: V) = V(self.x + o.x, self.y + o.y, self.z + o.z)
-fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+V.add(self, o: V) = V(self.x + o.x, self.y + o.y, self.z + o.z)
+V.scale(self, s) = V(self.x*s, self.y*s, self.z*s)
 
-fun f(dy) {
+f(dy) = {
     horizon = V(0.45, 0.10, 0.38)
     base = if dy < 0.0 {
         a = horizon.scale(2.0)

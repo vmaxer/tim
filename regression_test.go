@@ -276,12 +276,12 @@ a := [1 / 3, 5, 9]
 }
 
 func TestBitwiseMinMaxBounds(t *testing.T) {
-	code := `println(1 <<b 62)
-println(1 <<b 63)
-println(0xFFFFFFFFFFFFFFFF &b 0xFF)
-println((2 ** 64 + 5) &b 7)
-println(0xcbf29ce484222325 ^b 97)
-println(~b 0)
+	code := `println(1 << 62)
+println(1 << 63)
+println(0xFFFFFFFFFFFFFFFF & 0xFF)
+println((2 ** 64 + 5) & 7)
+println(0xcbf29ce484222325 ^ 97)
+println(~ 0)
 println(min(1 / 3, 0.3))
 println(max(2 ** 70, 2 ** 70 + 1))
 println(min(-1, -1 / 2))

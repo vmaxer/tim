@@ -47,7 +47,7 @@ println(sum)
 			name: "loop_break",
 			source: `@ i in 0..<10 {
     i > 5 {
-        ret @
+        break
     }
     println(i)
 }
@@ -128,7 +128,7 @@ func TestExistingLoopPrograms(t *testing.T) {
 
 // TestInclusiveRange tests the inclusive range operator (..)
 func TestInclusiveRange(t *testing.T) {
-	source := `@ i in 1..5 {
+	source := `@ i in 1..=5 {
     println(i)
 }
 `

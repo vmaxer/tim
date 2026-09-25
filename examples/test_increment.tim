@@ -4,13 +4,13 @@ main = {
     count := 0
     printf("count = %d\n", count)
     
-    count++
+    count += 1
     printf("After count++: %d\n", count)
     
-    count++
+    count += 1
     printf("After count++: %d\n", count)
     
-    count--
+    count -= 1
     printf("After count--: %d\n", count)
     
     printf("Done!\n")

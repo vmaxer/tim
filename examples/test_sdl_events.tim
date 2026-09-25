@@ -2,8 +2,8 @@ import sdl3 as sdl
 import libc as c
 
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 width = 620
@@ -49,7 +49,7 @@ main = {
             sdl.SDL_RenderPresent(renderer)
             sdl.SDL_Delay(16)
             
-            frame_count++
+            frame_count += 1
             frame_count {
                 | frame_count % 60 == 0 => { printf("Frame: %d\n", frame_count) }
             }

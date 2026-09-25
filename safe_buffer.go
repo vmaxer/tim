@@ -65,13 +65,6 @@ func (sb *SafeBuffer) IsCommitted() bool {
 	return sb.committed
 }
 
-// MustNotBeCommitted panics if the buffer is committed (for defensive programming)
-func (sb *SafeBuffer) MustNotBeCommitted() {
-	if sb.committed {
-		panic(fmt.Sprintf("SafeBuffer(%s): Expected uncommitted buffer", sb.name))
-	}
-}
-
 // ScopedBuffer provides automatic reset-on-complete semantics for temporary buffers.
 // Usage:
 //

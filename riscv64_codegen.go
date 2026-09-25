@@ -1162,7 +1162,7 @@ func (g *rvGen) expr(e Expression) error {
 	case *BooleanExpr:
 		g.number(map[bool]float64{true: 1}[e.Value])
 	case *StringExpr:
-		g.la(rvT0, g.timString(processEscapeSequences(e.Value)))
+		g.la(rvT0, g.timString(e.Value))
 		g.fmvDX(rvFA0, rvT0)
 	case *FStringExpr:
 		return g.fstring(e)
@@ -1819,7 +1819,7 @@ func (g *rvGen) printRaw(s string) {
 
 func (g *rvGen) printValue(e Expression) error {
 	if s, ok := e.(*StringExpr); ok {
-		g.printRaw(processEscapeSequences(s.Value))
+		g.printRaw(s.Value)
 		return nil
 	}
 	if err := g.expr(e); err != nil {
@@ -1847,7 +1847,7 @@ func (g *rvGen) printf(c *CallExpr) error {
 	if !ok {
 		return fmt.Errorf("printf format must be a string literal")
 	}
-	format := processEscapeSequences(f.Value)
+	format := f.Value
 	arg := 1
 	var lit strings.Builder
 	for i := 0; i < len(format); i++ {

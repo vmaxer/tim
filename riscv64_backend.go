@@ -27,12 +27,6 @@ func (r *RISCV64Backend) writeUnsigned(i uint) {
 	r.writer.(*BufferWrapper).WriteUnsigned(i)
 }
 
-func (r *RISCV64Backend) emit(bytes []byte) {
-	for _, b := range bytes {
-		r.write(b)
-	}
-}
-
 func (r *RISCV64Backend) writeInstruction(instr uint32) {
 	// RISC-V instructions are little-endian
 	r.write(uint8(instr & 0xFF))

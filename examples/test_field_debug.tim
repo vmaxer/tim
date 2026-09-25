@@ -1,8 +1,8 @@
 import sdl3 as sdl
 
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 event := c.malloc(192) as SDL_Event

@@ -2,8 +2,8 @@ import sdl3 as sdl
 import libc as c
 
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
@@ -55,7 +55,7 @@ frame := 0
     sdl.SDL_RenderPresent(renderer)
     sdl.SDL_Delay(16)
     
-    frame++
+    frame += 1
     
     elapsed {
         | elapsed > 5000 => {

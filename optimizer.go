@@ -4,9 +4,7 @@ package main
 import (
 	"fmt"
 	"maps"
-	"math"
 	"math/big"
-	"os"
 	"slices"
 	"strings"
 )
@@ -244,16 +242,6 @@ func foldConstantExpr(expr Expression) Expression {
 		e.Body = foldConstantExpr(e.Body)
 		return e
 
-	case *ParallelExpr:
-		e.List = foldConstantExpr(e.List)
-		e.Operation = foldConstantExpr(e.Operation)
-		return e
-
-	case *PipeExpr:
-		e.Left = foldConstantExpr(e.Left)
-		e.Right = foldConstantExpr(e.Right)
-		return e
-
 	case *InExpr:
 		e.Value = foldConstantExpr(e.Value)
 		e.Container = foldConstantExpr(e.Container)
@@ -353,20 +341,6 @@ func invertComparison(expr *BinaryExpr) Expression {
 		Operator: newOp,
 		Right:    expr.Right,
 	}
-}
-
-// isPowerOfTwo checks if a float64 value is a power of 2
-func isPowerOfTwo(x float64) bool {
-	if x <= 0 {
-		return false
-	}
-	// Check if x is an integer
-	if x != math.Floor(x) {
-		return false
-	}
-	// Check if it's a power of 2: x & (x-1) == 0
-	ix := int64(x)
-	return (ix & (ix - 1)) == 0
 }
 
 // strengthReduceExpr performs strength reduction and peephole optimization on expressions.
@@ -803,23 +777,6 @@ func strengthReduceExpr(expr Expression) Expression {
 		}
 		return e
 
-	case *LoopExpr:
-		e.Iterable = strengthReduceExpr(e.Iterable)
-		for i, stmt := range e.Body {
-			e.Body[i] = strengthReduceStmt(stmt)
-		}
-		return e
-
-	case *PipeExpr:
-		e.Left = strengthReduceExpr(e.Left)
-		e.Right = strengthReduceExpr(e.Right)
-		return e
-
-	case *ParallelExpr:
-		e.List = strengthReduceExpr(e.List)
-		e.Operation = strengthReduceExpr(e.Operation)
-		return e
-
 	case *InExpr:
 		e.Value = strengthReduceExpr(e.Value)
 		e.Container = strengthReduceExpr(e.Container)
@@ -979,16 +936,6 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 		// (More sophisticated analysis could handle this)
 		return e
 
-	case *ParallelExpr:
-		e.List = propagateConstantsExpr(e.List, constMap)
-		e.Operation = propagateConstantsExpr(e.Operation, constMap)
-		return e
-
-	case *PipeExpr:
-		e.Left = propagateConstantsExpr(e.Left, constMap)
-		e.Right = propagateConstantsExpr(e.Right, constMap)
-		return e
-
 	case *InExpr:
 		e.Value = propagateConstantsExpr(e.Value, constMap)
 		e.Container = propagateConstantsExpr(e.Container, constMap)
@@ -1020,11 +967,6 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 		}
 		return e
 
-	case *MoveExpr:
-		// Don't propagate constants into move expressions
-		// The variable must exist at runtime for move semantics to work
-		return e
-
 	case *FMAExpr:
 		e.A = propagateConstantsExpr(e.A, constMap)
 		e.B = propagateConstantsExpr(e.B, constMap)
@@ -1033,197 +975,6 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 
 	default:
 		return expr
-	}
-}
-
-// collectUsedVariables walks the AST and tracks which variables are referenced
-func collectUsedVariables(stmt Statement, usedVars map[string]bool) {
-	switch s := stmt.(type) {
-	case *AssignStmt:
-		collectUsedVariablesExpr(s.Value, usedVars)
-	case *ExpressionStmt:
-		collectUsedVariablesExpr(s.Expr, usedVars)
-	case *LoopStmt:
-		collectUsedVariablesExpr(s.Iterable, usedVars)
-		// Mark iterator as used (even if not explicitly referenced)
-		usedVars[s.Iterator] = true
-		for _, bodyStmt := range s.Body {
-			collectUsedVariables(bodyStmt, usedVars)
-		}
-	}
-}
-
-// collectUsedVariablesExpr tracks variable references in expressions
-func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
-	switch e := expr.(type) {
-	case *IdentExpr:
-		usedVars[e.Name] = true
-	case *BinaryExpr:
-		collectUsedVariablesExpr(e.Left, usedVars)
-		collectUsedVariablesExpr(e.Right, usedVars)
-	case *CallExpr:
-		// Mark the function being called as used
-		usedVars[e.Function] = true
-		for _, arg := range e.Args {
-			collectUsedVariablesExpr(arg, usedVars)
-		}
-	case *RangeExpr:
-		collectUsedVariablesExpr(e.Start, usedVars)
-		collectUsedVariablesExpr(e.End, usedVars)
-	case *ListExpr:
-		for _, elem := range e.Elements {
-			collectUsedVariablesExpr(elem, usedVars)
-		}
-	case *MapExpr:
-		for i := range e.Keys {
-			collectUsedVariablesExpr(e.Keys[i], usedVars)
-			collectUsedVariablesExpr(e.Values[i], usedVars)
-		}
-	case *IndexExpr:
-		collectUsedVariablesExpr(e.List, usedVars)
-		collectUsedVariablesExpr(e.Index, usedVars)
-	case *LambdaExpr:
-		collectUsedVariablesExpr(e.Body, usedVars)
-	case *ParallelExpr:
-		collectUsedVariablesExpr(e.List, usedVars)
-		collectUsedVariablesExpr(e.Operation, usedVars)
-	case *PipeExpr:
-		collectUsedVariablesExpr(e.Left, usedVars)
-		collectUsedVariablesExpr(e.Right, usedVars)
-	case *InExpr:
-		collectUsedVariablesExpr(e.Value, usedVars)
-		collectUsedVariablesExpr(e.Container, usedVars)
-	case *LengthExpr:
-		collectUsedVariablesExpr(e.Operand, usedVars)
-	case *MatchExpr:
-		collectUsedVariablesExpr(e.Condition, usedVars)
-		for _, clause := range e.Clauses {
-			if clause.Guard != nil {
-				collectUsedVariablesExpr(clause.Guard, usedVars)
-			}
-			collectUsedVariablesExpr(clause.Result, usedVars)
-		}
-		if e.DefaultExpr != nil {
-			collectUsedVariablesExpr(e.DefaultExpr, usedVars)
-		}
-	case *BlockExpr:
-		for _, stmt := range e.Statements {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *CastExpr:
-		collectUsedVariablesExpr(e.Expr, usedVars)
-	case *SliceExpr:
-		collectUsedVariablesExpr(e.List, usedVars)
-		if e.Start != nil {
-			collectUsedVariablesExpr(e.Start, usedVars)
-		}
-		if e.End != nil {
-			collectUsedVariablesExpr(e.End, usedVars)
-		}
-	case *UnaryExpr:
-		collectUsedVariablesExpr(e.Operand, usedVars)
-	case *NamespacedIdentExpr:
-		// Namespace access like sdl.SDL_Init or data.field
-		// For data.field, "data" is a variable that should be marked as used
-		// For sdl.SDL_Init, "sdl" is an imported namespace, not a variable
-		// We mark it as used - the compiler will handle whether it's a variable or namespace
-		usedVars[e.Namespace] = true
-	case *FStringExpr:
-		// FStringExpr.Parts is []Expression, each part is either StringExpr or an expression
-		if VerboseMode {
-			debugf("DEBUG: FStringExpr with %d parts\n", len(e.Parts))
-			for i, part := range e.Parts {
-				fmt.Fprintf(os.Stderr, "  Part %d: %T\n", i, part)
-			}
-		}
-		for _, part := range e.Parts {
-			collectUsedVariablesExpr(part, usedVars)
-		}
-	case *DirectCallExpr:
-		collectUsedVariablesExpr(e.Callee, usedVars)
-		for _, arg := range e.Args {
-			collectUsedVariablesExpr(arg, usedVars)
-		}
-	case *PostfixExpr:
-		collectUsedVariablesExpr(e.Operand, usedVars)
-	case *VectorExpr:
-		for _, comp := range e.Components {
-			collectUsedVariablesExpr(comp, usedVars)
-		}
-	case *ArenaExpr:
-		// ArenaExpr has Body []Statement
-		for _, stmt := range e.Body {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *MultiLambdaExpr:
-		// For multi-lambda, collect variables from all lambda bodies
-		for _, lambda := range e.Lambdas {
-			collectUsedVariablesExpr(lambda.Body, usedVars)
-		}
-	case *SendExpr:
-		// SendExpr has Target and Message
-		collectUsedVariablesExpr(e.Target, usedVars)
-		collectUsedVariablesExpr(e.Message, usedVars)
-	case *ReceiveExpr:
-		// ReceiveExpr has Source
-		collectUsedVariablesExpr(e.Source, usedVars)
-	case *UnsafeExpr:
-		// UnsafeExpr has architecture-specific blocks
-		for _, stmt := range e.X86_64Block {
-			collectUsedVariables(stmt, usedVars)
-		}
-		for _, stmt := range e.ARM64Block {
-			collectUsedVariables(stmt, usedVars)
-		}
-		for _, stmt := range e.RISCV64Block {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *LoopExpr:
-		for _, stmt := range e.Body {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *LoopStateExpr:
-		// LoopStateExpr doesn't reference variables
-	case *JumpExpr:
-		// JumpExpr doesn't reference variables directly
-	case *FMAExpr:
-		collectUsedVariablesExpr(e.A, usedVars)
-		collectUsedVariablesExpr(e.B, usedVars)
-		collectUsedVariablesExpr(e.C, usedVars)
-	}
-}
-
-// eliminateDeadCode removes assignments to unused variables
-// Returns nil if statement should be removed entirely
-func eliminateDeadCode(stmt Statement, usedVars map[string]bool) Statement {
-	switch s := stmt.(type) {
-	case *AssignStmt:
-		// Keep assignments if:
-		// 1. Variable is used somewhere
-		// 2. Assignment has side effects (contains function call)
-		if usedVars[s.Name] || hasSideEffects(s.Value) {
-			return s
-		}
-		// Dead assignment - remove it
-		return nil
-
-	case *ExpressionStmt:
-		// Always keep expression statements (they might have side effects like printf)
-		return s
-
-	case *LoopStmt:
-		// Keep loop but eliminate dead code in body
-		newBody := make([]Statement, 0, len(s.Body))
-		for _, bodyStmt := range s.Body {
-			if keep := eliminateDeadCode(bodyStmt, usedVars); keep != nil {
-				newBody = append(newBody, keep)
-			}
-		}
-		s.Body = newBody
-		return s
-
-	default:
-		return stmt
 	}
 }
 
@@ -1245,10 +996,6 @@ func hasSideEffects(expr Expression) bool {
 		return false
 	case *IndexExpr:
 		return hasSideEffects(e.List) || hasSideEffects(e.Index)
-	case *ParallelExpr:
-		return true // Parallel operations have side effects
-	case *PipeExpr:
-		return hasSideEffects(e.Left) || hasSideEffects(e.Right)
 	case *MatchExpr:
 		if hasSideEffects(e.Condition) {
 			return true
@@ -1323,12 +1070,6 @@ func analyzePurityExpr(expr Expression, pureFunctions map[string]bool) {
 	case *IndexExpr:
 		analyzePurityExpr(e.List, pureFunctions)
 		analyzePurityExpr(e.Index, pureFunctions)
-	case *ParallelExpr:
-		analyzePurityExpr(e.List, pureFunctions)
-		analyzePurityExpr(e.Operation, pureFunctions)
-	case *PipeExpr:
-		analyzePurityExpr(e.Left, pureFunctions)
-		analyzePurityExpr(e.Right, pureFunctions)
 	case *MatchExpr:
 		analyzePurityExpr(e.Condition, pureFunctions)
 		for _, clause := range e.Clauses {
@@ -1561,9 +1302,6 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
 			case *ArenaStmt:
 				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
-			case *WithStmt:
-				collectCapturedVarsExpr(s.Subject, localParamSet, captured)
-				collectCapturedVarsExpr(&BlockExpr{Statements: s.Body}, localParamSet, captured)
 			}
 		}
 	}
@@ -1692,12 +1430,6 @@ func analyzeClosuresExpr(expr Expression, availableVars map[string]bool, globalV
 		}
 	case *UnaryExpr:
 		analyzeClosuresExpr(e.Operand, availableVars, globalVars)
-	case *ParallelExpr:
-		analyzeClosuresExpr(e.List, availableVars, globalVars)
-		analyzeClosuresExpr(e.Operation, availableVars, globalVars)
-	case *PipeExpr:
-		analyzeClosuresExpr(e.Left, availableVars, globalVars)
-		analyzeClosuresExpr(e.Right, availableVars, globalVars)
 	case *FMAExpr:
 		analyzeClosuresExpr(e.A, availableVars, globalVars)
 		analyzeClosuresExpr(e.B, availableVars, globalVars)
@@ -1763,8 +1495,6 @@ func isComplexExpression(expr Expression) bool {
 			return true
 		}
 		return false
-	case *ParallelExpr:
-		return true // Don't inline parallel operations
 	case *CallExpr:
 		// Allow simple function calls, but not nested complex calls
 		return slices.ContainsFunc(e.Args, isComplexExpression)
@@ -1819,12 +1549,6 @@ func countCallsExpr(expr Expression, counts map[string]int) {
 	case *IndexExpr:
 		countCallsExpr(e.List, counts)
 		countCallsExpr(e.Index, counts)
-	case *ParallelExpr:
-		countCallsExpr(e.List, counts)
-		countCallsExpr(e.Operation, counts)
-	case *PipeExpr:
-		countCallsExpr(e.Left, counts)
-		countCallsExpr(e.Right, counts)
 	case *MatchExpr:
 		countCallsExpr(e.Condition, counts)
 		for _, clause := range e.Clauses {
@@ -1936,14 +1660,6 @@ func inlineFunctionsExpr(expr Expression, candidates map[string]*LambdaExpr, cal
 	case *IndexExpr:
 		e.List = inlineFunctionsExpr(e.List, candidates, callCounts)
 		e.Index = inlineFunctionsExpr(e.Index, candidates, callCounts)
-		return e
-	case *ParallelExpr:
-		e.List = inlineFunctionsExpr(e.List, candidates, callCounts)
-		e.Operation = inlineFunctionsExpr(e.Operation, candidates, callCounts)
-		return e
-	case *PipeExpr:
-		e.Left = inlineFunctionsExpr(e.Left, candidates, callCounts)
-		e.Right = inlineFunctionsExpr(e.Right, candidates, callCounts)
 		return e
 	case *MatchExpr:
 		e.Condition = inlineFunctionsExpr(e.Condition, candidates, callCounts)
@@ -2432,69 +2148,6 @@ func substituteParamsStmt(stmt Statement, substMap map[string]Expression) Statem
 }
 
 // Helper functions for integer strength reduction
-
-// isInUnsafeContext checks if an expression is within an unsafe block
-// This is a simple heuristic - we consider expressions to be in unsafe context
-// if they contain explicit integer type casts or are within UnsafeExpr
-func isInUnsafeContext(expr Expression) bool {
-	switch e := expr.(type) {
-	case *UnsafeExpr:
-		return true
-	case *CastExpr:
-		// Check if casting to an integer type
-		intTypes := []string{"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}
-		return slices.Contains(intTypes, e.Type)
-	case *BinaryExpr:
-		// If either operand is in unsafe context, the whole expression is
-		return isInUnsafeContext(e.Left) || isInUnsafeContext(e.Right)
-	case *UnaryExpr:
-		return isInUnsafeContext(e.Operand)
-	default:
-		return false
-	}
-}
-
-// hasIntegerTypeAnnotation checks if an expression has an explicit integer type annotation
-func hasIntegerTypeAnnotation(expr Expression) bool {
-	switch e := expr.(type) {
-	case *CastExpr:
-		intTypes := []string{"int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64"}
-		if slices.Contains(intTypes, e.Type) {
-			return true
-		}
-		// Check the inner expression too
-		return hasIntegerTypeAnnotation(e.Expr)
-	case *BinaryExpr:
-		// Check both operands
-		return hasIntegerTypeAnnotation(e.Left) || hasIntegerTypeAnnotation(e.Right)
-	case *UnaryExpr:
-		return hasIntegerTypeAnnotation(e.Operand)
-	case *IdentExpr:
-		// For identifiers, we can't tell from the expression alone
-		// This would require type tracking, so we return false
-		return false
-	default:
-		return false
-	}
-}
-
-// shouldApplyIntegerOptimization determines if integer-only optimizations should be applied
-// These optimizations (shift instead of multiply, mask instead of modulo) are only valid
-// for integer operations, not float64. We apply them only in unsafe blocks or with explicit
-// integer type casts.
-func shouldApplyIntegerOptimization(left, right Expression) bool {
-	// Check if we're in an unsafe context (unsafe blocks, explicit int casts)
-	if isInUnsafeContext(left) || isInUnsafeContext(right) {
-		return true
-	}
-
-	// Check for explicit integer type annotations
-	if hasIntegerTypeAnnotation(left) || hasIntegerTypeAnnotation(right) {
-		return true
-	}
-
-	return false
-}
 
 // ---------------------------------------------------------------------------
 // SROA: scalar replacement of non-escaping local aggregates.
@@ -3181,10 +2834,6 @@ func opCollectLocalTypesStmt(stmt Statement, env, retType map[string]string) {
 		for _, b := range s.Body {
 			opCollectLocalTypesStmt(b, env, retType)
 		}
-	case *WithStmt:
-		for _, b := range s.Body {
-			opCollectLocalTypesStmt(b, env, retType)
-		}
 	case *IfStmt:
 		for _, br := range s.Branches {
 			for _, b := range br.Body {
@@ -3221,11 +2870,6 @@ func opDesugarStmt(stmt Statement, env, retType map[string]string, defined map[s
 		s.Index = opDesugarExpr(s.Index, env, retType, defined)
 		s.Value = opDesugarExpr(s.Value, env, retType, defined)
 	case *ArenaStmt:
-		for _, b := range s.Body {
-			opDesugarStmt(b, env, retType, defined)
-		}
-	case *WithStmt:
-		s.Subject = opDesugarExpr(s.Subject, env, retType, defined)
 		for _, b := range s.Body {
 			opDesugarStmt(b, env, retType, defined)
 		}

@@ -166,33 +166,3 @@ func (is *IncrementalState) IncrementalRecompile(changedPath string) ([]string, 
 
 	return updatedFuncs, nil
 }
-
-// GetChangedFiles returns files that have been modified since last compilation
-func (is *IncrementalState) GetChangedFiles() ([]string, error) {
-	var changed []string
-
-	for path, lastModTime := range is.fileModTimes {
-		fileInfo, err := os.Stat(path)
-		if err != nil {
-			continue // File might have been deleted
-		}
-
-		if fileInfo.ModTime().After(lastModTime) {
-			changed = append(changed, path)
-		}
-	}
-
-	return changed, nil
-}
-
-// GetWatchFiles returns all files that should be watched for changes
-func (is *IncrementalState) GetWatchFiles() []string {
-	var files []string
-	for path := range is.sourceFiles {
-		absPath, err := filepath.Abs(path)
-		if err == nil {
-			files = append(files, absPath)
-		}
-	}
-	return files
-}

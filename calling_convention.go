@@ -143,11 +143,6 @@ func (fc *TimCompiler) argReg(n int) string {
 	return fc.cc().GetIntegerArgReg(n)
 }
 
-// floatArgReg returns the float argument register for argument index n (0-based).
-func (fc *TimCompiler) floatArgReg(n int) string {
-	return fc.cc().GetFloatArgReg(n)
-}
-
 // shadowSize returns the shadow space required by the calling convention (32 on Windows, 0 on Linux).
 func (fc *TimCompiler) shadowSize() int {
 	return fc.cc().GetShadowSpaceSize()
@@ -178,87 +173,4 @@ type CallSiteManager struct {
 	savedRegs    []string       // Registers we need to save
 	savedOffsets map[string]int // Stack offsets for saved registers
 	stackSpace   int            // Total stack space allocated
-}
-
-// NewCallSiteManager creates a manager for a function call site
-func NewCallSiteManager(cc CallingConvention) *CallSiteManager {
-	return &CallSiteManager{
-		cc:           cc,
-		savedRegs:    []string{},
-		savedOffsets: make(map[string]int),
-		stackSpace:   0,
-	}
-}
-
-// PrepareCall saves caller-saved registers that are currently in use
-// Returns the total stack space allocated (including shadow space)
-func (csm *CallSiteManager) PrepareCall(fc *TimCompiler, liveRegs []string) int {
-	// Determine which caller-saved registers need saving
-	callerSaved := csm.cc.GetCallerSavedRegs()
-	callerSavedMap := make(map[string]bool)
-	for _, reg := range callerSaved {
-		callerSavedMap[reg] = true
-	}
-
-	// Find live registers that are caller-saved
-	for _, reg := range liveRegs {
-		if callerSavedMap[reg] {
-			csm.savedRegs = append(csm.savedRegs, reg)
-		}
-	}
-
-	// Calculate stack space needed: saved registers + shadow space
-	shadowSpace := csm.cc.GetShadowSpaceSize()
-	registerSpace := len(csm.savedRegs) * 8
-	totalSpace := shadowSpace + registerSpace
-
-	// Align to stack alignment
-	alignment := csm.cc.GetStackAlignment()
-	if totalSpace%alignment != 0 {
-		totalSpace = ((totalSpace / alignment) + 1) * alignment
-	}
-
-	csm.stackSpace = totalSpace
-
-	// Allocate stack space
-	if totalSpace > 0 {
-		fc.out.SubImmFromReg("rsp", int64(totalSpace))
-	}
-
-	// Save registers
-	offset := shadowSpace
-	for _, reg := range csm.savedRegs {
-		csm.savedOffsets[reg] = offset
-		if isXmmReg(reg) {
-			fc.out.MovXmmToMem(reg, "rsp", offset)
-		} else {
-			fc.out.MovRegToMem(reg, "rsp", offset)
-		}
-		offset += 8
-	}
-
-	return totalSpace
-}
-
-// RestoreAfterCall restores saved registers and deallocates stack space
-func (csm *CallSiteManager) RestoreAfterCall(fc *TimCompiler) {
-	// Restore registers
-	for _, reg := range csm.savedRegs {
-		offset := csm.savedOffsets[reg]
-		if isXmmReg(reg) {
-			fc.out.MovMemToXmm(reg, "rsp", offset)
-		} else {
-			fc.out.MovMemToReg(reg, "rsp", offset)
-		}
-	}
-
-	// Deallocate stack space
-	if csm.stackSpace > 0 {
-		fc.out.AddImmToReg("rsp", int64(csm.stackSpace))
-	}
-}
-
-// Helper function to check if a register is an XMM register
-func isXmmReg(reg string) bool {
-	return len(reg) >= 3 && reg[0:3] == "xmm"
 }

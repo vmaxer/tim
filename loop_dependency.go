@@ -4,7 +4,6 @@ package main
 import (
 	"fmt"
 	"os"
-	"strings"
 )
 
 // DependencyType represents the type of dependency between loop iterations
@@ -200,22 +199,6 @@ func (lda *LoopDependencyAnalyzer) dedup(deps []Dependency) []Dependency {
 	return result
 }
 
-// HasCrossIterationDependency checks if dependencies prevent vectorization
-func (lda *LoopDependencyAnalyzer) HasCrossIterationDependency(loop *LoopStmt) bool {
-	deps := lda.AnalyzeDependencies(loop)
-
-	// Flow dependencies (RAW) prevent vectorization
-	for _, dep := range deps {
-		if dep.Type == FlowDependency {
-			// Check if it's a cross-iteration dependency
-			// For now, assume any flow dependency is problematic
-			return true
-		}
-	}
-
-	return false
-}
-
 // CanVectorize determines if loop can be safely vectorized
 func (lda *LoopDependencyAnalyzer) CanVectorize(loop *LoopStmt) (bool, string) {
 	deps := lda.AnalyzeDependencies(loop)
@@ -262,28 +245,4 @@ func (lda *LoopDependencyAnalyzer) CanVectorize(loop *LoopStmt) (bool, string) {
 	}
 
 	return true, "Dependencies are vectorization-safe"
-}
-
-// GetDependencyReport generates a human-readable dependency report
-func (lda *LoopDependencyAnalyzer) GetDependencyReport(loop *LoopStmt) string {
-	deps := lda.AnalyzeDependencies(loop)
-
-	if len(deps) == 0 {
-		return "No dependencies detected - loop is fully parallel"
-	}
-
-	var report strings.Builder
-	report.WriteString("Dependencies detected:\n")
-	for _, dep := range deps {
-		report.WriteString("  - " + dep.Type.String() + " on variable '" + dep.Variable + "'\n")
-	}
-
-	canVec, reason := lda.CanVectorize(loop)
-	if canVec {
-		report.WriteString("Verdict: Can vectorize (" + reason + ")")
-	} else {
-		report.WriteString("Verdict: Cannot vectorize (" + reason + ")")
-	}
-
-	return report.String()
 }

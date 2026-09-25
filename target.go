@@ -1,8 +1,6 @@
 // Completion: 100% - Utility module complete
 package main
 
-import "runtime"
-
 // Target represents a compilation target (architecture + OS)
 // This interface abstracts target-specific behavior, using GCC terminology
 //
@@ -80,35 +78,6 @@ func (t *TargetImpl) IsELF() bool {
 // IsPE returns true if this target uses PE format
 func (t *TargetImpl) IsPE() bool {
 	return t.os == OSWindows
-}
-
-// GetDefaultTarget returns the target for the current runtime
-func GetDefaultTarget() Target {
-	var arch Arch
-	switch runtime.GOARCH {
-	case "amd64":
-		arch = ArchX86_64
-	case "arm64":
-		arch = ArchARM64
-	case "riscv64":
-		arch = ArchRiscv64
-	default:
-		arch = ArchX86_64 // fallback
-	}
-
-	var os OS
-	switch runtime.GOOS {
-	case "linux":
-		os = OSLinux
-	case "darwin":
-		os = OSDarwin
-	case "freebsd":
-		os = OSFreeBSD
-	default:
-		os = OSLinux // fallback
-	}
-
-	return NewTarget(arch, os)
 }
 
 // GetELFMachineType returns the ELF machine type constant for a given architecture

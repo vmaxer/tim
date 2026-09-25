@@ -103,8 +103,8 @@ printf("strlen(NULL) = %v\n", result1)
 func TestCStructWithCFFI(t *testing.T) {
 	code := `
 cstruct Point {
-    x as float64,
-    y as float64
+    x: float64,
+    y: float64
 }
 
 // Test basic cstruct properties
@@ -113,7 +113,7 @@ printf("Point.x offset: %v\n", Point.x.offset)
 printf("Point.y offset: %v\n", Point.y.offset)
 
 // Allocate memory for a Point struct using C malloc
-ptr := c.malloc(Point.size)!
+ptr := c.malloc(Point.size)
 printf("Allocated %v bytes at address\n", Point.size)
 
 // Free the memory
@@ -144,14 +144,14 @@ println("Memory freed successfully")
 func TestCStructComplexFFI(t *testing.T) {
 	code := `
 cstruct Vec2 {
-    x as float64,
-    y as float64
+    x: float64,
+    y: float64
 }
 
 cstruct Vec3 {
-    x as float64,
-    y as float64,
-    z as float64
+    x: float64,
+    y: float64,
+    z: float64
 }
 
 // Test Vec2 (16 bytes)

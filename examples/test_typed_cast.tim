@@ -1,8 +1,8 @@
 // Test type casting with cstruct
 
 cstruct TestStruct {
-    x as uint32,
-    y as uint32
+    x: uint32,
+    y: uint32
 }
 
 // Test arena allocation with type cast

@@ -637,9 +637,6 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	// exit code is already in rdi (first syscall argument)
 	fc.eb.Emit("syscall") // invoke syscall directly
 
-	// Generate pattern lambda functions
-	fc.generatePatternLambdaFunctions()
-
 	// Generate runtime helper functions AFTER lambda generation
 	fc.generateRuntimeHelpers()
 

@@ -1,11 +1,6 @@
 // compiler_state.go - Central state management for compilation
 package main
 
-import (
-	"fmt"
-	"os"
-)
-
 // CompilerState manages the overall compilation state and coordinates between components
 type CompilerState struct {
 	// Configuration
@@ -84,38 +79,4 @@ func (cs *CompilerState) GetEstimatedRodataAddr() uint64 {
 		return cs.peWriter.GetEstimatedRodataAddr()
 	}
 	return cs.GetBaseAddr() + 0x3100 // Fallback
-}
-
-// TransitionPhase transitions to a new compilation phase with validation
-func (cs *CompilerState) TransitionPhase(newPhase CompilationPhase) error {
-	// Simple phase transition for now - full validation can come later
-	cs.phase = newPhase
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "=== Phase Transition: %v ===\n", newPhase)
-	}
-
-	return nil
-}
-
-// CurrentPhase returns the current compilation phase
-func (cs *CompilerState) CurrentPhase() CompilationPhase {
-	return cs.phase
-}
-
-// Validate performs comprehensive validation of compiler state
-func (cs *CompilerState) Validate() error {
-	// Simplified validation - can be expanded later
-	return nil
-}
-
-// GetSummary returns a summary of the current compiler state
-func (cs *CompilerState) GetSummary() string {
-	return fmt.Sprintf(
-		"CompilerState:\n"+
-			"  Phase: %v\n"+
-			"  BaseAddr: 0x%x\n",
-		cs.phase,
-		cs.GetBaseAddr(),
-	)
 }

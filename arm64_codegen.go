@@ -142,12 +142,6 @@ func ifStmtToMatchExpr(s *IfStmt) *MatchExpr {
 	return &MatchExpr{Condition: &NumberExpr{Value: 1.0}, Clauses: clauses, DefaultExpr: def}
 }
 
-// ifStmtCStructType returns the cstruct type a trailing `if`/`elif`/`else`
-// statement evaluates to. Delegates to the shared oracle.
-func (acg *ARM64CodeGen) ifStmtCStructType(s *IfStmt) string {
-	return acg.ctypes.ifStmtType(s)
-}
-
 // listElemCStructTypeOf infers the cstruct type of the ELEMENTS of a list-valued
 // expression, or "". Delegates to the shared oracle.
 func (acg *ARM64CodeGen) listElemCStructTypeOf(expr Expression) string {
@@ -166,16 +160,10 @@ func (acg *ARM64CodeGen) lambdaReturnCStructType(body Expression) string {
 	return acg.ctypes.LambdaReturnType(body)
 }
 
-// registerBlockLocalCStructTypes records the cstruct type of each struct-valued
-// local in a block into the shared type map. Delegates to the shared oracle.
-func (acg *ARM64CodeGen) registerBlockLocalCStructTypes(stmts []Statement) []string {
-	return acg.ctypes.RegisterBlockLocals(stmts)
-}
-
 // isLambdaValue reports whether expr is a lambda literal in any of its forms.
 func isLambdaValue(expr Expression) bool {
 	switch expr.(type) {
-	case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+	case *LambdaExpr:
 		return true
 	}
 	return false
@@ -215,8 +203,6 @@ func (acg *ARM64CodeGen) markIfClosure(name string, value Expression) {
 		if et := acg.lambdaReturnsListElemType(v.Body); et != "" {
 			acg.funcReturnsListElem[name] = et
 		}
-	case *PatternLambdaExpr, *MultiLambdaExpr:
-		acg.lambdaVars[name] = true
 	case *CallExpr:
 		if acg.returnsClosure[v.Function] {
 			acg.lambdaVars[name] = true
@@ -781,10 +767,6 @@ func (acg *ARM64CodeGen) CompileProgram(program *Program) error {
 func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 	switch s := stmt.(type) {
 	case *ExpressionStmt:
-		// Handle PostfixExpr as a statement (x++, x--)
-		if postfix, ok := s.Expr.(*PostfixExpr); ok {
-			return acg.compilePostfixStmt(postfix)
-		}
 		return acg.compileExpression(s.Expr)
 	case *AssignStmt:
 		return acg.compileAssignment(s)
@@ -804,15 +786,6 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 		return nil
 	case *ArenaStmt:
 		return acg.compileArenaStmt(s)
-	case *WithStmt:
-		// A with-block is transparent at runtime: the subject was already
-		// injected into each body call at parse time, so just run the body.
-		for _, bodyStmt := range s.Body {
-			if err := acg.compileStatement(bodyStmt); err != nil {
-				return err
-			}
-		}
-		return nil
 	case *DeferStmt:
 		// Defer statement: collect for execution at scope exit
 		if len(acg.deferredExprs) == 0 {
@@ -821,10 +794,6 @@ func (acg *ARM64CodeGen) compileStatement(stmt Statement) error {
 		currentScope := len(acg.deferredExprs) - 1
 		acg.deferredExprs[currentScope] = append(acg.deferredExprs[currentScope], s.Call)
 		return nil
-	case *SpawnStmt:
-		// Process spawning with fork()
-		// Full implementation needs process management
-		return fmt.Errorf("spawn statements not yet implemented in ARM64 (requires fork/exec support)")
 	case *RegisterAssignStmt:
 		// Register assignment in unsafe blocks
 		return acg.compileRegisterAssignment(s)
@@ -2905,9 +2874,6 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		acg.patchJumpOffset(foundJumpPos, int32(foundPos-foundJumpPos))
 		acg.patchJumpOffset(endJumpPos, int32(endPos-endJumpPos))
 
-	case *ParallelExpr:
-		return acg.compileParallelExpr(e)
-
 	case *NamespacedIdentExpr:
 		// Handle namespaced identifiers like sdl.SDL_INIT_VIDEO or data.field
 		// Check if this is a C constant
@@ -2935,12 +2901,6 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			}
 			return acg.compileExpression(indexExpr)
 		}
-
-	case *MoveExpr:
-		// Compile the expression being moved (loads into d0)
-		// The move operator (!) just compiles the inner expression
-		// Tracking of moved variables would be done at a higher level
-		return acg.compileExpression(e.Expr)
 
 	case *FStringExpr:
 		// F-string: concatenate all parts
@@ -3087,25 +3047,6 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 		}
 		return nil
 
-	case *PipeExpr:
-		// Pipe operator: left | right
-		// For now, implement basic scalar pipe (full list mapping would need ParallelExpr)
-		leftType := acg.getExprType(e.Left)
-
-		if leftType == "list" {
-			// List mapping: would need ParallelExpr support
-			return fmt.Errorf("pipe operator on lists not yet supported in ARM64 (requires ParallelExpr)")
-		}
-
-		// Scalar pipe: evaluate left, then apply right
-		if err := acg.compileExpression(e.Left); err != nil {
-			return err
-		}
-
-		// For now, just evaluate right (which should use the value in d0)
-		// Full implementation would handle lambda calls
-		return acg.compileExpression(e.Right)
-
 	case *UnsafeExpr:
 		// Inline assembly: execute ARM64-specific block
 		if len(e.ARM64Block) > 0 {
@@ -3125,11 +3066,6 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			// No ARM64 block - this is expected for x86_64-only unsafe code
 			return fmt.Errorf("unsafe block has no ARM64 implementation")
 		}
-
-	case *PatternLambdaExpr:
-		// Pattern matching lambda with multiple clauses
-		// Full implementation would need pattern matching codegen
-		return fmt.Errorf("pattern lambdas not yet implemented in ARM64 (requires pattern matching)")
 
 	case *FieldAccessExpr:
 		// SROA fast path: `Struct(e0, e1, ...).field` folds straight to the
@@ -3462,187 +3398,6 @@ func (acg *ARM64CodeGen) patchJumpOffset(pos int, offset int32) {
 }
 
 // compileParallelExpr compiles a parallel map operation (||)
-func (acg *ARM64CodeGen) compileParallelExpr(expr *ParallelExpr) error {
-	// For now, only support: list || lambda
-	lambda, ok := expr.Operation.(*LambdaExpr)
-	if !ok {
-		return fmt.Errorf("parallel operator (||) currently only supports lambda expressions")
-	}
-
-	if len(lambda.Params) != 1 {
-		return fmt.Errorf("parallel operator lambda must have exactly one parameter")
-	}
-
-	const (
-		parallelResultAlloc    = 2080
-		lambdaScratchOffset    = parallelResultAlloc - 8
-		savedLambdaSpillOffset = parallelResultAlloc + 8
-	)
-
-	// Compile the lambda to get its function pointer (result in d0)
-	if err := acg.compileExpression(expr.Operation); err != nil {
-		return err
-	}
-
-	// Save lambda function pointer (currently in d0) to stack
-	// str d0, [sp, #-16]! (pre-indexed: decrement sp by 16, then store)
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0xef, 0x1f, 0xfd})
-	// Convert d0 to integer pointer: fmov x11, d0
-	acg.out.out.writer.WriteBytes([]byte{0x0b, 0x00, 0x67, 0x9e})
-	// Save integer pointer: str x11, [sp, #8]
-	acg.out.out.writer.WriteBytes([]byte{0xeb, 0x07, 0x00, 0xf9})
-
-	// Compile the input list expression (returns pointer as float64 in d0)
-	if err := acg.compileExpression(expr.List); err != nil {
-		return err
-	}
-
-	// Save list pointer and load as integer pointer
-	// str d0, [sp, #-8]! (pre-indexed: decrement sp by 8, then store)
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0xff, 0x1f, 0xfd})
-	// Load as integer: ldr x13, [sp]
-	acg.out.out.writer.WriteBytes([]byte{0xed, 0x03, 0x40, 0xf9})
-
-	// Load list length from [x13] into x14
-	// ldr d0, [x13]
-	acg.out.out.writer.WriteBytes([]byte{0xa0, 0x01, 0x40, 0xfd})
-	// fcvtzs x14, d0 - convert float64 to int64
-	acg.out.out.writer.WriteBytes([]byte{0x0e, 0x00, 0x78, 0x9e})
-
-	// Allocate result list on stack
-	// sub sp, sp, #parallelResultAlloc
-	if err := acg.out.SubImm64("sp", "sp", parallelResultAlloc); err != nil {
-		return err
-	}
-
-	// Store result list pointer in x12
-	// mov x12, sp
-	acg.out.out.writer.WriteBytes([]byte{0xec, 0x03, 0x00, 0x91})
-
-	// Move the saved lambda pointer into the reserved scratch slot
-	// ldr x10, [x12, #savedLambdaSpillOffset]
-	spillOffsetImm := (savedLambdaSpillOffset / 8) << 10
-	strInstr := uint32(0xf9400000) | uint32(10) | uint32(12<<5) | uint32(spillOffsetImm)
-	acg.out.out.writer.WriteBytes([]byte{
-		byte(strInstr),
-		byte(strInstr >> 8),
-		byte(strInstr >> 16),
-		byte(strInstr >> 24),
-	})
-	// str x10, [x12, #lambdaScratchOffset]
-	scratchOffsetImm := (lambdaScratchOffset / 8) << 10
-	strInstr = uint32(0xf9000000) | uint32(10) | uint32(12<<5) | uint32(scratchOffsetImm)
-	acg.out.out.writer.WriteBytes([]byte{
-		byte(strInstr),
-		byte(strInstr >> 8),
-		byte(strInstr >> 16),
-		byte(strInstr >> 24),
-	})
-
-	// Store length in result list
-	// ldr d0, [x13]
-	acg.out.out.writer.WriteBytes([]byte{0xa0, 0x01, 0x40, 0xfd})
-	// str d0, [x12]
-	acg.out.out.writer.WriteBytes([]byte{0x80, 0x01, 0x00, 0xfd})
-
-	// Initialize loop counter to 0
-	// mov x15, xzr
-	acg.out.out.writer.WriteBytes([]byte{0xef, 0x03, 0x1f, 0xaa})
-
-	// Loop start
-	loopStart := acg.eb.text.Len()
-
-	// Check if index >= length: cmp x15, x14
-	acg.out.out.writer.WriteBytes([]byte{0xdf, 0x01, 0x0e, 0xeb})
-	// b.ge loop_end
-	loopEndJumpPos := acg.eb.text.Len()
-	acg.out.BranchCond("ge", 0) // Placeholder
-
-	// Load element from input list: input_list[index]
-	// Element address = x13 + 8 + (x15 * 8)
-	// mov x0, x15
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0f, 0xaa})
-	// lsl x0, x0, #3 (multiply by 8)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf0, 0x7d, 0xd3})
-	// add x0, x0, #8 (skip length)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x00, 0x91})
-	// add x0, x0, x13 (x0 = address of element)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x0d, 0x8b})
-
-	// Load element into d0
-	// ldr d0, [x0]
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x40, 0xfd})
-
-	// Save loop index x15 to stack (will be clobbered by environment pointer)
-	// str x15, [sp, #-16]! (pre-indexed: decrement sp by 16, then store)
-	acg.out.out.writer.WriteBytes([]byte{0xef, 0xef, 0x1f, 0xf8})
-
-	// Load lambda closure object pointer from scratch slot
-	// ldr x0, [x12, #lambdaScratchOffset]
-	scratchOffsetImm = (lambdaScratchOffset / 8) << 10
-	ldrInstr := uint32(0xf9400000) | uint32(0) | uint32(12<<5) | uint32(scratchOffsetImm)
-	acg.out.out.writer.WriteBytes([]byte{
-		byte(ldrInstr),
-		byte(ldrInstr >> 8),
-		byte(ldrInstr >> 16),
-		byte(ldrInstr >> 24),
-	})
-
-	// Extract function pointer from closure object (offset 0)
-	// ldr x11, [x0, #0]
-	acg.out.out.writer.WriteBytes([]byte{0x0b, 0x00, 0x40, 0xf9})
-
-	// Extract environment pointer from closure object (offset 8) into x15
-	// ldr x15, [x0, #8]
-	acg.out.out.writer.WriteBytes([]byte{0x0f, 0x04, 0x40, 0xf9})
-
-	// Call the lambda function with environment in x15: blr x11
-	acg.out.out.writer.WriteBytes([]byte{0x60, 0x01, 0x3f, 0xd6})
-
-	// Restore loop index from stack
-	// ldr x15, [sp], #16
-	acg.out.out.writer.WriteBytes([]byte{0xef, 0x07, 0x41, 0xf8})
-
-	// Result is in d0, store it in output list: result_list[index]
-	// mov x0, x15
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0f, 0xaa})
-	// lsl x0, x0, #3
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0xf0, 0x7d, 0xd3})
-	// add x0, x0, #8
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x20, 0x00, 0x91})
-	// add x0, x0, x12
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x0c, 0x8b})
-	// str d0, [x0]
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0xfd})
-
-	// Increment index: add x15, x15, #1
-	acg.out.out.writer.WriteBytes([]byte{0xef, 0x05, 0x00, 0x91})
-
-	// Jump back to loop start
-	loopBackJumpPos := acg.eb.text.Len()
-	backOffset := int32(loopStart - loopBackJumpPos)
-	acg.out.Branch(backOffset)
-
-	// Loop end
-	loopEndPos := acg.eb.text.Len()
-
-	// Patch conditional jump
-	acg.patchJumpOffset(loopEndJumpPos, int32(loopEndPos-loopEndJumpPos))
-
-	// Return result list pointer as float64 in d0
-	// mov x0, x12
-	acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x0c, 0xaa})
-	// scvtf d0, x0 - convert pointer to float64
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e})
-
-	// Adjust stack pointer
-	// add sp, sp, #(parallelResultAlloc + 16 + 8)
-	if err := acg.out.AddImm64("sp", "sp", parallelResultAlloc+24); err != nil {
-		return err
-	}
-
-	return nil
-}
 
 // compileCall compiles a function call
 // Confidence that this function is working: 75%
@@ -4859,7 +4614,7 @@ func (acg *ARM64CodeGen) compileDirectCall(call *DirectCallExpr) error {
 		// Check if callee is a simple value (not a lambda)
 		isLambda := false
 		switch call.Callee.(type) {
-		case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+		case *LambdaExpr:
 			isLambda = true
 		case *IdentExpr:
 			// Check if the identifier refers to a lambda/function
@@ -5221,7 +4976,7 @@ func (acg *ARM64CodeGen) compilePrintfNative(call *CallExpr, fd uint64) error {
 	if !ok {
 		return fmt.Errorf("printf first argument must be a string literal")
 	}
-	runes := []rune(processEscapeSequences(strExpr.Value))
+	runes := []rune(strExpr.Value)
 	argIndex := 0
 	i := 0
 	for i < len(runes) {
@@ -5354,7 +5109,7 @@ func (acg *ARM64CodeGen) compilePrintf(call *CallExpr) error {
 	}
 
 	// Process format string: %v -> %.15g (smart float), %b -> %s (boolean)
-	processedFormat := processEscapeSequences(strExpr.Value)
+	processedFormat := strExpr.Value
 	boolPositions := make(map[int]bool) // Track which args are %b (boolean)
 	isFloatArg := make(map[int]bool)    // Track which args are floats
 	isPtrArg := make(map[int]bool)      // Track which args are pointers
@@ -5685,104 +5440,6 @@ func (acg *ARM64CodeGen) compilePrintf(call *CallExpr) error {
 
 	// Result in d0
 	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x62, 0x9e}) // scvtf d0, x0
-	return nil
-}
-
-// compileMathFunction compiles a call to a C math library function (sin, cos, sqrt, etc.)
-func (acg *ARM64CodeGen) compileMathFunction(call *CallExpr) error {
-	if len(call.Args) != 1 {
-		return fmt.Errorf("%s requires exactly 1 argument", call.Function)
-	}
-
-	// Compile the argument - result will be in d0
-	if err := acg.compileExpression(call.Args[0]); err != nil {
-		return err
-	}
-
-	// Argument is already in d0 (ARM64 ABI: first float arg in d0)
-
-	// Mark that we need dynamic linking
-	acg.eb.useDynamicLinking = true
-
-	// Map function names to C library names (e.g., abs -> fabs)
-	funcName := call.Function
-	if funcName == "abs" {
-		funcName = "fabs" // Use fabs for floating-point absolute value
-	}
-
-	// Add function to needed functions list if not already there
-	found := slices.Contains(acg.eb.neededFunctions, funcName)
-	if !found {
-		acg.eb.neededFunctions = append(acg.eb.neededFunctions, funcName)
-	}
-
-	// Generate call to function stub
-	stubLabel := funcName + "$stub"
-	position := acg.eb.text.Len()
-	acg.eb.callPatches = append(acg.eb.callPatches, CallPatch{
-		position:   position,
-		targetName: stubLabel,
-	})
-
-	// Emit placeholder bl instruction (will be patched later)
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x94}) // bl #0
-
-	// Result is returned in d0 (ARM64 ABI: float return value in d0)
-	// No conversion needed, d0 already has the result
-
-	return nil
-}
-
-// compilePowFunction compiles a call to pow(x, y)
-func (acg *ARM64CodeGen) compilePowFunction(call *CallExpr) error {
-	if len(call.Args) != 2 {
-		return fmt.Errorf("pow requires exactly 2 arguments")
-	}
-
-	// Compile first argument (base) - result will be in d0
-	if err := acg.compileExpression(call.Args[0]); err != nil {
-		return err
-	}
-
-	// Save first argument to d1 temporarily (we'll move it back)
-	// fmov d8, d0 (use callee-saved register d8)
-	acg.out.out.writer.WriteBytes([]byte{0x08, 0x40, 0x60, 0x1e})
-
-	// Compile second argument (exponent) - result will be in d0
-	if err := acg.compileExpression(call.Args[1]); err != nil {
-		return err
-	}
-
-	// Move second argument to d1 (ARM64 ABI: second float arg in d1)
-	// fmov d1, d0
-	acg.out.out.writer.WriteBytes([]byte{0x01, 0x40, 0x60, 0x1e})
-
-	// Move first argument back to d0 (ARM64 ABI: first float arg in d0)
-	// fmov d0, d8
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x41, 0x60, 0x1e})
-
-	// Mark that we need dynamic linking
-	acg.eb.useDynamicLinking = true
-
-	// Add function to needed functions list (pow, atan2, etc.)
-	funcName := call.Function
-	found := slices.Contains(acg.eb.neededFunctions, funcName)
-	if !found {
-		acg.eb.neededFunctions = append(acg.eb.neededFunctions, funcName)
-	}
-
-	// Generate call to function stub
-	stubLabel := funcName + "$stub"
-	position := acg.eb.text.Len()
-	acg.eb.callPatches = append(acg.eb.callPatches, CallPatch{
-		position:   position,
-		targetName: stubLabel,
-	})
-
-	// Emit placeholder bl instruction
-	acg.out.out.writer.WriteBytes([]byte{0x00, 0x00, 0x00, 0x94}) // bl #0
-
-	// Result is returned in d0
 	return nil
 }
 
@@ -6236,9 +5893,6 @@ func (acg *ARM64CodeGen) getExprType(expr Expression) string {
 	case *SliceExpr:
 		// Slicing preserves the type of the list
 		return acg.getExprType(e.List)
-	case *ParallelExpr:
-		// Parallel expr returns a list
-		return "list"
 	case *CastExpr:
 		switch e.Type {
 		case "string", "str":
@@ -7936,57 +7590,6 @@ func (acg *ARM64CodeGen) undefinedVariableError(name string) error {
 }
 
 // compilePostfixStmt compiles postfix increment/decrement statements (x++, x--)
-func (acg *ARM64CodeGen) compilePostfixStmt(postfix *PostfixExpr) error {
-	// x++ and x-- are statements only, not expressions
-	identExpr, ok := postfix.Operand.(*IdentExpr)
-	if !ok {
-		return fmt.Errorf("postfix operator %s requires a variable operand", postfix.Operator)
-	}
-
-	// Get the variable's stack offset
-	offset, exists := acg.stackVars[identExpr.Name]
-	if !exists {
-		return acg.undefinedVariableError(identExpr.Name)
-	}
-
-	// Check if variable is mutable
-	if !acg.mutableVars[identExpr.Name] {
-		return fmt.Errorf("cannot modify immutable variable '%s'", identExpr.Name)
-	}
-
-	// Load current value into d0: ldr d0, [x29, #offset]
-	stackOffset := int32(16 + offset - 8)
-	if err := acg.out.LdrImm64Double("d0", "x29", stackOffset); err != nil {
-		return err
-	}
-
-	// Create 1.0 constant and load it into d1
-	// Load 1 as integer, then convert to float
-	if err := acg.out.MovImm64("x0", 1); err != nil {
-		return err
-	}
-	// scvtf d1, x0 (convert int64 to float64)
-	acg.out.out.writer.WriteBytes([]byte{0x01, 0x00, 0x62, 0x9e})
-
-	// Apply the operation
-	switch postfix.Operator {
-	case "++":
-		// fadd d0, d0, d1 (d0 = d0 + 1.0)
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x28, 0x61, 0x1e})
-	case "--":
-		// fsub d0, d0, d1 (d0 = d0 - 1.0)
-		acg.out.out.writer.WriteBytes([]byte{0x00, 0x38, 0x61, 0x1e})
-	default:
-		return fmt.Errorf("unknown postfix operator '%s'", postfix.Operator)
-	}
-
-	// Store result back: str d0, [x29, #offset]
-	if err := acg.out.StrImm64Double("d0", "x29", stackOffset); err != nil {
-		return err
-	}
-
-	return nil
-}
 
 // compileFFICall compiles FFI call() function for ARM64+macOS
 func (acg *ARM64CodeGen) compileFFICall(call *CallExpr) error {
@@ -8393,80 +7996,5 @@ func (acg *ARM64CodeGen) compileMemoryRead(call *CallExpr) error {
 	if err := acg.out.AddImm64("sp", "sp", 16); err != nil {
 		return err
 	}
-	return nil
-}
-
-// generateArenaRuntimeARM64 generates arena runtime functions for ARM64
-func (acg *ARM64CodeGen) generateArenaRuntimeARM64() error {
-	// Define arena global variables in .data section
-	acg.eb.Define("_tim_arena_meta", "\x00\x00\x00\x00\x00\x00\x00\x00")     // Pointer to meta-arena array
-	acg.eb.Define("_tim_arena_meta_cap", "\x00\x00\x00\x00\x00\x00\x00\x00") // Capacity of meta-arena
-	acg.eb.Define("_tim_arena_meta_len", "\x00\x00\x00\x00\x00\x00\x00\x00") // Length (number of arenas)
-
-	// Generate arena runtime functions
-	// These will be placeholders that call through to libc functions
-	// For now, we'll generate simple stub implementations
-
-	// _tim_arena_ensure_capacity(depth) - Ensure meta-arena can hold depth arenas
-	// Simplified stub: just return (arena allocation is done directly by alloc())
-	acg.eb.MarkLabel("_tim_arena_ensure_capacity")
-	if err := acg.out.Return("x30"); err != nil {
-		return err
-	}
-
-	// tim_arena_create(capacity) -> arena_ptr
-	// Creates a new arena with the specified capacity
-	// Argument: x0 = capacity
-	// Returns: x0 = arena pointer
-	acg.eb.MarkLabel("_tim_arena_create")
-	// Save link register
-	// stp x29, x30, [sp, #-16]!
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xbf, 0xa9})
-	// Arena structure: [buffer_ptr][capacity][offset][alignment] = 32 bytes
-	// For now, allocate 4KB buffer via malloc
-	if err := acg.out.MovImm64("x0", 4096); err != nil {
-		return err
-	}
-	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
-		return err
-	}
-	// Restore link register and return
-	// ldp x29, x30, [sp], #16
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc1, 0xa8})
-	if err := acg.out.Return("x30"); err != nil {
-		return err
-	}
-
-	// tim_arena_alloc(arena_ptr, size) -> allocation_ptr
-	// Allocates memory from the arena
-	// Arguments: x0 = arena_ptr, x1 = size
-	// Returns: x0 = allocated memory pointer
-	acg.eb.MarkLabel("_tim_arena_alloc")
-	// Save link register
-	// stp x29, x30, [sp, #-16]!
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xbf, 0xa9})
-	// Simple stub: just call malloc with size in x0
-	if err := acg.out.MovReg64("x0", "x1"); err != nil {
-		return err
-	}
-	if err := acg.eb.GenerateCallInstruction("_tim_malloc"); err != nil {
-		return err
-	}
-	// Restore link register and return
-	// ldp x29, x30, [sp], #16
-	acg.out.out.writer.WriteBytes([]byte{0xfd, 0x7b, 0xc1, 0xa8})
-	if err := acg.out.Return("x30"); err != nil {
-		return err
-	}
-
-	// tim_arena_reset(arena_ptr)
-	// Resets the arena offset to 0
-	// Argument: x0 = arena_ptr
-	acg.eb.MarkLabel("_tim_arena_reset")
-	// No-op for now
-	if err := acg.out.Return("x30"); err != nil {
-		return err
-	}
-
 	return nil
 }

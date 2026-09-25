@@ -48,22 +48,6 @@ func (o *Out) AddImmToReg(dst string, imm int64) {
 	}
 }
 
-// AddRegToRegToReg generates ADD dst, src1, src2 (dst = src1 + src2)
-// For ARM64 and RISC-V which have 3-operand form
-func (o *Out) AddRegToRegToReg(dst, src1, src2 string) {
-	switch o.target.Arch() {
-	case ArchX86_64:
-		// x86 doesn't have 3-operand ADD, use MOV + ADD
-		// MOV dst, src1; ADD dst, src2
-		o.MovRegToReg(dst, src1)
-		o.AddRegToReg(dst, src2)
-	case ArchARM64:
-		o.addARM64RegToRegToReg(dst, src1, src2)
-	case ArchRiscv64:
-		o.addRISCVRegToRegToReg(dst, src1, src2)
-	}
-}
-
 // x86-64 ADD reg, reg
 func (o *Out) addX86RegToReg(dst, src string) {
 	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
@@ -205,34 +189,6 @@ func (o *Out) addARM64ImmToReg(dst string, imm int64) {
 	}
 }
 
-// ARM64 ADD Xd, Xn, Xm (3-operand form)
-func (o *Out) addARM64RegToRegToReg(dst, src1, src2 string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	src1Reg, src1Ok := GetRegister(o.target.Arch(), src1)
-	src2Reg, src2Ok := GetRegister(o.target.Arch(), src2)
-	if !dstOk || !src1Ok || !src2Ok {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "add %s, %s, %s:", dst, src1, src2)
-	}
-
-	instr := uint32(0x8B000000) |
-		(uint32(src2Reg.Encoding&31) << 16) | // Rm
-		(uint32(src1Reg.Encoding&31) << 5) | // Rn
-		uint32(dstReg.Encoding&31) // Rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
 // RISC-V ADD rd, rs1, rs2
 func (o *Out) addRISCVRegToReg(dst, src string) {
 	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
@@ -283,34 +239,6 @@ func (o *Out) addRISCVImmToReg(dst string, imm int64) {
 	instr := uint32(0x13) |
 		(uint32(imm&0xFFF) << 20) | // imm[11:0]
 		(uint32(dstReg.Encoding&31) << 15) | // rs1 (same as rd)
-		(uint32(dstReg.Encoding&31) << 7) // rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// RISC-V ADD rd, rs1, rs2 (3-operand form)
-func (o *Out) addRISCVRegToRegToReg(dst, src1, src2 string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	src1Reg, src1Ok := GetRegister(o.target.Arch(), src1)
-	src2Reg, src2Ok := GetRegister(o.target.Arch(), src2)
-	if !dstOk || !src1Ok || !src2Ok {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "add %s, %s, %s:", dst, src1, src2)
-	}
-
-	instr := uint32(0x33) |
-		(uint32(src2Reg.Encoding&31) << 20) | // rs2
-		(uint32(src1Reg.Encoding&31) << 15) | // rs1
 		(uint32(dstReg.Encoding&31) << 7) // rd
 
 	o.Write(uint8(instr & 0xFF))

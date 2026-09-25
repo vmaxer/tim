@@ -2,7 +2,6 @@
 package main
 
 import (
-	"fmt"
 	"hash/fnv"
 )
 
@@ -217,9 +216,4 @@ func (m *TimHashMap) Values() []float64 {
 // Count returns the number of entries in the hash map
 func (m *TimHashMap) Count() int {
 	return m.count
-}
-
-// String returns a string representation of the hash map
-func (m *TimHashMap) String() string {
-	return fmt.Sprintf("TimHashMap{count: %d, size: %d}", m.count, m.size)
 }

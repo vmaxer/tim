@@ -1,6 +1,6 @@
 cstruct TestStruct {
-    field1 as uint32,
-    field2 as uint64
+    field1: uint32,
+    field2: uint64
 }
 
 printf("Test: alloc and cast\n")

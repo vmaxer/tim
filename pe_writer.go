@@ -1,10 +1,6 @@
 // pe_writer.go - Object-oriented PE writer
 package main
 
-import (
-	"fmt"
-)
-
 // PEWriter handles PE (Windows) file generation with proper state management
 type PEWriter struct {
 	target   Target
@@ -39,33 +35,4 @@ func (w *PEWriter) GetBaseAddr() uint64 {
 // GetEstimatedRodataAddr returns an estimated rodata address for first-pass compilation
 func (w *PEWriter) GetEstimatedRodataAddr() uint64 {
 	return w.baseAddr + 0x3000 + 0x100
-}
-
-// CalculateLayout computes the memory layout for all sections
-func (w *PEWriter) CalculateLayout(codeSize, rodataSize int, dataSymbols map[string]string) error {
-	// PE layout calculation
-	w.phase = PhaseELFLayout // Reuse phase enum
-
-	// TODO: Implement proper PE layout
-
-	return nil
-}
-
-// WritePE writes a complete PE file
-func (w *PEWriter) WritePE() error {
-	w.phase = PhaseWriting
-
-	// This would call the actual PE writing code
-	// For now, we'll integrate with existing PE generation
-
-	return nil
-}
-
-// Validate performs sanity checks on the PE structure
-func (w *PEWriter) Validate() error {
-	if len(w.layout) == 0 {
-		return fmt.Errorf("PE layout not calculated")
-	}
-
-	return nil
 }

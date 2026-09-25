@@ -868,9 +868,3 @@ func (p *CParser) parseEnum() {
 	// Skip until semicolon (for typedef enum Name { ... } Name; pattern)
 	p.skipUntil(";")
 }
-
-// ParseCHeaderFile is a convenience function that parses a C header file
-func ParseCHeaderFile(filepath string) (*CHeaderConstants, error) {
-	parser := NewCParser()
-	return parser.ParseFile(filepath)
-}

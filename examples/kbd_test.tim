@@ -31,7 +31,7 @@ frame_count := 0
         }
     }
     sdl.SDL_Delay(16)
-    frame_count++
+    frame_count += 1
     {
         | frame_count >= 300 => { running <- 0 }
     }

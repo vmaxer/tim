@@ -58,16 +58,6 @@ func getDecompressorStubLinuxX64() []byte {
 	}
 }
 
-// RLE decompressor stub for x86-64 Windows
-func getDecompressorStubWindowsX64() []byte {
-	// Similar to Linux but uses VirtualAlloc instead of mmap
-	// For now, simplified version
-	return []byte{
-		// TODO: Implement Windows version with VirtualAlloc
-		// For now, just return Linux version as placeholder
-	}
-}
-
 // Simple RLE compression
 // Format: [decompressed_size:4][count:1][byte:1]... with count=0 as terminator
 func compressRLE(data []byte) []byte {

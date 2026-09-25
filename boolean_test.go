@@ -13,13 +13,12 @@ func TestBooleanTypeLexing(t *testing.T) {
 	}{
 		{"yes keyword", "yes", TOKEN_YES},
 		{"no keyword", "no", TOKEN_NO},
-		{"bool type", "bool", TOKEN_BOOL},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lexer := &Lexer{input: tt.input}
-			token := lexer.NextToken()
+			toks, _ := Lex(tt.input)
+			token := toks[0]
 			if token.Type != tt.expected {
 				t.Errorf("Expected token type %v, got %v", tt.expected, token.Type)
 			}

@@ -38,21 +38,6 @@ func (o *Out) AndRegWithImm(dst string, imm int32) {
 	}
 }
 
-// AndRegWithRegToReg generates AND dst, src1, src2 (dst = src1 & src2)
-// 3-operand form for ARM64 and RISC-V
-func (o *Out) AndRegWithRegToReg(dst, src1, src2 string) {
-	switch o.target.Arch() {
-	case ArchX86_64:
-		// x86-64: MOV dst, src1; AND dst, src2
-		o.MovRegToReg(dst, src1)
-		o.AndRegWithReg(dst, src2)
-	case ArchARM64:
-		o.andARM64RegWithRegToReg(dst, src1, src2)
-	case ArchRiscv64:
-		o.andRISCVRegWithRegToReg(dst, src1, src2)
-	}
-}
-
 // ============================================================================
 // x86-64 implementations
 // ============================================================================
@@ -138,64 +123,6 @@ func (o *Out) andX86RegWithImm(dst string, imm int32) {
 // ARM64 implementations
 // ============================================================================
 
-// ARM64 AND (register-register, 2-operand form)
-func (o *Out) andARM64RegWithReg(dst, src string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	srcReg, srcOk := GetRegister(o.target.Arch(), src)
-	if !dstOk || !srcOk {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "and %s, %s, %s:", dst, dst, src)
-	}
-
-	// AND Xd, Xn, Xm (shifted register)
-	// Format: sf 0 01010 shift 0 Rm imm6 Rn Rd
-	// sf=1 (64-bit), shift=00 (LSL #0), Rm=src, Rn=dst (same as Rd), Rd=dst
-	instr := uint32(0x8A000000) |
-		(uint32(srcReg.Encoding&31) << 16) | // Rm
-		(uint32(dstReg.Encoding&31) << 5) | // Rn (same as Rd for 2-operand)
-		uint32(dstReg.Encoding&31) // Rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// ARM64 AND - 3 operand form
-func (o *Out) andARM64RegWithRegToReg(dst, src1, src2 string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	src1Reg, src1Ok := GetRegister(o.target.Arch(), src1)
-	src2Reg, src2Ok := GetRegister(o.target.Arch(), src2)
-	if !dstOk || !src1Ok || !src2Ok {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "and %s, %s, %s:", dst, src1, src2)
-	}
-
-	instr := uint32(0x8A000000) |
-		(uint32(src2Reg.Encoding&31) << 16) | // Rm
-		(uint32(src1Reg.Encoding&31) << 5) | // Rn
-		uint32(dstReg.Encoding&31) // Rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
 // ARM64 AND with immediate
 func (o *Out) andARM64RegWithImm(dst string, imm int32) {
 	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
@@ -229,64 +156,6 @@ func (o *Out) andARM64RegWithImm(dst string, imm int32) {
 // ============================================================================
 // RISC-V implementations
 // ============================================================================
-
-// RISC-V AND (register-register, 2-operand form)
-func (o *Out) andRISCVRegWithReg(dst, src string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	srcReg, srcOk := GetRegister(o.target.Arch(), src)
-	if !dstOk || !srcOk {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "and %s, %s, %s:", dst, dst, src)
-	}
-
-	// AND: 0000000 rs2 rs1 111 rd 0110011
-	instr := uint32(0x33) |
-		(7 << 12) | // funct3 = 111 (AND)
-		(uint32(srcReg.Encoding&31) << 20) | // rs2
-		(uint32(dstReg.Encoding&31) << 15) | // rs1 (same as rd)
-		(uint32(dstReg.Encoding&31) << 7) // rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// RISC-V AND - 3 operand form
-func (o *Out) andRISCVRegWithRegToReg(dst, src1, src2 string) {
-	dstReg, dstOk := GetRegister(o.target.Arch(), dst)
-	src1Reg, src1Ok := GetRegister(o.target.Arch(), src1)
-	src2Reg, src2Ok := GetRegister(o.target.Arch(), src2)
-	if !dstOk || !src1Ok || !src2Ok {
-		return
-	}
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "and %s, %s, %s:", dst, src1, src2)
-	}
-
-	instr := uint32(0x33) |
-		(7 << 12) | // funct3 = 111 (AND)
-		(uint32(src2Reg.Encoding&31) << 20) | // rs2
-		(uint32(src1Reg.Encoding&31) << 15) | // rs1
-		(uint32(dstReg.Encoding&31) << 7) // rd
-
-	o.Write(uint8(instr & 0xFF))
-	o.Write(uint8((instr >> 8) & 0xFF))
-	o.Write(uint8((instr >> 16) & 0xFF))
-	o.Write(uint8((instr >> 24) & 0xFF))
-
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
 
 // RISC-V ANDI (AND immediate)
 func (o *Out) andRISCVRegWithImm(dst string, imm int32) {

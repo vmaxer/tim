@@ -144,8 +144,3 @@ func (fi *FileInfo) IsMachO() bool {
 func (fi *FileInfo) IsARM64() bool {
 	return fi.Arch == ArchARM64
 }
-
-// IsX86_64 returns true if the file is x86_64 architecture
-func (fi *FileInfo) IsX86_64() bool {
-	return fi.Arch == ArchX86_64
-}
