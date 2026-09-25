@@ -62,7 +62,7 @@ the older backends (`codegen.go`, `arm64_codegen.go`, `riscv64_codegen.go`).
 
 ```sh
 go test ./...                              # includes cross-architecture tests when qemu is installed
-TIM_UPDATE=1 go test -run TestCorePrograms # rewrite testdata/core/*.out
+TIM_UPDATE=1 go test -run TestCorePrograms # rewrite testdata/core/*.want
 sh runtime/build.sh                        # rebuild the runtime blobs (clang, ld.lld)
 TIM_LEGACY=1 tim prog.tim                  # force the legacy backends
 ```

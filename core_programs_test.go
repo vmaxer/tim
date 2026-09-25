@@ -14,7 +14,7 @@ import (
 
 // TestCorePrograms compiles testdata/core/*.tim with the core code generator
 // for the host, and on Linux also for the other architectures under qemu,
-// and compares their output with the .out files. TIM_UPDATE=1 rewrites them.
+// and compares their output with the .want files. TIM_UPDATE=1 rewrites them.
 func TestCorePrograms(t *testing.T) {
 	files, _ := filepath.Glob("testdata/core/*.tim")
 	if len(files) == 0 {
@@ -77,7 +77,7 @@ func TestCorePrograms(t *testing.T) {
 					t.Fatal(err)
 				}
 				got := fmt.Sprintf("%s[exit %d]\n", stdout.String(), exit)
-				golden := strings.TrimSuffix(src, ".tim") + ".out"
+				golden := strings.TrimSuffix(src, ".tim") + ".want"
 				if os.Getenv("TIM_UPDATE") != "" && tg.qemu == "" {
 					if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
 						t.Fatal(err)
