@@ -902,6 +902,8 @@ static double asin_d(double x) {
 static double pow_d(double x, double y) {
 	if (y == 0.0)
 		return 1.0;
+	if (y == 0.5 && x >= 0)
+		return sqrt_(x);
 	if (x == 0.0)
 		return y > 0 ? 0.0 : double_of(ERR_DV0);
 	if (trunc_d(y) == y && y > -TWO53 && y < TWO53) {
@@ -1922,6 +1924,16 @@ static u64 list_concat(R *r, u64 a, u64 b) {
 	return l;
 }
 
+static int num_sign(u64 v) {
+	u64 t = tag_of(v);
+	if (t == TAG_BIG || t == TAG_RAT) {
+		u64 h = obj(v)[1];
+		return (h & SIGN_BIT) ? -1 : (h & 0xFFFFFFFF) ? 1 : 0;
+	}
+	double d = double_of(v);
+	return d < 0 ? -1 : d > 0 ? 1 : 0;
+}
+
 u64 rt_binop(R *r, u64 op, u64 a, u64 b) {
 	if (op == OP_EQ || op == OP_NE)
 		return num(val_eq(r, a, b) == (op == OP_EQ));
@@ -1937,9 +1949,11 @@ u64 rt_binop(R *r, u64 op, u64 a, u64 b) {
 		u64 nb = double_of(b) != double_of(b) && is_num(b) && !is_exact(b);
 		if (na || nb)
 			return op >= OP_LT ? num(0) : (na ? a : b);
-		if (is_exact(a) && is_exact(b))
-			return exact(r, op, a, b);
-		return inexact(r, op, a, b);
+		u64 v = is_exact(a) && is_exact(b) ? exact(r, op, a, b) : inexact(r, op, a, b);
+		// % is floored: the remainder takes the sign of the divisor
+		if (op == OP_MOD && !is_err(v) && num_sign(v) * num_sign(b) < 0)
+			v = rt_binop(r, OP_ADD, v, b);
+		return v;
 	}
 	if (op >= OP_LT && op <= OP_GE) {
 		int ok = 1, k = val_cmp(r, a, b, &ok);
@@ -2585,10 +2599,13 @@ u64 rt_num(R *r, u64 s) {
 	u64 v = parse_digits(r, p + i, n - i, base, &k);
 	if (!k && !(base == 10 && i < n && p[i] == '.'))
 		goto bad;
+	u64 whole = k;
 	i += k;
 	if (base == 10 && i < n && p[i] == '.') {
 		i++;
 		u64 f = parse_digits(r, p + i, n - i, 10, &k);
+		if (!whole && !k)
+			goto bad;
 		u64 digits = 0;
 		for (u64 j = 0; j < k; j++)
 			digits += p[i + j] != '_';

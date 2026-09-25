@@ -268,7 +268,8 @@ f"{s} has {#s} bytes"
 | error  | a value carrying a short error code, produced by failing operations or `err`  |
 
 - **Numbers.** `+ - * / % **` are exact on exact operands: `7 / 2` is `3.5`,
-  `2 ** 100` is exact, `0.1 + 0.2 == 0.3`. `sqrt`, `sin`, `log` and friends, C
+  `2 ** 100` is exact, `0.1 + 0.2 == 0.3`. `%` is floored: the remainder has the
+  divisor's sign, so `-7 % 3` is `2`. `sqrt`, `sin`, `log` and friends, C
   `float`/`double`, and `x as float64` give inexact float64; any arithmetic with an
   inexact operand is inexact.
 - **Truthiness.** `0`, `no`, `""`, `[]`, `{}` and errors are false; everything else is true.
