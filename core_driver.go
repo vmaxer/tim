@@ -108,6 +108,10 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 	switch p.Arch {
 	case ArchX86_64:
 		blob, syms, a = rtLinuxAMD64, rtLinuxAMD64Syms, newX86()
+	case ArchARM64:
+		blob, syms, a = rtLinuxARM64, rtLinuxARM64Syms, newA64()
+	case ArchRiscv64:
+		blob, syms, a = rtLinuxRISCV64, rtLinuxRISCV64Syms, newRV()
 	default:
 		why = "architecture"
 		return false, nil
