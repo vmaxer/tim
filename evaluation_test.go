@@ -69,7 +69,7 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "make_counter_mutable_capture",
-			// The canonical closure from LANGUAGESPEC: a nested lambda mutates a
+			// The canonical closure: a nested lambda mutates a
 			// captured enclosing-local via `<-` and the change persists across
 			// calls. The local is boxed in a shared heap cell.
 			code: `

@@ -1,208 +1,70 @@
 # Tim
 
-**Tim** is a fully vibecoded compiler for an experimental programming language. It compiles directly to machine code for Linux (x86_64) and Windows (x86_64). Linux (aarch64 and riscv64) and macOS support is experimental. This entire compiler is experimental. The Tim programming language is experimental too.
-
-## Features
-
-*   **Fast Compilation**: Compiles directly to machine code. No LLVM, no intermediate steps, sub-second build times.
-*   **Highly Optimized**:
-    *   **Tail Call Optimization (TCO)**
-    *   **Pure Function Memoization**
-    *   **SIMD & FMA**
-*   **Minimalist Syntax**:
-    *   Unified syntax for functions, lambdas, and pattern matching.
-    *   The `@` symbol handles all loops (range, while, infinite, for-each).
-*   **One Number Type**: `num` holds exact integers of any size, exact rationals and inexact floats. `0.1 + 0.2 == 0.3`, `2 ** 200` is exact, and `7 / 2` is `3.5`, not `3`.
-*   **Compact & Standalone**: "Hello World" is ~21KB on Linux. No `libc` dependency on Linux (uses direct syscalls).
-*   **Manual Memory Management w/ Safety**: First-class **Arena** allocators for bulk deallocation and `defer` for resource cleanup. No Garbage Collector pauses.
-
-## Installation
-
-```bash
-go install github.com/vmaxer/tim@latest
-```
-
-Ensure `~/go/bin` is in your PATH.
-
-## Quick Start
-
-Create `hello.tim`:
-
-```python
-println("Hello, Tim!")
-```
-
-Compile and run:
-
-```bash
-tim hello.tim -o hello
-./hello
-```
-
-## Language Tour
-
-### 1. One Number Type
-Numbers are exact until you ask for a float.
-```go
-2 ** 100          // 1267650600228229401496703205376
-7 / 2             // 3.5 (exact rational)
-1 / 3 + 1 / 6     // 0.5
-22 / 7            // 22/7
-0.1 + 0.2 == 0.3  // yes
-sqrt(2)           // 1.414214 (inexact float64)
-```
-
-### 2. Variables & Functions
-```go
-// Immutable (default)
-x = 42
-add = (a, b) -> a + b
-
-// Mutable
-count := 0
-count <- count + 1
-
-// Implicit lambda in assignment
-run = { println("Running...") }
-```
-
-### 3. Unified Control Flow
-Pattern matching and lambdas share syntax.
-
-```go
-// Value matching
-sign = x {
-    | x > 0 => "positive"
-    | x < 0 => "negative"
-    ~> "zero"
-}
-
-// Range Loop
-@ i in 0..<10 {
-    println(i)
-}
-
-// While Loop (condition loops require a `!` bound)
-@ count > 0 ! 1000 {
-    count <- count - 1
-}
-```
-
-### Error Handling (`or!`)
-
-The `or!` operator handles errors (encoded as NaN) or nulls (0.0).
-
-```go
-// Returns 42 if risky() fails
-val = risky() or! 42
-
-// Executes block on error
-file = open("data.txt") or! {
-    println("Failed to open file")
-    ret 1
-}
-```
-
-### 5. Memory & Resources
-Use `defer` for LIFO cleanup and `arena` for high-performance temporary allocations.
+Tim is a small programming language and a compiler that writes machine code
+directly: no LLVM, no assembler, no linker. It targets Linux on x86-64, arm64
+and riscv64, Windows on x86-64 and arm64, and macOS on arm64.
 
 ```tim
-arena {
-    data = allocate(1024)
-    // ... use data ...
-} // Automatically freed here
+fact(n) = n <= 1 { => 1 ~> n * fact(n - 1) }
+println(fact(30))                       // 265252859812191058636308480000000
 
-ptr := c.malloc(64)
-defer c.free(ptr)
+words = split("the quick brown fox", " ")
+println([upper(w) @ w in words if #w > 3])   // ["QUICK", "BROWN"]
+println(0.1 + 0.2 == 0.3, 7 / 2)        // 1 3.5
 ```
 
-### 6. C Interop (FFI)
-Call C libraries directly. Tim parses headers and links dynamically.
+## Install
 
-```go
-import sdl3 as sdl
-
-sdl.SDL_Init(sdl.SDL_INIT_VIDEO)
-defer sdl.SDL_Quit()
+```sh
+go install github.com/vmaxer/tim@latest
+tim hello.tim -o hello && ./hello
+tim --os windows --arch arm64 hello.tim -o hello.exe
 ```
 
-## Example: Displaying an image with SDL3
+## The language in a minute
 
-* Requires `img/grumpy-cat.bmp`.
-* When compiling for Windows, this also requires `SDL3.dll` and the `include/SDL3` folder (with SDL3 header files).
+- **One number type.** Integers of any size and rationals are exact; `sqrt`,
+  `sin` and `as float64` give float64. `yes` and `no` are 1 and 0.
+- **Bindings.** `x = 1` is immutable, `n := 0` is mutable and `n <- n + 1`
+  (or `n += 1`) updates it.
+- **Functions** are values: `square(x) = x * x`, `inc = x -> x + 1`.
+  Closures capture by reference and every tail call is a jump.
+- **Matching.** A block after an expression matches on its value:
+  `n { 0 => "zero" 1..<10 => "small" ~> "large" }`; `{ | x > 0 => 1 ~> -1 }`
+  is a guard match.
+- **Loops** all start with `@`: `@ i in 0..<10 { }`, `@ x in xs { }`,
+  `@ n > 1 { }`, `@ { }`, with `break`, `continue` and optional `! N` bounds.
+- **Errors are values.** `10 / 0` and `xs[99]` are errors that print as
+  `error: division by zero`; `x or! default` replaces an error, `v.error`
+  reads its code and `err "code"` returns one.
+- **Memory** is garbage collected.
+- **C interop.** `import sdl3 as sdl` makes C functions callable as `sdl.SDL_Init(...)`.
 
-```go
-// Import the SDL3 library (auto detect header files and library files with pkg-config on Linux, use SDL3.dll and include/* on Windows)
-import sdl3 as sdl
+The full grammar and semantics are in [GRAMMAR.md](GRAMMAR.md) and the
+builtin functions in [STDLIB.md](STDLIB.md).
 
-// Set the window dimentions
-width = 620
-height = 387
+## How it works
 
-// Initialize SDL with SDL_Init. Use the "or!" keyword to handle the case where SDL_Init returns nothing.
-sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
-    // Exitf is like printf, but writes to stderr and also quits the program with error code 1
-    exitf("SDL_Init failed: %s\n", sdl.SDL_GetError())
-}
+The compiler lexes and parses (`lexer.go`, `parser.go`), then checks names,
+mutability, arities and the types it can infer (`check.go`), reporting errors
+with source context and suggestions. The core code generator (`core.go`)
+compiles through a small interface that each instruction set implements
+(`core_x86.go`, `core_a64.go`, `core_rv64.go`), and writes ELF, PE or Mach-O
+files. Values are NaN-boxed 64-bit words: plain doubles get inline fast paths,
+and everything else calls the runtime, `runtime/rt.c`, a freestanding C
+library with exact arithmetic, UTF-8 strings, lists, maps and a garbage
+collector, embedded in each executable as a position-independent blob.
 
-// Call SDL_Quit when the program ends
-defer sdl.SDL_Quit()
+Programs that use C libraries, cstructs, `unsafe` or `defer` are compiled by
+the older backends (`codegen.go`, `arm64_codegen.go`, `riscv64_codegen.go`).
 
-// Create window, or exit with an error
-window = sdl.SDL_CreateWindow("Hello World!", width, height, sdl.SDL_WINDOW_RESIZABLE) or! {
-    exitf("Failed to create window: %s\n", sdl.SDL_GetError())
-}
+## Development
 
-// Call SDL_DestroyWindow when the program ends (before SDL_Quit)
-defer sdl.SDL_DestroyWindow(window)
-
-// Create renderer, or exit with an error
-renderer = sdl.SDL_CreateRenderer(window, 0) or! {
-    exitf("Failed to create renderer: %s\n", sdl.SDL_GetError())
-}
-
-// Call SDL_DestroyRenderer when the program ends (before SDL_DestroyWindow and SDL_Quit)
-defer sdl.SDL_DestroyRenderer(renderer)
-
-// Load BMP file, or exit with an error
-file = sdl.SDL_IOFromFile("img/grumpy-cat.bmp", "rb") or! {
-    exitf("Error reading file: %s\n", sdl.SDL_GetError())
-}
-
-// Load surface from file, or exit with an error
-bmp = sdl.SDL_LoadBMP_IO(file, 1) or! {
-    exitf("Error creating surface: %s\n", sdl.SDL_GetError())
-}
-
-// Clean up the surface when the program ends
-defer sdl.SDL_DestroySurface(bmp)
-
-// Create texture from surface, or exit with an error
-tex = sdl.SDL_CreateTextureFromSurface(renderer, bmp) or! {
-    exitf("Error creating texture: %s\n", sdl.SDL_GetError())
-}
-
-// Clean up the surface when the program ends
-defer sdl.SDL_DestroyTexture(tex)
-
-// Main rendering loop. Run for approximately 2 seconds (20 frames * 100ms = 2s)
-@ frame in 0..<20 {
-
-    // Clear screen
-    sdl.SDL_RenderClear(renderer)
-
-    // Render texture (fills entire window)
-    sdl.SDL_RenderTexture(renderer, tex, 0, 0)
-
-    // Present the rendered frame
-    sdl.SDL_RenderPresent(renderer)
-
-    // Delay to maintain framerate
-    sdl.SDL_Delay(100)
-}
+```sh
+go test ./...                              # includes cross-architecture tests when qemu is installed
+TIM_UPDATE=1 go test -run TestCorePrograms # rewrite testdata/core/*.out
+sh runtime/build.sh                        # rebuild the runtime blobs (clang, ld.lld)
+TIM_LEGACY=1 tim prog.tim                  # force the legacy backends
 ```
 
-## General info
-
-* Version: 1.0.3
-* License: The Unlicense
+License: The Unlicense.

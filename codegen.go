@@ -19,12 +19,9 @@ import (
 
 // codegen.go - Tim Code Generator
 //
-// This code generator is the authoritative implementation of LANGUAGESPEC.md v1.5.0.
+// This is the legacy code generator, used for programs the core (core.go) does not handle yet.
 // It transforms parsed AST into x86_64 assembly and ELF executables.
 //
-// Stability Commitment:
-// This code generator implements all LANGUAGESPEC.md v1.5.0 features. Future work
-// focuses on bug fixes, optimizations, and additional target architectures only.
 //
 // Current Target Support:
 // - x86_64 Linux (complete, production-ready)

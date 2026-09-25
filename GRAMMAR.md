@@ -277,6 +277,8 @@ f"{s} has {#s} bytes"
   arithmetic on an error propagates it. `v.error` is the error's code as a string
   (`""` for a non-error), `v or! d` substitutes `d`, and `err "code"` returns an
   error from the current function. Printing an error prints `error: <message>`.
+- **Memory.** Values live on a garbage-collected heap. `arena { ... }` runs its
+  block; it is kept for programs written for manual arenas.
 
 ## 6. Unsafe code
 

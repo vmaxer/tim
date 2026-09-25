@@ -654,7 +654,7 @@ EXAMPLES:
     ./script.tim arg1 arg2
 
 DOCUMENTATION:
-    For language documentation, see LANGUAGESPEC.md
+    For language documentation, see GRAMMAR.md and STDLIB.md
     For help or bug reports: https://github.com/zmaxer/tim/issues
 
 `)
