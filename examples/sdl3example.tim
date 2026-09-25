@@ -58,7 +58,7 @@ arena {
         sdl.SDL_RenderPresent(renderer)
         sdl.SDL_Delay(16)
         
-        loop_count++
+        loop_count += 1
         
         loop_count {
             | loop_count % 60 == 0 => { printf("Frame: %d\n", loop_count) }

@@ -276,8 +276,6 @@ func (c *CStructTypes) RegisterBlockLocals(stmts []Statement) []string {
 				}
 			case *ArenaStmt:
 				scan(s.Body)
-			case *WithStmt:
-				scan(s.Body)
 			}
 		}
 	}

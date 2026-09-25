@@ -1,0 +1,24 @@
+xs := [3, 1, 2]
+push(xs, 4)
+println(xs, #xs, xs[0], xs[-1], xs[1:3], xs[:2], xs[2:], pop(xs), xs)
+xs[0] <- 30
+println(xs, [1, 2] + [3], [0] * 3, 2 in xs, 9 in xs, reverse(xs), find(xs, 2))
+m := {name: "Tim", "two words": 2, 7: yes}
+m["new"] <- [1, 2]
+m.name <- "Tim 2"
+println(m, m.name, m["two words"], m[7], "name" in m, keys(m), #m)
+println(remove(m, "new"), m, values(m))
+a, b = [1, 2]
+println(a, b, zip([1, 2, 3], ["a", "b"]), enumerate(["x", "y"]))
+grid := [[0] * 3 @ i in 0..<3]
+grid[1][1] <- 5
+println(grid)
+s = "héllo wörld"
+println(#s, s[0], s[1:3], upper(s), split(s, " "), join(["a", "b"], "-"), runes("é€"), chr(128512), ord("€"))
+println(trim("  x  "), replace("a-b-c", "-", "+"), starts_with(s, "hé"), ends_with(s, "x"), reverse("abc"), bytes("hi"))
+println(f"{s} has {#s} bytes and {1 + 1} words", "x" + "y", "ab" * 3, "b" < "c")
+println(num("42") + 1, num("0.5") * 2, num("1e3"), num("x"), str(1 / 3), type(1), type("s"), type([]), type({}), type(str), type(10 / 0))
+plus(a, b) = a + b
+minus(a, b) = a - b
+size(x) = #x
+println(plus(1, "a"), minus("a", 1), size(5), [1][1], (10 / 0).error, error("custom").error, "fine".error)

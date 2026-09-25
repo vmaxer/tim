@@ -1,6 +1,6 @@
 cstruct Point {
-    x as int32,
-    y as int32
+    x: int32,
+    y: int32
 }
 
 // Should just compile and do nothing

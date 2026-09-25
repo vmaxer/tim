@@ -309,17 +309,3 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 		debugf("DEBUG: Generated _tim_println_syscall\n")
 	}
 }
-
-// generatePrintfSyscall generates printf using print + f-string infrastructure
-// This leverages the existing f-string compilation which calls _tim_concat_strings
-// Signature: printf(fstring_ptr) -> void
-func (fc *TimCompiler) generatePrintfSyscall() {
-	// printf is just print with f-string support
-	// The f-string compilation handles formatting, then we print the result
-	// This is already handled in compileBuiltinCall for "printf"
-	// We don't need a separate runtime function since printf calls are inlined
-
-	if VerboseMode {
-		debugf("DEBUG: printf uses inline f-string + print\n")
-	}
-}

@@ -131,16 +131,6 @@ func (p Platform) FullString() string {
 	return archStr + "-" + p.OS.String()
 }
 
-// IsMachO returns true if this platform uses Mach-O format
-func (p Platform) IsMachO() bool {
-	return p.OS == OSDarwin
-}
-
-// IsELF returns true if this platform uses ELF format
-func (p Platform) IsELF() bool {
-	return p.OS == OSLinux || p.OS == OSFreeBSD
-}
-
 // GetDefaultPlatform returns the platform for the current runtime
 func GetDefaultPlatform() Platform {
 	var arch Arch
@@ -563,15 +553,6 @@ func New(machineStr string) (*ExecutableBuilder, error) {
 func NewWithPlatform(platform Platform) (*ExecutableBuilder, error) {
 	target := PlatformToTarget(platform)
 
-	return &ExecutableBuilder{
-		target:    target,
-		consts:    make(map[string]*Const),
-		dynlinker: NewDynamicLinker(),
-	}, nil
-}
-
-// NewWithTarget creates an ExecutableBuilder for a specific target
-func NewWithTarget(target Target) (*ExecutableBuilder, error) {
 	return &ExecutableBuilder{
 		target:    target,
 		consts:    make(map[string]*Const),
@@ -1237,32 +1218,6 @@ func (eb *ExecutableBuilder) patchRodataInELF() {
 
 	if rodataOffset > 0 && rodataOffset+rodataSize <= len(elfBuf) {
 		copy(elfBuf[rodataOffset:rodataOffset+rodataSize], newRodata)
-	}
-}
-
-func (eb *ExecutableBuilder) patchDataInELF() {
-	elfBuf := eb.elf.Bytes()
-	newData := eb.data.Bytes()
-
-	dataOffset := int(eb.dataOffsetInELF)
-	dataSize := len(newData)
-
-	if VerboseMode {
-		debugf("DEBUG patchDataInELF: elfBuf size=%d, newData size=%d\n", len(elfBuf), len(newData))
-		debugf("DEBUG patchDataInELF: dataOffset=0x%x, dataSize=%d\n", dataOffset, dataSize)
-	}
-
-	if dataOffset > 0 && dataOffset+dataSize <= len(elfBuf) {
-		if VerboseMode {
-			debugf("DEBUG patchDataInELF: copying newData to elfBuf[0x%x:0x%x]\n", dataOffset, dataOffset+dataSize)
-		}
-		copy(elfBuf[dataOffset:dataOffset+dataSize], newData)
-		if VerboseMode {
-			debugf("DEBUG patchDataInELF: first 32 bytes of .data = %x\n", newData[:min(32, len(newData))])
-		}
-	} else if VerboseMode {
-		debugf("DEBUG patchDataInELF: WARNING - invalid offset or size (offset=%d, size=%d, elfBuf=%d)\n",
-			dataOffset, dataSize, len(elfBuf))
 	}
 }
 

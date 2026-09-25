@@ -1,6 +1,6 @@
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 // Direct test - allocate and access without SDL

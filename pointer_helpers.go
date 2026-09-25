@@ -61,23 +61,3 @@ func EmitLoadPointerFromStack(out *Out, destGpr string, baseReg string, offset i
 	out.MovMemToXmm("xmm15", baseReg, offset)
 	EmitFloat64ToPointer(out, destGpr, "xmm15")
 }
-
-// EmitStorePointerToStack stores a pointer from a GPR as float64 on the stack
-// This is a convenience function combining conversion + store.
-//
-// Parameters:
-//   - out: The output code generator
-//   - srcGpr: Source general-purpose register containing the pointer (e.g., "rax")
-//   - baseReg: Base register for stack addressing (usually "rbp" or "rsp")
-//   - offset: Offset from base register (in bytes)
-//
-// Example:
-//
-//	EmitStorePointerToStack(fc.out, "rax", "rbp", -16)  // Store pointer to [rbp-16]
-//
-// Implementation: Convert to XMM first, then store
-func EmitStorePointerToStack(out *Out, srcGpr string, baseReg string, offset int) {
-	// Use a temporary XMM register (xmm15 is rarely used)
-	EmitPointerToFloat64(out, "xmm15", srcGpr)
-	out.MovXmmToMem("xmm15", baseReg, offset)
-}

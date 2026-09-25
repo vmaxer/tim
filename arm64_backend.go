@@ -28,12 +28,6 @@ func (a *ARM64Backend) writeUnsigned(i uint) {
 	a.writer.(*BufferWrapper).WriteUnsigned(i)
 }
 
-func (a *ARM64Backend) emit(bytes []byte) {
-	for _, b := range bytes {
-		a.write(b)
-	}
-}
-
 func (a *ARM64Backend) writeInstruction(instr uint32) {
 	// ARM64 instructions are little-endian
 	a.write(uint8(instr & 0xFF))

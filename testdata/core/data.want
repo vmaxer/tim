@@ -1,0 +1,12 @@
+[3, 1, 2] 4 3 4 [1, 2] [3, 1] [2, 4] 4 [3, 1, 2]
+[30, 1, 2] [1, 2, 3] [0, 0, 0] 1 0 [2, 1, 30] 2
+{name: "Tim 2", "two words": 2, 7: 1, new: [1, 2]} Tim 2 2 1 1 ["name", "two words", 7, "new"] 4
+[1, 2] {name: "Tim 2", "two words": 2, 7: 1} ["Tim 2", 2, 1]
+1 2 [[1, "a"], [2, "b"]] [[0, "x"], [1, "y"]]
+[[0, 0, 0], [0, 5, 0], [0, 0, 0]]
+13 104 é HéLLO WöRLD ["héllo", "wörld"] a-b [233, 8364] 😀 8364
+x a+b+c 1 0 cba [104, 105]
+héllo wörld has 13 bytes and 2 words xy ababab 1
+43 1 1000 error: not a number: "x" 1/3 num str list map fn error
+error: cannot add a num and a str error: cannot subtract a str and a num error: cannot take the length of a num error: index out of range dv0 custom 
+[exit 0]

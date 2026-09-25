@@ -69,7 +69,7 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "make_counter_mutable_capture",
-			// The canonical closure from LANGUAGESPEC: a nested lambda mutates a
+			// The canonical closure: a nested lambda mutates a
 			// captured enclosing-local via `<-` and the change persists across
 			// calls. The local is boxed in a shared heap cell.
 			code: `
@@ -164,38 +164,6 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "currency_sign_or_bang_alias",
-			// ¤ is a one-character alias for or!.
-			code: `
-				main = {
-					x := 0
-					println(x ¤ { 99 })
-					y := 42
-					println(y ¤ { 7 })
-				}
-			`,
-			expectedOutput: "99\n42\n",
-			expectCompile:  true,
-		},
-		{
-			name: "cons_operator",
-			// `elem :: list` prepends (right-associative): the new list has the
-			// element at index 0 and the old elements shifted up one index.
-			code: `
-				main = {
-					xs = [3, 4, 5]
-					ys = 1 :: 2 :: xs
-					println(#ys)
-					println(ys[0])
-					println(ys[1])
-					println(ys[2])
-					println(ys[4])
-				}
-			`,
-			expectedOutput: "5\n1\n2\n3\n5\n",
-			expectCompile:  true,
-		},
-		{
 			name: "multi_clause_guard_match",
 			// A multi-clause guard match on one line: the result of a clause must
 			// not swallow the next clause's leading `|` as the pipe operator.
@@ -249,9 +217,9 @@ func TestEvaluation(t *testing.T) {
 			// no `aa = a as V` cast. Also exercises the inliner substituting a
 			// param inside a field access (previously dropped -> "undefined a").
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
-				vadd = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
-				vdot = (a as V, b as V) -> a.x*b.x + a.y*b.y + a.z*b.z
+				cstruct V { x: float64, y: float64, z: float64 }
+				vadd = (a: V, b: V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vdot = (a: V, b: V) -> a.x*b.x + a.y*b.y + a.z*b.z
 				main = {
 					p = V(1.0, 2.0, 3.0)
 					q = V(10.0, 20.0, 30.0)
@@ -271,12 +239,12 @@ func TestEvaluation(t *testing.T) {
 			// codegen folds `Struct(..).field` to the field expression (SROA), all
 			// while keeping nested/composed results correct.
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
-				vadd   = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
-				vsub   = (a as V, b as V) -> V(a.x-b.x, a.y-b.y, a.z-b.z)
-				vscale = (a as V, s) -> V(a.x*s, a.y*s, a.z*s)
-				vdot   = (a as V, b as V) -> a.x*b.x + a.y*b.y + a.z*b.z
-				vmix   = (a as V, b as V, t) -> vadd(vscale(a, 1.0 - t), vscale(b, t))
+				cstruct V { x: float64, y: float64, z: float64 }
+				vadd   = (a: V, b: V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vsub   = (a: V, b: V) -> V(a.x-b.x, a.y-b.y, a.z-b.z)
+				vscale = (a: V, s) -> V(a.x*s, a.y*s, a.z*s)
+				vdot   = (a: V, b: V) -> a.x*b.x + a.y*b.y + a.z*b.z
+				vmix   = (a: V, b: V, t) -> vadd(vscale(a, 1.0 - t), vscale(b, t))
 				main = {
 					p = V(1.0, 2.0, 3.0)
 					q = V(4.0, 5.0, 6.0)
@@ -293,10 +261,10 @@ func TestEvaluation(t *testing.T) {
 			// `fun name(params) { ... }` desugars to `name = (params) -> { ... }`,
 			// with cstruct param types via `as V` or `: V`.
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
-				fun vadd(a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
-				fun dotx(a: V, b: V) { a.x*b.x }
-				fun square(n) { n * n }
+				cstruct V { x: float64, y: float64, z: float64 }
+				vadd(a: V, b: V) = V(a.x+b.x, a.y+b.y, a.z+b.z)
+				dotx(a: V, b: V) = { a.x*b.x }
+				square(n) = { n * n }
 				main = {
 					p = V(1.0, 2.0, 3.0)
 					q = V(10.0, 20.0, 30.0)
@@ -314,15 +282,15 @@ func TestEvaluation(t *testing.T) {
 			// `@ v as float64 in range` and `@ b as Ball in list` — the cstruct
 			// iterator type lets the body read b.field directly.
 			code: `
-				cstruct Ball { cx as float64, cy as float64, cz as float64, R as float64 }
+				cstruct Ball { cx: float64, cy: float64, cz: float64, R: float64 }
 				balls = [Ball(1.0,2.0,3.0,4.0), Ball(5.0,6.0,7.0,8.0)]
 				main = {
 					sum := 0.0
-					@ i as float64 in 0..<4 {
+					@ i: float64 in 0..<4 {
 						sum <- sum + i
 					}
 					println(sum)
-					@ b as Ball in balls {
+					@ b: Ball in balls {
 						println(b.cx + b.R)
 					}
 				}
@@ -336,7 +304,7 @@ func TestEvaluation(t *testing.T) {
 			// (V_add/V_sub/V_mul/V_scale) when defined; scalar arithmetic is left
 			// untouched.
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
+				cstruct V { x: float64, y: float64, z: float64 }
 				V_add   = (a: V, b: V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
 				V_sub   = (a: V, b: V) -> V(a.x-b.x, a.y-b.y, a.z-b.z)
 				V_mul   = (a: V, b: V) -> V(a.x*b.x, a.y*b.y, a.z*b.z)
@@ -366,7 +334,7 @@ func TestEvaluation(t *testing.T) {
 			name: "multiline_calls_and_lists",
 			// Function-call arguments and list elements may span multiple lines.
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
+				cstruct V { x: float64, y: float64, z: float64 }
 				add3 = (a, b, c) -> a + b + c
 				main = {
 					p = V(1.0,
@@ -388,17 +356,17 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "for_loop_alias",
-			// `for` is a full alias for `@`-loops: range, typed cstruct iterator.
+			// `@` loops: range, typed cstruct iterator.
 			code: `
-				cstruct Ball { cx as float64, R as float64 }
+				cstruct Ball { cx: float64, R: float64 }
 				balls = [Ball(1.0, 4.0), Ball(5.0, 8.0)]
 				main = {
 					sum := 0.0
-					for i in 0..<5 {
+					@ i in 0..<5 {
 						sum <- sum + i
 					}
 					println(sum)
-					for b as Ball in balls {
+					@ b: Ball in balls {
 						println(b.cx + b.R)
 					}
 				}
@@ -407,45 +375,21 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "colon_as_cast_alias",
-			// `:` aliases `as` in unambiguous positions: postfix cast, lambda
-			// params, and loop iterator type — while map literals keep `:`.
-			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
-				balls = [V(1.0,2.0,3.0), V(4.0,5.0,6.0)]
-				addx = (a: V, b: V) -> a.x + b.x
-				main = {
-					p = balls[0] : V
-					println(p.x)
-					m = { x: 10.0, y: 20.0 }
-					println(m.x)
-					nm = { 5: 99.0 }
-					println(nm[5])
-					for b: V in balls {
-						println(b.z)
-					}
-					println(addx(balls[0] : V, balls[1] : V))
-				}
-			`,
-			expectedOutput: "1\n10\n99\n3\n6\n5\n",
-			expectCompile:  true,
-		},
-		{
 			name: "while_loop_and_if_jumps",
-			// `while cond { }` is a condition loop with no explicit bound. break and
+			// `@ cond { }` is a condition loop with no explicit bound. break and
 			// continue work inside `if` blocks (the parser leaves them on their last
 			// token so block parsing stays in sync).
 			code: `
 				main = {
 					i := 0.0
-					while i < 3.0 {
+					@ i < 3.0 {
 						i <- i + 1.0
 					}
 					println(i)
 
 					j := 0.0
 					last := 0.0
-					while j < 100.0 {
+					@ j < 100.0 {
 						j <- j + 1.0
 						if j > 5.0 { break }
 						last <- j
@@ -454,7 +398,7 @@ func TestEvaluation(t *testing.T) {
 
 					k := 0.0
 					sum := 0.0
-					while k < 6.0 {
+					@ k < 6.0 {
 						k <- k + 1.0
 						if k == 3.0 { continue }
 						sum <- sum + k
@@ -491,12 +435,12 @@ func TestEvaluation(t *testing.T) {
 			code: `
 				cstruct V    { x, y, z: f64 }
 				cstruct Ball { c: V, r: f64 }
-				fun V.sub(o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
-				fun V.dot(o: V) = self.x*o.x + self.y*o.y + self.z*o.z
+				V.sub(self, o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
+				V.dot(self, o: V) = self.x*o.x + self.y*o.y + self.z*o.z
 				balls = [Ball(V(1.0, 0.0, 0.0), 2.0), Ball(V(4.0, 0.0, 0.0), 1.0)]
-				fun field(p: V) {
+				field(p: V) = {
 					sum := 0.0
-					for b: Ball in balls {
+					@ b: Ball in balls {
 						d := p - b.c
 						sum += d.dot(d)
 					}
@@ -516,7 +460,7 @@ func TestEvaluation(t *testing.T) {
 			code: `
 				cstruct V    { x, y, z: f64 }
 				cstruct Ball { c: V, r: f64 }
-				fun make_balls() = [
+				make_balls() = [
 					Ball(V(1.0, 2.0, 3.0), 9.0),
 					Ball(V(4.0, 5.0, 6.0), 8.0),
 				]
@@ -541,10 +485,10 @@ func TestEvaluation(t *testing.T) {
 			// through the FMA so `p.dot(p)` resolves.
 			code: `
 				cstruct V { x, y, z: f64 }
-				fun V.add(o: V)  = V(self.x+o.x, self.y+o.y, self.z+o.z)
-				fun V.scale(s)   = V(self.x*s, self.y*s, self.z*s)
-				fun V.dot(o: V)  = self.x*o.x + self.y*o.y + self.z*o.z
-				fun at(ro as V, rd as V, t) = ro + rd * t
+				V.add(self, o: V) = V(self.x+o.x, self.y+o.y, self.z+o.z)
+				V.scale(self, s) = V(self.x*s, self.y*s, self.z*s)
+				V.dot(self, o: V) = self.x*o.x + self.y*o.y + self.z*o.z
+				at(ro: V, rd: V, t) = ro + rd * t
 				main = {
 					p = at(V(1.0,2.0,3.0), V(1.0,0.0,0.0), 2.0)
 					println(p.dot(p))
@@ -562,12 +506,12 @@ func TestEvaluation(t *testing.T) {
 			// a trailing `if` statement must yield its arm's value (not 0).
 			code: `
 				cstruct V { x, y, z: f64 }
-				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
-				fun pick_expr(a as V, f) = if f > 0.0 { a * 2.0 } else { a }
-				fun pick_stmt(a as V, f) {
+				V.scale(self, s) = V(self.x*s, self.y*s, self.z*s)
+				pick_expr(a: V, f) = if f > 0.0 { a * 2.0 } else { a }
+				pick_stmt(a: V, f) = {
 					if f > 0.0 { a * 2.0 } else { a }
 				}
-				fun pick_local(a as V, f) {
+				pick_local(a: V, f) = {
 					r = if f > 0.0 { a * 2.0 } else { a }
 					r
 				}
@@ -591,8 +535,8 @@ func TestEvaluation(t *testing.T) {
 			// codegen fails with "undefined variable".
 			code: `
 				g_buf := 0.0
-				fun fill(flag) {
-					for i in 0..<4 {
+				fill(flag) = {
+					@ i in 0..<4 {
 						if flag > 0.5 {
 							write_u32(g_buf, i, 7.0)
 						}
@@ -613,7 +557,7 @@ func TestEvaluation(t *testing.T) {
 			// A bare `if`/`else` as a function's last statement is the function's
 			// value (it must not fall through to 0).
 			code: `
-				fun classify(x) {
+				classify(x) = {
 					y = x + 1.0
 					if y > 10.0 { y * 2.0 } elif y > 5.0 { y } else { 0.0 }
 				}
@@ -635,9 +579,9 @@ func TestEvaluation(t *testing.T) {
 			code: `
 				cstruct V { x, y, z: f64 }
 				cstruct Ball { c: V, r: f64 }
-				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
-				fun mk(a as V) = V(a.x+1.0, a.y, a.z)
-				fun mkball() = Ball(V(3.0, 4.0, 5.0), 9.0)
+				V.scale(self, s) = V(self.x*s, self.y*s, self.z*s)
+				mk(a: V) = V(a.x+1.0, a.y, a.z)
+				mkball() = Ball(V(3.0, 4.0, 5.0), 9.0)
 				main = {
 					println(mk(V(1.0, 2.0, 3.0)).x)
 					a := V(2.0, 3.0, 4.0)
@@ -650,32 +594,6 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "ternary_conditional_operator",
-			// `cond ? a : b` lowers to the if-expression MatchExpr. Covers nesting
-			// (right-associative), cstruct-valued arms, and coexistence with map
-			// literals and the `?b` bit-test inside the same block.
-			code: `
-				cstruct V { x, y, z: f64 }
-				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
-				fun sign(x) = x > 0.0 ? 1.0 : (x < 0.0 ? -1.0 : 0.0)
-				fun pick(a as V, f) = f > 0.5 ? a.scale(2.0) : a
-				main = {
-					println(sign(7.0))
-					println(sign(-2.0))
-					println(sign(0.0))
-					p = pick(V(1.0, 2.0, 3.0), 1.0)
-					println(p.x)
-					q = pick(V(1.0, 2.0, 3.0), 0.0)
-					println(q.z)
-					m = { a: 5, b: 6 }
-					println(m.a)
-					println(12.0 ?b 2.0)
-				}
-			`,
-			expectedOutput: "1\n-1\n0\n2\n3\n5\n1\n",
-			expectCompile:  true,
-		},
-		{
 			name: "neon_vec3_elementwise_and_scale",
 			// The NEON fast path for 3×f64 cstruct constructors must produce exactly
 			// the same values as the scalar path for element-wise +/-/* and scalar
@@ -684,11 +602,11 @@ func TestEvaluation(t *testing.T) {
 			code: `
 				cstruct V { x, y, z: f64 }
 				cstruct P { a: f64, v: V, b: f64 }
-				fun V.add(o: V) = V(self.x+o.x, self.y+o.y, self.z+o.z)
-				fun V.sub(o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
-				fun V.mul(o: V) = V(self.x*o.x, self.y*o.y, self.z*o.z)
-				fun V.scl(s)    = V(self.x*s, self.y*s, self.z*s)
-				fun V.scl2(s)   = V(s*self.x, s*self.y, s*self.z)
+				V.add(self, o: V) = V(self.x+o.x, self.y+o.y, self.z+o.z)
+				V.sub(self, o: V) = V(self.x-o.x, self.y-o.y, self.z-o.z)
+				V.mul(self, o: V) = V(self.x*o.x, self.y*o.y, self.z*o.z)
+				V.scl(self, s) = V(self.x*s, self.y*s, self.z*s)
+				V.scl2(self, s) = V(s*self.x, s*self.y, s*self.z)
 				main = {
 					a := V(1.0, 2.0, 3.0)
 					b := V(10.0, 20.0, 30.0)
@@ -718,7 +636,7 @@ func TestEvaluation(t *testing.T) {
 			// the basis of the metaballs' multi-process renderer.
 			code: `
 				import libc as c
-				cstruct Buf { v as uint32 }
+				cstruct Buf { v: uint32 }
 				main = {
 					buf = mmap(0, 64, 3, 4097, -1, 0) or! { exitf("mmap\n") }
 					write_u32(buf, 0, 42)
@@ -742,11 +660,11 @@ func TestEvaluation(t *testing.T) {
 			// scalarized (no allocation). Exercises multi-level inlining collapsing
 			// to a constructor, plus a struct local read inside a loop.
 			code: `
-				cstruct V { x as float64, y as float64, z as float64 }
-				vadd   = (a as V, b as V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
-				vscale = (a as V, s) -> V(a.x*s, a.y*s, a.z*s)
-				at     = (ro as V, rd as V, t) -> vadd(ro, vscale(rd, t))
-				fun fieldlike(ro as V, rd as V, t) {
+				cstruct V { x: float64, y: float64, z: float64 }
+				vadd   = (a: V, b: V) -> V(a.x+b.x, a.y+b.y, a.z+b.z)
+				vscale = (a: V, s) -> V(a.x*s, a.y*s, a.z*s)
+				at     = (ro: V, rd: V, t) -> vadd(ro, vscale(rd, t))
+				fieldlike(ro: V, rd: V, t) = {
 					p = at(ro, rd, t)
 					sum := 0.0
 					@ i in 0..<3 {
@@ -812,7 +730,7 @@ func TestEvaluation(t *testing.T) {
 				countdown = (n) -> {
 					total := 0.0
 					@ i in 0..<100 {
-						i >= n { ret @ }
+						i >= n { break }
 						total <- total + 1.0
 					}
 					total
@@ -846,38 +764,6 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "with_block_prepends_subject",
-			// `with <subj> { f(); g(x) }` prepends subj as the first argument of
-			// each direct call statement in the body, so f(5) becomes f(subj, 5).
-			code: `
-				show = (subj, n) -> println(subj + n)
-				main = {
-					with 100.0 {
-						show(5.0)
-						show(7.0)
-					}
-				}
-			`,
-			expectedOutput: "105\n107\n",
-			expectCompile:  true,
-		},
-		{
-			name: "with_block_identifier_subject_zero_arg",
-			// The subject can be an identifier and the body calls can be zero-arg;
-			// `emit()` inside `with base` becomes `emit(base)`.
-			code: `
-				emit = (tag) -> println(tag)
-				main = {
-					base = 42.0
-					with base {
-						emit()
-					}
-				}
-			`,
-			expectedOutput: "42\n",
-			expectCompile:  true,
-		},
-		{
 			name: "variable_named_c_shadows_cffi_namespace",
 			// A local variable named `c` (or `C`) must shadow the always-registered
 			// C-FFI namespace, so `c.x` is a struct-field access — not a `c.`
@@ -901,8 +787,8 @@ func TestEvaluation(t *testing.T) {
 			// function, and `recv.method(...).field` chained on a method result.
 			code: `
 				cstruct V { x: float64, y: float64, z: float64 }
-				fun V.dot(o: V) = self.x*o.x + self.y*o.y + self.z*o.z
-				fun V.scale(s) = V(self.x*s, self.y*s, self.z*s)
+				V.dot(self, o: V) = self.x*o.x + self.y*o.y + self.z*o.z
+				V.scale(self, s) = V(self.x*s, self.y*s, self.z*s)
 				mk = (a) -> V(a, a*2.0, a*3.0)
 				main = {
 					a = V(1.0, 2.0, 3.0)
@@ -924,13 +810,13 @@ func TestEvaluation(t *testing.T) {
 			// fresh shadow slot (which used to make only the first step "stick").
 			code: `
 				main = {
-					acc = 0.0
-					for i in 1..=5 { acc = acc + i }
-					lo = 0.0
-					hi = 10.0
-					for k in 0..<6 {
+					acc := 0.0
+					@ i in 1..=5 { acc <- acc + i }
+					lo := 0.0
+					hi := 10.0
+					@ k in 0..<6 {
 						m = 0.5 * (lo + hi)
-						if m < 5.0 { lo = m } else { hi = m }
+						if m < 5.0 { lo <- m } else { hi <- m }
 					}
 					println(acc)
 					println(lo + hi)
@@ -1052,7 +938,7 @@ func TestDiagnosticsNotNoisy(t *testing.T) {
 	if !strings.Contains(msg, "undefined variable 'veloctiy'") {
 		t.Errorf("expected an 'undefined variable' message, got: %q", msg)
 	}
-	if !strings.Contains(msg, "Did you mean: velocity?") {
+	if !strings.Contains(msg, "did you mean 'velocity'?") {
 		t.Errorf("expected a 'Did you mean' suggestion for a near name, got: %q", msg)
 	}
 }

@@ -594,22 +594,6 @@ func (o *Out) Cld() {
 	}
 }
 
-// RepMovsb repeats movsb rcx times (copies rcx bytes from rsi to rdi)
-func (o *Out) RepMovsb() {
-	switch o.target.Arch() {
-	case ArchX86_64:
-		o.Write(0xF3) // REP prefix
-		o.Write(0xA4) // MOVSB
-	case ArchARM64:
-		// ARM64: implement with a loop or memcpy call
-		// For now, just panic - this shouldn't be called for ARM64
-		compilerError("RepMovsb not implemented for ARM64")
-	case ArchRiscv64:
-		// RISC-V: implement with a loop or memcpy call
-		compilerError("RepMovsb not implemented for RISC-V")
-	}
-}
-
 // BtRegReg performs bit test: BT reg1, reg2 (test bit reg2 in reg1, sets CF)
 func (o *Out) BtRegReg(reg1, reg2 string) {
 	switch o.target.Arch() {

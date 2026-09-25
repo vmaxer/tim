@@ -164,20 +164,3 @@ func (sa *SIMDAnalyzer) hasVectorizableOperations(ops []string) bool {
 
 	return false
 }
-
-// PrintAnalysis prints loop analysis for debugging
-func (info *LoopVectorizationInfo) Print() {
-	fmt.Println("=== Loop Vectorization Analysis ===")
-	fmt.Printf("Iterator: %s\n", info.Iterator)
-	fmt.Printf("Can Vectorize: %v\n", info.CanVectorize)
-	fmt.Printf("Reason: %s\n", info.Reason)
-	fmt.Printf("Vector Width: %d elements\n", info.VectorWidth)
-	fmt.Printf("Is Parallel: %v\n", info.IsParallel)
-	fmt.Printf("Has Dependencies: %v\n", info.HasDependencies)
-	if len(info.MemoryAccesses) > 0 {
-		fmt.Printf("Memory Accesses: %v\n", info.MemoryAccesses)
-	}
-	if len(info.Operations) > 0 {
-		fmt.Printf("Operations: %v\n", info.Operations)
-	}
-}

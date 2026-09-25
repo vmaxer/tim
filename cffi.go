@@ -280,11 +280,6 @@ func parseHeaderFileWithDepth(headerPath string, constants *CHeaderConstants, vi
 	return parseIncludesWithDepth(headerPath, constants, visited, depth)
 }
 
-// parseIncludes recursively parses #include directives
-func parseIncludes(headerPath string, constants *CHeaderConstants, visited map[string]bool) error {
-	return parseIncludesWithDepth(headerPath, constants, visited, 0)
-}
-
 func parseIncludesWithDepth(headerPath string, constants *CHeaderConstants, visited map[string]bool, depth int) error {
 	file, err := os.Open(headerPath)
 	if err != nil {

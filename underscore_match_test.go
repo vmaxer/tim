@@ -18,7 +18,7 @@ func TestUnderscoreDefaultMatch(t *testing.T) {
 x {
     0 => println("zero")
     5 => println("five")
-    _ => println("other")
+    ~> println("other")
 }
 `,
 			expected: "other\n",
@@ -29,7 +29,7 @@ x {
 y := 3
 x == y {
     => println("equal")
-    _ => println("not equal")
+    ~> println("not equal")
 }
 `,
 			expected: "not equal\n",
@@ -43,7 +43,7 @@ x {
 }
 x {
     0 => println("zero")
-    _ => println("underscore default")
+    ~> println("underscore default")
 }
 `,
 			expected: "tilde default\nunderscore default\n",

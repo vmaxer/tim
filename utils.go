@@ -82,11 +82,13 @@ func findSimilarIdentifiers(name string, availableVars map[string]int, maxSugges
 	}
 
 	var suggestions []suggestion
-	threshold := 3 // Maximum edit distance for suggestions
+	// Allow about one edit per three characters, so short names only match
+	// near-identical ones.
+	threshold := min(3, (len(name)+1)/3)
 
 	for varName := range availableVars {
 		dist := levenshteinDistance(name, varName)
-		if dist <= threshold && dist > 0 {
+		if dist <= threshold && dist > 0 && dist < len(varName) {
 			suggestions = append(suggestions, suggestion{varName, dist})
 		}
 	}
@@ -105,43 +107,6 @@ func findSimilarIdentifiers(name string, availableVars map[string]int, maxSugges
 		result = append(result, suggestions[i].name)
 	}
 	return result
-}
-
-// isUppercase checks if an identifier is all uppercase (constant naming convention)
-func isUppercase(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for _, ch := range s {
-		if ch >= 'a' && ch <= 'z' {
-			return false
-		}
-	}
-	return true
-}
-
-func isAllUppercase(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for _, ch := range s {
-		if ch >= 'a' && ch <= 'z' {
-			return false
-		}
-		if ch >= 'A' && ch <= 'Z' {
-			continue
-		}
-		if ch >= '0' && ch <= '9' {
-			continue
-		}
-		if ch == '_' {
-			continue
-		}
-		return false
-	}
-	// Must start with uppercase letter
-	firstCh := rune(s[0])
-	return firstCh >= 'A' && firstCh <= 'Z'
 }
 
 // deriveAliasFromSource extracts a suitable alias from an import source

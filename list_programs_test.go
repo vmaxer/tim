@@ -167,12 +167,12 @@ println(#ys)
 // Confidence that this function is working: 95%
 func TestPopMethod(t *testing.T) {
 	source := `xs := [1, 2, 3, 4]
-new_list, popped_value = xs.pop()
-println(new_list[0])
-println(new_list[1])
-println(new_list[2])
+popped_value = xs.pop()
+println(xs[0])
+println(xs[1])
+println(xs[2])
 println(popped_value)
-println(#new_list)
+println(#xs)
 `
 	testInlineTim(t, "pop_method", source, "1\n2\n3\n4\n3\n")
 }
@@ -181,11 +181,11 @@ println(#new_list)
 // Confidence that this function is working: 95%
 func TestPopFunction(t *testing.T) {
 	source := `xs := [10, 20, 30]
-new_list, popped = pop(xs)
-println(new_list[0])
-println(new_list[1])
+popped = pop(xs)
+println(xs[0])
+println(xs[1])
 println(popped)
-println(#new_list)
+println(#xs)
 `
 	testInlineTim(t, "pop_function", source, "10\n20\n30\n2\n")
 }

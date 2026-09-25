@@ -1,0 +1,47 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Install qemu and the arm64 C library
+        run: sudo apt-get update && sudo apt-get install -y qemu-user libc6-arm64-cross
+      - run: go vet ./...
+      - run: go test ./...
+
+  runtime:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install clang and lld
+        run: sudo apt-get update && sudo apt-get install -y clang lld llvm
+      - name: Test the runtime natively
+        working-directory: runtime
+        run: |
+          clang -O1 -fno-builtin -fno-math-errno -w test/harness.c -o /tmp/harness && /tmp/harness
+          clang -O1 -fno-builtin -fno-math-errno -w test/gc.c -o /tmp/gc && /tmp/gc
+      - name: Build the runtime blobs
+        run: sh runtime/build.sh
+
+  native:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-2022, windows-11-arm]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - run: go build ./...
+      - name: Core programs
+        run: go test -count=1 -run TestCorePrograms -v .

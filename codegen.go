@@ -19,12 +19,9 @@ import (
 
 // codegen.go - Tim Code Generator
 //
-// This code generator is the authoritative implementation of LANGUAGESPEC.md v1.5.0.
+// This is the legacy code generator, used for programs the core (core.go) does not handle yet.
 // It transforms parsed AST into x86_64 assembly and ELF executables.
 //
-// Stability Commitment:
-// This code generator implements all LANGUAGESPEC.md v1.5.0 features. Future work
-// focuses on bug fixes, optimizations, and additional target architectures only.
 //
 // Current Target Support:
 // - x86_64 Linux (complete, production-ready)
@@ -99,7 +96,6 @@ type TimCompiler struct {
 	lambdaCounter        int                           // Counter for unique lambda function names
 	activeLoops          []LoopInfo                    // Stack of active loops (for @N jump resolution)
 	lambdaFuncs          []LambdaFunc                  // List of lambda functions to generate
-	patternLambdaFuncs   []PatternLambdaFunc           // List of pattern lambda functions to generate
 	lambdaOffsets        map[string]int                // Lambda name -> offset in .text
 	currentLambda        *LambdaFunc                   // Currently compiling lambda (for "me" self-reference)
 	lambdaBodyStart      int                           // Offset where lambda body starts (for tail recursion)
@@ -177,11 +173,6 @@ type LambdaFunc struct {
 	// heap cell pointer (shared with the enclosing scope) instead of a value, so
 	// `<-` updates in the closure persist and are visible across calls.
 	BoxedCaptures map[string]bool
-}
-
-type PatternLambdaFunc struct {
-	Name    string
-	Clauses []*PatternClause
 }
 
 // nextLabel generates a unique label name
@@ -719,10 +710,6 @@ func (fc *TimCompiler) trackDependenciesInExpr(expr Expression) {
 		}
 		if e.DefaultExpr != nil {
 			fc.trackDependenciesInExpr(e.DefaultExpr)
-		}
-	case *LoopExpr:
-		for _, stmt := range e.Body {
-			fc.trackDependenciesInStatement(stmt)
 		}
 	case *ListExpr:
 		for _, elem := range e.Elements {
@@ -1571,32 +1558,6 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 		}
 		fc.stackOffset = baseOffset
 
-	case *ReceiveLoopStmt:
-		baseOffset := fc.stackOffset
-
-		if s.BaseOffset == 0 {
-			s.BaseOffset = baseOffset
-		}
-
-		// Allocate stack space for:
-		// - message variable (8 bytes) at baseOffset+8
-		// - sender variable (8 bytes) at baseOffset+16
-		// - socket fd (8 bytes) at baseOffset+24
-		// - sockaddr_in (16 bytes) at baseOffset+40 (with padding to avoid overlap)
-		// - buffer (256 bytes) starting at baseOffset+56
-		// - addrlen (8 bytes) at baseOffset+320
-		// Total: 320 bytes
-		fc.updateStackOffset(320)
-
-		for _, bodyStmt := range s.Body {
-			if err := fc.collectSymbols(bodyStmt); err != nil {
-				return err
-			}
-		}
-
-		// Restore stackOffset after loop body
-		fc.stackOffset = baseOffset
-
 	case *ArenaStmt:
 		// Track arena depth during symbol collection
 		// This ensures alloc() calls are validated correctly
@@ -1614,13 +1575,6 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 
 		// Restore arena depth
 		fc.currentArena = previousArena
-	case *WithStmt:
-		// Transparent block: collect symbols from the (already-injected) body.
-		for _, bodyStmt := range s.Body {
-			if err := fc.collectSymbols(bodyStmt); err != nil {
-				return err
-			}
-		}
 	case *CStructDecl:
 		// Cstruct declarations don't allocate runtime stack space, but we must
 		// register the (layout-computed) declaration so value constructors
@@ -1701,7 +1655,7 @@ func (fc *TimCompiler) isExpressionPure(expr Expression, pureFunctions map[strin
 		return fc.isExpressionPure(e.Operand, pureFunctions)
 	case *InExpr:
 		return fc.isExpressionPure(e.Value, pureFunctions) && fc.isExpressionPure(e.Container, pureFunctions)
-	case *LoopExpr, *BlockExpr:
+	case *BlockExpr:
 		return false
 	default:
 		return false
@@ -1990,133 +1944,14 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 	case *IfStmt:
 		fc.compileIfStatement(s)
 
-	case *ReceiveLoopStmt:
-		fc.compileReceiveLoopStmt(s)
-
 	case *JumpStmt:
 		fc.compileJumpStatement(s)
 
 	case *ExpressionStmt:
-		// Handle PostfixExpr as a statement (like Go)
-		if postfix, ok := s.Expr.(*PostfixExpr); ok {
-			// x++ and x-- are statements only, not expressions
-			identExpr, ok := postfix.Operand.(*IdentExpr)
-			if !ok {
-				compilerError("postfix operator %s requires a variable operand", postfix.Operator)
-			}
-
-			// Check if it's a global variable
-			if _, isGlobal := fc.globalVars[identExpr.Name]; isGlobal {
-				// Check if variable is mutable
-				if !fc.globalVarsMutable[identExpr.Name] {
-					compilerError("cannot modify immutable variable '%s'", identExpr.Name)
-				}
-
-				// Load global variable address into rax
-				fc.out.LeaSymbolToReg("rax", "_global_"+identExpr.Name)
-				// Load current value into xmm0
-				fc.out.MovMemToXmm("xmm0", "rax", 0)
-
-				// Create 1.0 constant
-				labelName := fmt.Sprintf("one_%d", fc.stringCounter)
-				fc.stringCounter++
-
-				one := 1.0
-				bits := uint64(0)
-				*(*float64)(unsafe.Pointer(&bits)) = one
-				var floatData []byte
-				for i := range 8 {
-					floatData = append(floatData, byte((bits>>(i*8))&ByteMask))
-				}
-				fc.eb.Define(labelName, string(floatData))
-
-				// Load 1.0 into xmm1
-				fc.out.LeaSymbolToReg("rbx", labelName)
-				fc.out.MovMemToXmm("xmm1", "rbx", 0)
-
-				// Apply the operation
-				switch postfix.Operator {
-				case "++":
-					fc.emitNumBinop("+")
-				case "--":
-					fc.emitNumBinop("-")
-				default:
-					compilerError("unknown postfix operator '%s'", postfix.Operator)
-				}
-
-				// Store the modified value back to the global variable
-				fc.out.LeaSymbolToReg("rax", "_global_"+identExpr.Name)
-				fc.out.MovXmmToMem("xmm0", "rax", 0)
-			} else {
-				// Local variable handling
-				// Get the variable's stack offset
-				offset, exists := fc.variables[identExpr.Name]
-				if !exists {
-					suggestions := findSimilarIdentifiers(identExpr.Name, fc.variables, 3)
-					if len(suggestions) > 0 {
-						compilerError("undefined variable '%s'. Did you mean: %s?", identExpr.Name, strings.Join(suggestions, ", "))
-					} else {
-						compilerError("undefined variable '%s'", identExpr.Name)
-					}
-				}
-
-				// Check if variable is mutable
-				if !fc.mutableVars[identExpr.Name] {
-					compilerError("cannot modify immutable variable '%s'", identExpr.Name)
-				}
-
-				// Use r11 for parent variables, rbp for local
-				baseReg := "rbp"
-				if fc.parentVariables != nil && fc.parentVariables[identExpr.Name] {
-					baseReg = "r11"
-				}
-
-				// Load current value into xmm0
-				fc.out.MovMemToXmm("xmm0", baseReg, -offset)
-
-				// Create 1.0 constant
-				labelName := fmt.Sprintf("one_%d", fc.stringCounter)
-				fc.stringCounter++
-
-				one := 1.0
-				bits := uint64(0)
-				*(*float64)(unsafe.Pointer(&bits)) = one
-				var floatData []byte
-				for i := range 8 {
-					floatData = append(floatData, byte((bits>>(i*8))&ByteMask))
-				}
-				fc.eb.Define(labelName, string(floatData))
-
-				// Load 1.0 into xmm1
-				fc.out.LeaSymbolToReg("rax", labelName)
-				fc.out.MovMemToXmm("xmm1", "rax", 0)
-
-				// Apply the operation
-				switch postfix.Operator {
-				case "++":
-					fc.emitNumBinop("+")
-				case "--":
-					fc.emitNumBinop("-")
-				default:
-					compilerError("unknown postfix operator '%s'", postfix.Operator)
-				}
-
-				// Store the modified value back to the variable
-				fc.out.MovXmmToMem("xmm0", baseReg, -offset)
-			}
-		} else {
-			fc.compileExpression(s.Expr)
-		}
+		fc.compileExpression(s.Expr)
 
 	case *ArenaStmt:
 		fc.compileArenaStmt(s)
-
-	case *WithStmt:
-		// Transparent block: subject already injected into body calls at parse
-		// time, so just emit the body statements in order.
-		for _, bodyStmt := range s.Body {
-			fc.compileStatement(bodyStmt)
-		}
 
 	case *DeferStmt:
 		if len(fc.deferredExprs) == 0 {
@@ -2124,9 +1959,6 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 		}
 		currentScope := len(fc.deferredExprs) - 1
 		fc.deferredExprs[currentScope] = append(fc.deferredExprs[currentScope], s.Call)
-
-	case *SpawnStmt:
-		fc.compileSpawnStmt(s)
 
 	case *CStructDecl:
 		// Cstruct declarations generate no runtime code
@@ -2288,59 +2120,6 @@ func (fc *TimCompiler) compileArenaExpr(expr *ArenaExpr) {
 	}
 
 	// Result is already in xmm0 from the last statement
-}
-
-func (fc *TimCompiler) compileSpawnStmt(stmt *SpawnStmt) {
-	// Call fork() syscall (57 on x86-64 Linux)
-	// Returns: child gets 0 in rax, parent gets child PID in rax
-	fc.out.MovImmToReg("rax", "57") // fork syscall number
-	fc.out.Syscall()
-
-	// Test if we're in child or parent
-	// If rax == 0, we're in child
-	fc.out.TestRegReg("rax", "rax")
-
-	// Jump to child code if rax == 0 (we're in child)
-	childJumpPos := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0) // Placeholder, will patch
-
-	// Parent path: just continue execution
-	// (child PID is in rax, but we don't use it for fire-and-forget)
-	if stmt.Block != nil {
-		// Note: Pipe-based result waiting from child processes is a future enhancement
-		compilerError("pipe syntax (| params | block) not yet implemented - use simple syntax for now")
-	}
-
-	// Jump over child code
-	parentJumpPos := fc.eb.text.Len()
-	fc.out.JumpUnconditional(0) // Placeholder
-
-	// Child path: execute expression and exit
-	childStartPos := fc.eb.text.Len()
-
-	// Patch the jump to child
-	childOffset := int32(childStartPos - (childJumpPos + ConditionalJumpSize))
-	fc.patchJumpImmediate(childJumpPos+2, childOffset)
-
-	// Execute the timped expression
-	fc.compileExpression(stmt.Expr)
-
-	// Flush all output streams before exiting
-	// Call fflush(NULL) to flush all streams
-	fc.out.MovImmToReg("rdi", "0") // NULL = 0
-	fc.callFunction("fflush", "")
-
-	// Exit child process with status 0
-	fc.out.MovImmToReg("rax", "60") // exit syscall number
-	fc.out.MovImmToReg("rdi", "0")  // exit status 0
-	fc.out.Syscall()
-
-	// Parent continues here
-	parentContinuePos := fc.eb.text.Len()
-
-	// Patch the parent jump
-	parentOffset := int32(parentContinuePos - (parentJumpPos + UnconditionalJumpSize))
-	fc.patchJumpImmediate(parentJumpPos+1, parentOffset)
 }
 
 func (fc *TimCompiler) compileLoopStatement(stmt *LoopStmt) {
@@ -2813,188 +2592,6 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 	fc.activeLoops = fc.activeLoops[:len(fc.activeLoops)-1]
 }
 
-// emitVectorizedBinaryOpLoop emits SIMD code for: result[i] = a[i] OP b[i]
-func (fc *TimCompiler) emitVectorizedBinaryOpLoop(stmt *LoopStmt, rangeExpr *RangeExpr,
-	resultName, leftArrayName, rightArrayName string, operator string, vectorWidth int) {
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "SIMD: Emitting vectorized loop: %s = %s[i] %s %s[i] (width=%d)\n",
-			resultName, leftArrayName, operator, rightArrayName, vectorWidth)
-	}
-
-	// Get array pointers from variables map
-	// Extract base name from result (might be "result[i]" -> "result")
-	resultBase := strings.Split(resultName, "[")[0]
-	resultOffset, resultExists := fc.variables[resultBase]
-	leftOffset, leftExists := fc.variables[leftArrayName]
-	rightOffset, rightExists := fc.variables[rightArrayName]
-
-	if !resultExists || !leftExists || !rightExists {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "SIMD: Cannot find array variables in symbol table\n")
-			fmt.Fprintf(os.Stderr, "SIMD:   result=%s exists=%v, left=%s exists=%v, right=%s exists=%v\n",
-				resultBase, resultExists, leftArrayName, leftExists, rightArrayName, rightExists)
-		}
-		return
-	}
-
-	// Evaluate and store range start and end
-	fc.compileExpression(rangeExpr.Start)
-	fc.emitNumToI64()
-	fc.out.MovRegToReg("rbx", "rax") // rbx = loop counter (start)
-
-	fc.compileExpression(rangeExpr.End)
-	fc.emitNumToI64()
-	fc.out.MovRegToReg("r12", "rax") // r12 = loop limit (end)
-	if rangeExpr.Inclusive {
-		fc.out.IncReg("r12")
-	}
-
-	// Load array base pointers into registers
-	// Arrays are stored as pointers on the stack
-	fc.out.MovMemToReg("rdi", "rbp", -resultOffset) // rdi = result array ptr
-	fc.out.MovMemToReg("rsi", "rbp", -leftOffset)   // rsi = left array ptr
-	fc.out.MovMemToReg("rdx", "rbp", -rightOffset)  // rdx = right array ptr
-
-	// Determine register type based on vector width
-	var regPrefix string
-	if vectorWidth == 8 {
-		regPrefix = "zmm" // AVX-512: 512-bit (8 doubles)
-	} else if vectorWidth == 4 {
-		regPrefix = "ymm" // AVX/AVX2: 256-bit (4 doubles)
-	} else {
-		regPrefix = "xmm" // SSE: 128-bit (2 doubles)
-	}
-
-	// ===== VECTOR LOOP =====
-	// Process vectorWidth elements per iteration
-	vecLoopStart := fc.eb.text.Len()
-
-	// Check if we have at least vectorWidth elements remaining
-	fc.out.MovRegToReg("rax", "r12")
-	fc.out.SubRegFromReg("rax", "rbx") // rax = limit - counter (remaining)
-	fc.out.CmpRegToImm("rax", int64(vectorWidth))
-
-	// Jump to cleanup if remaining < vectorWidth
-	cleanupJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpLess, 0) // Placeholder, will patch later
-
-	// Load vectorWidth doubles from left array: reg0 = left[rbx:rbx+vectorWidth]
-	// Offset = rbx * 8 (8 bytes per double)
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)     // r10 = rbx * 8
-	fc.out.AddRegToReg("r10", "rsi") // r10 = &left[rbx]
-	fc.out.VMovupdLoadFromMem(regPrefix+"0", "r10", 0)
-
-	// Load vectorWidth doubles from right array: reg1 = right[rbx:rbx+vectorWidth]
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)
-	fc.out.AddRegToReg("r10", "rdx") // r10 = &right[rbx]
-	fc.out.VMovupdLoadFromMem(regPrefix+"1", "r10", 0)
-
-	// Vector operation: reg0 = reg0 OP reg1
-	switch operator {
-	case "+":
-		fc.out.VAddPDVectorToVector(regPrefix+"0", regPrefix+"0", regPrefix+"1")
-	case "-":
-		fc.out.VSubPDVectorToVector(regPrefix+"0", regPrefix+"0", regPrefix+"1")
-	case "*":
-		fc.out.VMulPDVectorToVector(regPrefix+"0", regPrefix+"0", regPrefix+"1")
-	}
-
-	// Store result: result[rbx:rbx+vectorWidth] = reg0
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)
-	fc.out.AddRegToReg("r10", "rdi") // r10 = &result[rbx]
-	fc.out.VMovupdStoreToMem(regPrefix+"0", "r10", 0)
-
-	// Increment counter by vectorWidth
-	fc.out.AddImmToReg("rbx", int64(vectorWidth))
-
-	// Jump back to vector loop start
-	vecLoopEnd := fc.eb.text.Len()
-	offset := vecLoopStart - vecLoopEnd - 2
-	fc.out.JumpUnconditional(int32(offset))
-
-	// ===== CLEANUP LOOP =====
-	// Process remaining elements one by one
-	cleanupStart := fc.eb.text.Len()
-
-	// Patch the earlier jump to cleanup
-	cleanupJumpTarget := cleanupStart - cleanupJump - 6
-	fc.patchJump(cleanupJump, cleanupJumpTarget)
-
-	// Check if counter >= limit
-	cleanupLoopStart := fc.eb.text.Len()
-	fc.out.CmpRegToReg("rbx", "r12")
-
-	// Jump to done if rbx >= r12
-	doneJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0) // Placeholder, will patch later
-
-	// Load one element from left: xmm0 = left[rbx]
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)
-	fc.out.AddRegToReg("r10", "rsi")
-	// Load scalar double (use SSE2 movsd)
-	fc.out.Emit([]byte{0xF2, 0x41, 0x0F, 0x10, 0x02}) // movsd xmm0, [r10]
-
-	// Load one element from right: xmm1 = right[rbx]
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)
-	fc.out.AddRegToReg("r10", "rdx")
-	fc.out.Emit([]byte{0xF2, 0x41, 0x0F, 0x10, 0x0A}) // movsd xmm1, [r10]
-
-	// Scalar operation: xmm0 = xmm0 OP xmm1
-	switch operator {
-	case "+":
-		fc.out.Emit([]byte{0xF2, 0x0F, 0x58, 0xC1}) // addsd xmm0, xmm1
-	case "-":
-		fc.out.Emit([]byte{0xF2, 0x0F, 0x5C, 0xC1}) // subsd xmm0, xmm1
-	case "*":
-		fc.out.Emit([]byte{0xF2, 0x0F, 0x59, 0xC1}) // mulsd xmm0, xmm1
-	}
-
-	// Store result: result[rbx] = xmm0
-	fc.out.MovRegToReg("r10", "rbx")
-	fc.out.ShlRegByImm("r10", 3)
-	fc.out.AddRegToReg("r10", "rdi")
-	fc.out.Emit([]byte{0xF2, 0x41, 0x0F, 0x11, 0x02}) // movsd [r10], xmm0
-
-	// Increment counter
-	fc.out.IncReg("rbx")
-
-	// Jump back to cleanup loop start
-	cleanupLoopEnd := fc.eb.text.Len()
-	cleanupOffset := cleanupLoopStart - cleanupLoopEnd - 2
-	fc.out.JumpUnconditional(int32(cleanupOffset))
-
-	// ===== DONE =====
-	doneStart := fc.eb.text.Len()
-
-	// Patch the jump to done
-	doneJumpTarget := doneStart - doneJump - 6
-	fc.patchJump(doneJump, doneJumpTarget)
-
-	// Clean up AVX state
-	fc.out.VZeroUpper()
-
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "SIMD: Successfully emitted vectorized loop\n")
-	}
-}
-
-// patchJump patches a conditional jump with the correct offset
-func (fc *TimCompiler) patchJump(jumpPos int, offset int) {
-	// For conditional jumps, the offset is encoded as a 32-bit signed integer
-	// Get the raw bytes from the buffer
-	textBytes := fc.eb.text.Bytes()
-	textBytes[jumpPos+2] = byte(offset & 0xFF)
-	textBytes[jumpPos+3] = byte((offset >> 8) & 0xFF)
-	textBytes[jumpPos+4] = byte((offset >> 16) & 0xFF)
-	textBytes[jumpPos+5] = byte((offset >> 24) & 0xFF)
-}
-
 // collectLoopLocalVars scans the loop body and returns a map of variables defined inside it
 func collectLoopLocalVars(body []Statement) map[string]bool {
 	localVars := make(map[string]bool)
@@ -3016,71 +2613,6 @@ func collectLoopLocalVars(body []Statement) map[string]bool {
 
 	scanStatements(body)
 	return localVars
-}
-
-// hasAtomicOperations recursively checks if any atomic operations are used in statements
-func hasAtomicOperations(stmts []Statement) bool {
-	for _, stmt := range stmts {
-		switch s := stmt.(type) {
-		case *ExpressionStmt:
-			if hasAtomicInExpr(s.Expr) {
-				return true
-			}
-		case *AssignStmt:
-			if hasAtomicInExpr(s.Value) {
-				return true
-			}
-		case *LoopStmt:
-			if hasAtomicOperations(s.Body) {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// hasAtomicInExpr checks if an expression contains atomic operation calls
-func hasAtomicInExpr(expr Expression) bool {
-	if expr == nil {
-		return false
-	}
-
-	switch e := expr.(type) {
-	case *CallExpr:
-		// Check if this is an atomic operation
-		atomicOps := []string{"atomic_add", "atomic_load", "atomic_store", "atomic_cas"}
-		if slices.Contains(atomicOps, e.Function) {
-			return true
-		}
-		// Check arguments recursively
-		if slices.ContainsFunc(e.Args, hasAtomicInExpr) {
-			return true
-		}
-	case *BinaryExpr:
-		return hasAtomicInExpr(e.Left) || hasAtomicInExpr(e.Right)
-	case *UnaryExpr:
-		return hasAtomicInExpr(e.Operand)
-	case *MatchExpr:
-		// Check condition and all clauses
-		if hasAtomicInExpr(e.Condition) {
-			return true
-		}
-		for _, clause := range e.Clauses {
-			if hasAtomicInExpr(clause.Guard) || hasAtomicInExpr(clause.Result) {
-				return true
-			}
-		}
-		if hasAtomicInExpr(e.DefaultExpr) {
-			return true
-		}
-	case *BlockExpr:
-		// Check all statements in the block
-		return hasAtomicOperations(e.Statements)
-	case *LoopExpr:
-		// Check loop body
-		return hasAtomicOperations(e.Body)
-	}
-	return false
 }
 
 func (fc *TimCompiler) compileParallelRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
@@ -4658,25 +4190,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.out.MovMemToXmm("xmm0", baseReg, -offset)
 		}
 
-	case *MoveExpr:
-		// Compile the expression being moved (loads into xmm0)
-		fc.compileExpression(e.Expr)
-
-		// Mark variable as moved if it's an identifier
-		if ident, ok := e.Expr.(*IdentExpr); ok {
-			if fc.movedVars != nil {
-				if fc.movedVars[ident.Name] {
-					compilerError("variable '%s' was already moved", ident.Name)
-				}
-				fc.movedVars[ident.Name] = true
-				// Track in current scope for proper cleanup
-				if len(fc.scopedMoved) > 0 {
-					fc.scopedMoved[len(fc.scopedMoved)-1][ident.Name] = true
-				}
-			}
-		}
-		// Value is already in xmm0 from compileExpression call
-
 	case *NamespacedIdentExpr:
 		// Handle namespaced identifiers like sdl.SDL_INIT_VIDEO or data.field
 		// Check if this is a C constant
@@ -4727,100 +4240,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		}
 		fc.compileExpression(indexExpr)
 
-	case *LoopStateExpr:
-		// @first, @last, @counter, @i are special loop state variables
-		if len(fc.activeLoops) == 0 {
-			compilerError("@%s used outside of loop", e.Type)
-		}
-
-		currentLoop := fc.activeLoops[len(fc.activeLoops)-1]
-
-		switch e.Type {
-		case "first":
-			// @first: check if counter == 0
-			var counterOffset int
-			if currentLoop.IsRangeLoop {
-				counterOffset = currentLoop.IteratorOffset
-				// Load iterator as float, convert to int
-				fc.out.MovMemToXmm("xmm0", "rbp", -counterOffset)
-				fc.out.Cvttsd2si("rax", "xmm0")
-			} else {
-				counterOffset = currentLoop.IndexOffset
-				// Load index as integer
-				fc.out.MovMemToReg("rax", "rbp", -counterOffset)
-			}
-			// Compare with 0
-			fc.out.CmpRegToImm("rax", 0)
-			// Set rax to 1 if equal, 0 if not
-			fc.out.MovImmToReg("rax", "0")
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.Cmove("rax", "rcx") // rax = (counter == 0) ? 1 : 0
-			// Convert to float64
-			fc.out.Cvtsi2sd("xmm0", "rax")
-
-		case "last":
-			// @last: check if counter == upper_bound - 1
-			var counterOffset int
-			if currentLoop.IsRangeLoop {
-				counterOffset = currentLoop.IteratorOffset
-				// Load iterator as float, convert to int
-				fc.out.MovMemToXmm("xmm0", "rbp", -counterOffset)
-				fc.out.Cvttsd2si("rax", "xmm0")
-			} else {
-				counterOffset = currentLoop.IndexOffset
-				// Load index as integer
-				fc.out.MovMemToReg("rax", "rbp", -counterOffset)
-			}
-			// Load upper bound
-			fc.out.MovMemToReg("rdi", "rbp", -currentLoop.UpperBoundOffset)
-			// Subtract 1 from upper bound: rdi = upper_bound - 1
-			fc.out.SubImmFromReg("rdi", 1)
-			// Compare counter with upper_bound - 1
-			fc.out.CmpRegToReg("rax", "rdi")
-			// Set rax to 1 if equal, 0 if not
-			fc.out.MovImmToReg("rax", "0")
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.Cmove("rax", "rcx") // rax = (counter == upper_bound - 1) ? 1 : 0
-			// Convert to float64
-			fc.out.Cvtsi2sd("xmm0", "rax")
-
-		case "counter":
-			// @counter: return the iteration counter (starting at 0)
-			if currentLoop.IsRangeLoop {
-				// For range loops, iterator is the counter
-				fc.out.MovMemToXmm("xmm0", "rbp", -currentLoop.IteratorOffset)
-			} else {
-				// For list loops, index is the counter
-				fc.out.MovMemToReg("rax", "rbp", -currentLoop.IndexOffset)
-				fc.out.Cvtsi2sd("xmm0", "rax")
-			}
-
-		case "i":
-			// @i (level 0): current loop iterator
-			// @i1 (level 1): outermost loop iterator
-			// @i2 (level 2): second loop iterator, etc.
-
-			var targetLoop LoopInfo
-			if e.LoopLevel == 0 {
-				// @i means current loop
-				targetLoop = currentLoop
-			} else {
-				// @iN means loop at level N (1-indexed from outermost)
-				if e.LoopLevel > len(fc.activeLoops) {
-					compilerError("@i%d refers to loop level %d, but only %d loops active",
-						e.LoopLevel, e.LoopLevel, len(fc.activeLoops))
-				}
-				// activeLoops[0] is outermost (level 1), activeLoops[1] is level 2, etc.
-				targetLoop = fc.activeLoops[e.LoopLevel-1]
-			}
-
-			// Return the iterator value from the target loop
-			fc.out.MovMemToXmm("xmm0", "rbp", -targetLoop.IteratorOffset)
-
-		default:
-			compilerError("unknown loop state variable @%s", e.Type)
-		}
-
 	case *UnaryExpr:
 		// Compile the operand first (result in xmm0)
 		fc.compileExpression(e.Operand)
@@ -4864,10 +4283,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			// xmm0 already contains the value (interpreted as address)
 			// No-op: the value in xmm0 is already the "address"
 		}
-
-	case *PostfixExpr:
-		// PostfixExpr (x++, x--) can only be used as statements, not expressions
-		compilerError("%s can only be used as a statement, not in an expression (like Go)", e.Operator)
 
 	case *FMAExpr:
 		// Fused Multiply-Add: result = a * b + c (or a * b - c for FMSUB)
@@ -6154,43 +5569,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.out.AddImmToReg("rsp", 16)
 		}
 
-	case *PatternLambdaExpr:
-		// Pattern lambda: (pattern1) => body1, (pattern2) => body2, ...
-		// Compiles to a function that checks patterns in order and executes first match
-		var funcName string
-		if fc.currentAssignName != "" {
-			funcName = fc.currentAssignName
-		} else {
-			fc.lambdaCounter++
-			funcName = fmt.Sprintf("lambda_%d", fc.lambdaCounter)
-		}
-
-		// Create synthetic lambda body that implements pattern matching
-		// The body will be a series of if-else checks for each pattern
-		// For now, we'll generate the pattern matching code directly during lambda codegen
-
-		// Store pattern lambda for later code generation
-		fc.patternLambdaFuncs = append(fc.patternLambdaFuncs, PatternLambdaFunc{
-			Name:    funcName,
-			Clauses: e.Clauses,
-		})
-
-		// Create static closure object (pattern lambdas don't capture vars)
-		closureLabel := fmt.Sprintf("closure_%s", funcName)
-		// Use DefineWritable since we initialize at runtime
-		fc.eb.DefineWritable(closureLabel, strings.Repeat("\x00", 16))
-
-		// Initialize closure at runtime
-		fc.out.LeaSymbolToReg("r12", closureLabel)
-		fc.out.LeaSymbolToReg("rax", funcName)
-		fc.out.MovRegToMem("rax", "r12", 0)
-
-		// Return closure object pointer in xmm0
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		fc.out.MovRegToMem("r12", "rsp", 0)
-		fc.out.MovMemToXmm("xmm0", "rsp", 0)
-		fc.out.AddImmToReg("rsp", StackSlotSize)
-
 	case *LengthExpr:
 		// MAP/LIST LENGTH: Read count from header [count][key0][val0]...
 		// Compile the operand (should be a list/map, returns pointer as float64 in xmm0)
@@ -6313,21 +5691,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 	case *MatchExpr:
 		fc.compileMatchExpr(e)
 
-	case *ParallelExpr:
-		fc.compileParallelExpr(e)
-
-	case *PipeExpr:
-		fc.compilePipeExpr(e)
-
-	case *ComposeExpr:
-		fc.compileComposeExpr(e)
-
-	case *SendExpr:
-		fc.compileSendExpr(e)
-
-	case *ReceiveExpr:
-		fc.compileReceiveExpr(e)
-
 	case *CastExpr:
 		fc.compileCastExpr(e)
 
@@ -6357,19 +5720,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		fc.out.MovRegToReg("rax", "rsp")
 		fc.out.Cvtsi2sd("xmm0", "rax")
 
-	case *LoopExpr:
-		// Loop expressions return a value (possibly through reduction)
-		// For now, we don't support parallel loop expressions with reducers
-		if e.NumThreads != 0 && e.Reducer != nil {
-			compilerError("parallel loop expressions with reducers not yet implemented")
-		}
-		if e.NumThreads != 0 {
-			compilerError("parallel loop expressions not yet implemented")
-		}
-
-		// For sequential loops, we need to accumulate results
-		// This is a simplified implementation - full support needs more work
-		compilerError("loop expressions (@ i in ... { expr }) not yet implemented as expressions")
 	}
 }
 
@@ -7256,55 +6606,6 @@ func (fc *TimCompiler) emitNullPointerCheck(reg string) {
 	fc.patchJumpImmediate(okJumpPos+2, okOffset)
 }
 
-// emitBoundsCheck generates code to check if an index is within valid bounds [0, length)
-// and aborts the program with an error message if out of bounds.
-// indexReg: register containing the index (as signed 64-bit integer)
-// lengthReg: register containing the list/array length (as signed 64-bit integer)
-func (fc *TimCompiler) emitBoundsCheck(indexReg, lengthReg string) {
-	// Check if index < 0
-	fc.out.CmpRegToImm(indexReg, 0)
-	negativeJumpPos := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpLess, 0) // Jump to error if index < 0
-
-	// Check if index >= length
-	fc.out.CmpRegToReg(indexReg, lengthReg)
-	tooLargeJumpPos := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0) // Jump to error if index >= length
-
-	// Index is valid - jump to ok
-	okJumpPos := fc.eb.text.Len()
-	fc.out.JumpUnconditional(0) // Will patch to skip error handlers
-
-	// Index < 0 error handler
-	negativePos := fc.eb.text.Len()
-	fc.out.LeaSymbolToReg("rdi", "_bounds_negative_msg")
-	fc.out.XorRegWithReg("rax", "rax") // AL=0 for variadic function
-	fc.callFunction("printf", "")
-	fc.out.MovImmToReg("rdi", "1")
-	fc.callFunction("exit", "")
-
-	// Index >= length error handler
-	tooLargePos := fc.eb.text.Len()
-	fc.out.LeaSymbolToReg("rdi", "_bounds_too_large_msg")
-	fc.out.XorRegWithReg("rax", "rax") // AL=0 for variadic function
-	fc.callFunction("printf", "")
-	fc.out.MovImmToReg("rdi", "1")
-	fc.callFunction("exit", "")
-
-	// Continue here if index is valid
-	okPos := fc.eb.text.Len()
-
-	// Patch jumps
-	negativeOffset := int32(negativePos - (negativeJumpPos + 6))
-	fc.patchJumpImmediate(negativeJumpPos+2, negativeOffset)
-
-	tooLargeOffset := int32(tooLargePos - (tooLargeJumpPos + 6))
-	fc.patchJumpImmediate(tooLargeJumpPos+2, tooLargeOffset)
-
-	okOffset := int32(okPos - (okJumpPos + 5)) // Unconditional jump is 5 bytes
-	fc.patchJumpImmediate(okJumpPos+1, okOffset)
-}
-
 func (fc *TimCompiler) compileMemoryStore(addr string, value any) {
 	// Memory store: [addr] <- value
 
@@ -7374,138 +6675,6 @@ func (fc *TimCompiler) compileUnsafeCast(dest string, cast *CastExpr) {
 	default:
 		compilerError("unsupported cast expression type in unsafe block: %T", expr)
 	}
-}
-
-func (fc *TimCompiler) compileParallelExpr(expr *ParallelExpr) {
-	// Support: list || lambda or list || lambdaVar
-	lambda, isDirectLambda := expr.Operation.(*LambdaExpr)
-	if isDirectLambda {
-		if len(lambda.Params) != 1 {
-			compilerError("parallel operator lambda must have exactly one parameter")
-		}
-	}
-
-	// No longer using fixed stack allocation - malloc will handle memory
-
-	// Compile the lambda to get its function pointer (result in xmm0)
-	fc.compileExpression(expr.Operation)
-
-	// Save lambda function pointer (currently in xmm0) to stack and convert once to raw pointer bits
-	fc.out.SubImmFromReg("rsp", 16)
-	fc.out.MovXmmToMem("xmm0", "rsp", StackSlotSize) // Store at rsp+8
-	fc.out.MovMemToReg("r11", "rsp", StackSlotSize)  // Reinterpret float64 bits as pointer
-	fc.out.MovRegToMem("r11", "rsp", StackSlotSize)  // Keep integer pointer for later loads
-
-	// Compile the input list expression (returns pointer as float64 in xmm0)
-	fc.compileExpression(expr.List)
-
-	// Save list pointer to stack (reuse reserved slot) and load as integer pointer
-	fc.out.MovXmmToMem("xmm0", "rsp", 0) // Store at rsp+0
-	fc.out.MovMemToReg("r13", "rsp", 0)
-
-	// Load list length from [r13] into r14 (empty lists have length=0, not null)
-	fc.out.MovMemToXmm("xmm0", "r13", 0)
-	fc.out.Cvttsd2si("r14", "xmm0") // r14 = length as integer
-
-	// Calculate allocation size: 8 bytes (length) + length * 8 bytes (elements)
-	fc.out.MovRegToReg("rdi", "r14") // rdi = length
-	fc.out.ShlRegImm("rdi", "3")     // rdi = length * 8
-	fc.out.AddImmToReg("rdi", 8)     // rdi = 8 + length * 8
-
-	// DO NOT USE MALLOC! See MEMORY.md - should use arena allocation
-	// TODO: Replace with arena allocation (if mutable) or .rodata (if immutable)
-	// Allocate from arena
-	fc.callArenaAlloc()
-
-	// Store result list pointer in r12
-	fc.out.MovRegToReg("r12", "rax") // r12 = result list base (from malloc)
-
-	// Store length in result list
-	fc.out.MovMemToXmm("xmm0", "r13", 0) // Reload length as float64
-	fc.out.MovXmmToMem("xmm0", "r12", 0)
-
-	// Initialize loop counter to 0
-	fc.out.XorRegWithReg("r15", "r15") // r15 = index
-
-	// Loop start
-	loopStart := fc.eb.text.Len()
-
-	// Check if index >= length
-	fc.out.CmpRegToReg("r15", "r14")
-	loopEndJumpPos := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
-
-	// Load element from input list: input_list[index]
-	// Element address = r13 + 8 + (r15 * 8)
-	fc.out.MovRegToReg("rax", "r15")
-	fc.out.MulRegWithImm("rax", 8)
-	fc.out.AddImmToReg("rax", 8)     // skip length
-	fc.out.AddRegToReg("rax", "r13") // rax = address of element
-
-	// Load element into xmm0 (this is the argument to the lambda)
-	fc.out.MovMemToXmm("xmm0", "rax", 0)
-
-	// Save loop index r15 to stack (will be clobbered by environment pointer)
-	fc.out.SubImmFromReg("rsp", 8)
-	fc.out.MovRegToMem("r15", "rsp", 0)
-
-	// Load lambda closure object pointer (stored at [rsp+8] from earlier)
-	fc.out.MovMemToReg("rax", "rsp", 16) // rsp+8 for saved r15, +8 for lambda pointer
-
-	// Extract function pointer from closure object (offset 0)
-	fc.out.MovMemToReg("r11", "rax", 0)
-
-	// Extract environment pointer from closure object (offset 8) into r15
-	fc.out.MovMemToReg("r15", "rax", 8)
-
-	// Call the lambda function with element in xmm0 and environment in r15
-	fc.out.CallRegister("r11")
-
-	// Restore loop index from stack
-	fc.out.MovMemToReg("r15", "rsp", 0)
-	fc.out.AddImmToReg("rsp", 8)
-
-	// Result is in xmm0, store it in output list: result_list[index]
-	fc.out.MovRegToReg("rax", "r15")
-	fc.out.MulRegWithImm("rax", 8)
-	fc.out.AddImmToReg("rax", 8)     // skip length
-	fc.out.AddRegToReg("rax", "r12") // rax = address in result list
-	fc.out.MovXmmToMem("xmm0", "rax", 0)
-
-	// Increment index
-	fc.out.IncReg("r15")
-
-	// Jump back to loop start
-	loopBackJumpPos := fc.eb.text.Len()
-	backOffset := int32(loopStart - (loopBackJumpPos + UnconditionalJumpSize))
-	fc.out.JumpUnconditional(backOffset)
-
-	// Loop end
-	loopEndPos := fc.eb.text.Len()
-
-	// Patch conditional jump
-	endOffset := int32(loopEndPos - (loopEndJumpPos + ConditionalJumpSize))
-	fc.patchJumpImmediate(loopEndJumpPos+2, endOffset)
-
-	// Don't clean up the lambda/list spill area yet - it's part of our memory layout
-	// The result buffer includes this space in its allocation
-
-	// Return result list pointer as float64 in xmm0
-	// r12 points to the result buffer on stack
-	fc.out.SubImmFromReg("rsp", StackSlotSize)
-	fc.out.MovRegToMem("r12", "rsp", 0)
-	fc.out.MovMemToXmm("xmm0", "rsp", 0)
-	fc.out.AddImmToReg("rsp", StackSlotSize)
-
-	// Clean up the initial 16-byte spill area for lambda/list pointers
-	// but leave the result list on the stack
-	fc.out.AddImmToReg("rsp", 16)
-
-	// IMPORTANT: The result list remains on the stack and will be valid
-	// as long as no other stack allocations overwrite it
-	// This is a temporary solution - proper heap allocation would be better
-
-	// End of parallel operator - xmm0 contains result pointer as float64
 }
 
 func (fc *TimCompiler) predeclareLambdaSymbols() {
@@ -7843,153 +7012,6 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 		fc.maxStackOffset = oldMaxStackOffset
 		fc.runtimeStack = oldRuntimeStack
 		fc.boxedVars = oldBoxedVars
-	}
-}
-
-func (fc *TimCompiler) generatePatternLambdaFunctions() {
-	if VerboseMode {
-		debugf("DEBUG generatePatternLambdaFunctions: generating %d pattern lambdas\n", len(fc.patternLambdaFuncs))
-	}
-	for _, patternLambda := range fc.patternLambdaFuncs {
-		if VerboseMode {
-			debugf("DEBUG generating pattern lambda '%s' with %d clauses\n", patternLambda.Name, len(patternLambda.Clauses))
-		}
-		// Record offset
-		fc.lambdaOffsets[patternLambda.Name] = fc.eb.text.Len()
-		fc.eb.MarkLabel(patternLambda.Name)
-
-		// Function prologue
-		fc.out.PushReg("rbp")
-		fc.out.MovRegToReg("rbp", "rsp")
-
-		// Save state
-		oldVariables := fc.variables
-		oldMutableVars := fc.mutableVars
-		oldStackOffset := fc.stackOffset
-		oldMaxStackOffset := fc.maxStackOffset
-
-		fc.variables = make(map[string]int)
-		fc.mutableVars = make(map[string]bool)
-		fc.stackOffset = 0
-		fc.maxStackOffset = 0
-
-		if VerboseMode {
-			debugf("DEBUG generatePatternLambdaFunctions: reset variables map for '%s', fc.variables=%v\n", patternLambda.Name, fc.variables)
-		}
-
-		// Determine number of parameters from first clause
-		numParams := len(patternLambda.Clauses[0].Patterns)
-
-		// Store parameters from xmm0, xmm1, ... to stack
-		xmmRegs := []string{"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7"}
-		paramOffsets := make([]int, numParams)
-		for i := range numParams {
-			fc.stackOffset += 16
-			paramOffsets[i] = fc.stackOffset
-			fc.out.SubImmFromReg("rsp", 16)
-			fc.out.MovXmmToMem(xmmRegs[i], "rbp", -paramOffsets[i])
-		}
-
-		// Generate pattern matching code
-		// For each clause, check if patterns match, execute body if so
-		clauseLabels := make([]string, len(patternLambda.Clauses))
-		for i := range patternLambda.Clauses {
-			fc.labelCounter++
-			clauseLabels[i] = fmt.Sprintf("pattern_clause_%d", fc.labelCounter)
-		}
-
-		fc.labelCounter++
-		failLabel := fmt.Sprintf("pattern_fail_%d", fc.labelCounter)
-
-		// Track all jumps that need patching across all clauses
-		type jumpPatch struct {
-			jumpPos int
-			target  string
-		}
-		var allJumps []jumpPatch
-
-		for clauseIdx, clause := range patternLambda.Clauses {
-			fc.eb.MarkLabel(clauseLabels[clauseIdx])
-
-			// Determine target for failed pattern matches in this clause
-			nextTarget := failLabel
-			if clauseIdx < len(patternLambda.Clauses)-1 {
-				nextTarget = clauseLabels[clauseIdx+1]
-			}
-
-			// Check each pattern in this clause
-			for paramIdx, pattern := range clause.Patterns {
-				paramOffset := paramOffsets[paramIdx]
-
-				switch p := pattern.(type) {
-				case *LiteralPattern:
-					// Compare parameter against literal value
-					fc.compileExpression(p.Value) // Result in xmm0
-					fc.out.MovMemToXmm("xmm1", "rbp", -paramOffset)
-					fc.out.Ucomisd("xmm0", "xmm1")
-					// If not equal, jump to next clause
-					jumpOffset := fc.eb.text.Len()
-					fc.out.JumpConditional(JumpNotEqual, 0)
-					allJumps = append(allJumps, jumpPatch{jumpOffset, nextTarget})
-
-				case *VarPattern:
-					// Bind parameter to variable name
-					fc.stackOffset += 16
-					varOffset := fc.stackOffset
-					fc.variables[p.Name] = varOffset
-					fc.mutableVars[p.Name] = false
-					fc.out.SubImmFromReg("rsp", 16)
-					fc.out.MovMemToXmm("xmm15", "rbp", -paramOffset)
-					fc.out.MovXmmToMem("xmm15", "rbp", -varOffset)
-
-				case *WildcardPattern:
-					// Match anything, no binding
-				}
-			}
-
-			// All patterns matched, execute body
-			fc.compileExpression(clause.Body)
-
-			// After executing body, return (don't fall through to next clause)
-			fc.out.MovRegToReg("rsp", "rbp")
-
-			fc.out.PopReg("rbp")
-			fc.out.Ret()
-		}
-
-		// Fail label - must be marked before patching jumps
-		fc.eb.MarkLabel(failLabel)
-
-		// Now patch all jumps after all labels have been marked
-		for _, jump := range allJumps {
-			targetOffset := fc.eb.LabelOffset(jump.target)
-			if targetOffset < 0 {
-				compilerError("pattern lambda jump target not found: %s", jump.target)
-			}
-			offset := int32(targetOffset - (jump.jumpPos + 6)) // 6 = size of conditional jump instruction
-			if VerboseMode {
-				debugf("DEBUG: Patching jump at %d to target %s (offset %d -> %d, relative %d)\n",
-					jump.jumpPos, jump.target, jump.jumpPos, targetOffset, offset)
-			}
-			fc.eb.text.Bytes()[jump.jumpPos+2] = byte(offset)
-			fc.eb.text.Bytes()[jump.jumpPos+3] = byte(offset >> 8)
-			fc.eb.text.Bytes()[jump.jumpPos+4] = byte(offset >> 16)
-			fc.eb.text.Bytes()[jump.jumpPos+5] = byte(offset >> 24)
-		}
-		// No pattern matched - return 0
-		fc.out.XorpdXmm("xmm0", "xmm0")
-
-		// Function epilogue
-		fc.out.MovRegToReg("rsp", "rbp")
-
-		fc.out.PopReg("rbp")
-		fc.out.Ret()
-
-		// Restore state
-		fc.variables = oldVariables
-		fc.mutableVars = oldMutableVars
-		fc.stackOffset = oldStackOffset
-		fc.maxStackOffset = oldMaxStackOffset
 	}
 }
 
@@ -11475,31 +10497,6 @@ func (fc *TimCompiler) compileMemoizedCall(call *CallExpr, lambda *LambdaFunc) {
 	fc.memoCaches[cacheName] = true
 }
 
-// isFMAPattern detects if an expression is a FMA pattern: a * b + c
-// Returns (true, a, b, c) if pattern matches, (false, nil, nil, nil) otherwise
-func (fc *TimCompiler) isFMAPattern(expr Expression) (bool, Expression, Expression, Expression) {
-	// Check if this is an addition
-	if call, ok := expr.(*DirectCallExpr); ok {
-		if ident, ok := call.Callee.(*IdentExpr); ok && ident.Name == "+" && len(call.Args) == 2 {
-			// Check if left is multiplication: (a * b) + c
-			if leftCall, ok := call.Args[0].(*DirectCallExpr); ok {
-				if leftIdent, ok := leftCall.Callee.(*IdentExpr); ok && leftIdent.Name == "*" && len(leftCall.Args) == 2 {
-					// Pattern: (a * b) + c
-					return true, leftCall.Args[0], leftCall.Args[1], call.Args[1]
-				}
-			}
-			// Check if right is multiplication: c + (a * b)
-			if rightCall, ok := call.Args[1].(*DirectCallExpr); ok {
-				if rightIdent, ok := rightCall.Callee.(*IdentExpr); ok && rightIdent.Name == "*" && len(rightCall.Args) == 2 {
-					// Pattern: c + (a * b)
-					return true, rightCall.Args[0], rightCall.Args[1], call.Args[0]
-				}
-			}
-		}
-	}
-	return false, nil, nil, nil
-}
-
 // compileFMA compiles a fused multiply-add: result = a * b + c
 // Uses VFMADD132SD if FMA is available, falls back to mul+add otherwise
 func (fc *TimCompiler) compileFMA(a, b, c Expression) {
@@ -11626,7 +10623,7 @@ func (fc *TimCompiler) compileDirectCall(call *DirectCallExpr) {
 	if len(call.Args) == 0 {
 		isCallable := false
 		switch call.Callee.(type) {
-		case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+		case *LambdaExpr:
 			isCallable = true
 			if VerboseMode {
 				debugf("DEBUG: DirectCall with 0 args - callee is a Lambda expression\n")
@@ -11701,209 +10698,6 @@ func (fc *TimCompiler) compileDirectCall(call *DirectCallExpr) {
 	fc.out.CallRegister("r11")
 
 	// Result is in xmm0
-}
-
-// compileMapToCString converts a string map (map[uint64]float64) to a CString
-// Input: mapPtr (register name) = pointer to string map
-// Output: cstrPtr (register name) = pointer to first character of CString
-// CString format: [length_byte][char0][char1]...[charn][newline][null]
-//
-//	^-- returned pointer points here
-func (fc *TimCompiler) compileMapToCString(mapPtr, cstrPtr string) {
-	// Allocate space on stack for CString (max 256 bytes + length + newline + null)
-	fc.out.SubImmFromReg("rsp", 260) // 1 (length) + 256 (chars) + 1 (newline) + 1 (null) + padding
-
-	// Load count from map[0] (empty strings have count=0, not null)
-	fc.out.MovMemToXmm("xmm0", mapPtr, 0)
-	fc.out.Cvttsd2si("rcx", "xmm0") // rcx = character count
-
-	// Store length byte at [rsp]
-	fc.out.MovRegToMem("rcx", "rsp", 0) // Just store lower byte
-
-	// rsi = write position (starts at rsp+1, after length byte)
-	fc.out.LeaMemToReg("rsi", "rsp", 1)
-
-	// rbx = map pointer (start after count)
-	fc.out.MovRegToReg("rbx", mapPtr)
-	fc.out.AddImmToReg("rbx", 8) // Skip count field
-
-	// rdi = character index (0, 1, 2, ...)
-	fc.out.XorRegWithReg("rdi", "rdi")
-
-	// Loop through each character
-	loopStart := fc.eb.text.Len()
-
-	// Check if done (rdi >= rcx)
-	fc.out.CmpRegToReg("rdi", "rcx")
-	loopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
-	loopEndEnd := fc.eb.text.Len()
-
-	// Find character at index rdi in the map
-	// For simplicity, use linear search through map pairs
-	// TODO: This is O(n²) - optimize later
-
-	// r8 = current map position
-	fc.out.MovRegToReg("r8", "rbx")
-
-	// r9 = remaining keys to check
-	fc.out.MovRegToReg("r9", "rcx")
-
-	// Inner loop: search for key == rdi
-	innerLoopStart := fc.eb.text.Len()
-
-	// Check if any keys remain
-	fc.out.CmpRegToImm("r9", 0)
-	innerLoopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-	innerLoopEndEnd := fc.eb.text.Len()
-
-	// Load key from [r8]
-	fc.out.MovMemToXmm("xmm1", "r8", 0)
-	fc.out.Cvttsd2si("r10", "xmm1") // r10 = key as integer
-
-	// Compare with rdi (target index)
-	fc.out.CmpRegToReg("r10", "rdi")
-	keyMatchJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-	keyMatchEnd := fc.eb.text.Len()
-
-	// Not a match, advance to next pair
-	fc.out.AddImmToReg("r8", 16) // Skip key+value pair
-	fc.out.SubImmFromReg("r9", 1)
-	fc.out.JumpUnconditional(int32(innerLoopStart - (fc.eb.text.Len() + 5)))
-
-	// Key matched - load value (character code)
-	keyMatchPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(keyMatchJump+2, int32(keyMatchPos-keyMatchEnd))
-
-	fc.out.MovMemToXmm("xmm2", "r8", 8) // Load value at [r8+8]
-	fc.out.Cvttsd2si("r10", "xmm2")     // r10 = character code
-
-	// Store character byte at [rsi]
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-
-	// Advance write position
-	fc.out.AddImmToReg("rsi", 1)
-
-	// Advance character index
-	fc.out.AddImmToReg("rdi", 1)
-
-	// Continue outer loop
-	fc.out.JumpUnconditional(int32(loopStart - (fc.eb.text.Len() + 5)))
-
-	// Inner loop end (key not found - shouldn't happen for valid strings)
-	innerLoopEndPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(innerLoopEndJump+2, int32(innerLoopEndPos-innerLoopEndEnd))
-
-	// Store '?' for missing character (shouldn't happen)
-	fc.out.MovImmToReg("r10", "63") // ASCII '?'
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-	fc.out.AddImmToReg("rsi", 1)
-	fc.out.AddImmToReg("rdi", 1)
-	fc.out.JumpUnconditional(int32(loopStart - (fc.eb.text.Len() + 5)))
-
-	// Loop end - all characters processed
-	loopEndPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(loopEndJump+2, int32(loopEndPos-loopEndEnd))
-
-	// Add newline character
-	fc.out.MovImmToReg("r10", "10") // ASCII '\n'
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-	fc.out.AddImmToReg("rsi", 1)
-
-	// Add null terminator
-	fc.out.XorRegWithReg("r10", "r10")
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-
-	// Return pointer to first character (skip length byte)
-	fc.out.LeaMemToReg(cstrPtr, "rsp", 1)
-
-	// Note: Stack not cleaned up here - caller must handle
-}
-
-// compilePrintMapAsString converts a string map to bytes for printing via syscall
-// Input: mapPtr (register) = pointer to string map, bufPtr (register) = buffer start
-// Output: rsi = pointer to string data, rdx = length (including newline)
-func (fc *TimCompiler) compilePrintMapAsString(mapPtr, bufPtr string) {
-	// Load count from map[0] (empty strings have count=0, not null)
-	fc.out.MovMemToXmm("xmm0", mapPtr, 0)
-	fc.out.Cvttsd2si("rcx", "xmm0") // rcx = character count
-
-	// rsi = write position (buffer start)
-	fc.out.MovRegToReg("rsi", bufPtr)
-
-	// rbx = map data pointer (start after count at offset 8)
-	fc.out.MovRegToReg("rbx", mapPtr)
-	fc.out.AddImmToReg("rbx", 8)
-
-	// rdi = character index
-	fc.out.XorRegWithReg("rdi", "rdi")
-
-	// Loop through each character
-	loopStart := fc.eb.text.Len()
-
-	// Check if done (rdi >= rcx)
-	fc.out.CmpRegToReg("rdi", "rcx")
-	loopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
-	loopEndEnd := fc.eb.text.Len()
-
-	// Linear search for key == rdi
-	fc.out.MovRegToReg("r8", "rbx")
-	fc.out.MovRegToReg("r9", "rcx")
-
-	innerLoopStart := fc.eb.text.Len()
-	fc.out.CmpRegToImm("r9", 0)
-	innerLoopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-	innerLoopEndEnd := fc.eb.text.Len()
-
-	// Load and compare key
-	fc.out.MovMemToXmm("xmm1", "r8", 0)
-	fc.out.Cvttsd2si("r10", "xmm1")
-	fc.out.CmpRegToReg("r10", "rdi")
-	keyMatchJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpEqual, 0)
-	keyMatchEnd := fc.eb.text.Len()
-
-	// Not a match, advance
-	fc.out.AddImmToReg("r8", 16)
-	fc.out.SubImmFromReg("r9", 1)
-	fc.out.JumpUnconditional(int32(innerLoopStart - (fc.eb.text.Len() + 5)))
-
-	// Key matched - store character
-	keyMatchPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(keyMatchJump+2, int32(keyMatchPos-keyMatchEnd))
-
-	fc.out.MovMemToXmm("xmm2", "r8", 8)
-	fc.out.Cvttsd2si("r10", "xmm2")
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-	fc.out.AddImmToReg("rsi", 1)
-
-	// Inner loop end
-	innerLoopEndPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(innerLoopEndJump+2, int32(innerLoopEndPos-innerLoopEndEnd))
-
-	// Advance character index
-	fc.out.AddImmToReg("rdi", 1)
-	fc.out.JumpUnconditional(int32(loopStart - (fc.eb.text.Len() + 5)))
-
-	// Loop end - add newline
-	loopEndPos := fc.eb.text.Len()
-	fc.patchJumpImmediate(loopEndJump+2, int32(loopEndPos-loopEndEnd))
-
-	// Store newline
-	fc.out.MovImmToReg("r10", "10") // '\n' = 10
-	fc.out.MovByteRegToMem("r10", "rsi", 0)
-	fc.out.AddImmToReg("rsi", 1)
-
-	// Calculate length: rsi - bufPtr
-	fc.out.MovRegToReg("rdx", "rsi")
-	fc.out.SubRegFromReg("rdx", bufPtr)
-
-	// Set rsi back to buffer start
-	fc.out.MovRegToReg("rsi", bufPtr)
 }
 
 // compileFloatToString converts a float64 to ASCII string representation
@@ -12722,16 +11516,6 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		}
 	}
 
-	// Also check pattern lambdas
-	if !isKnownLambda {
-		for _, lambda := range fc.patternLambdaFuncs {
-			if lambda.Name == call.Function {
-				isKnownLambda = true
-				break
-			}
-		}
-	}
-
 	if VerboseMode {
 		debugf("DEBUG compileCall: isKnownLambda=%v, hasCaptures=%v\n", isKnownLambda, hasCaptures)
 	}
@@ -13498,7 +12282,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		}
 
 		// Process format string for libc printf: %v -> %g (smart float), %b -> %s (boolean), %s -> string
-		processedFormat := processEscapeSequences(strExpr.Value)
+		processedFormat := strExpr.Value
 		boolPositions := make(map[int]bool)    // Track which args are %b (boolean)
 		stringPositions := make(map[int]bool)  // Track which args are %s (string)
 		integerPositions := make(map[int]bool) // Track which args are %d, %i, %ld, etc (integer)
@@ -13821,7 +12605,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			if strExpr, ok := arg.(*StringExpr); ok {
 				labelName := fmt.Sprintf("str_%d", fc.stringCounter)
 				fc.stringCounter++
-				processedStr := processEscapeSequences(strExpr.Value)
+				processedStr := strExpr.Value
 				fc.eb.Define(labelName, processedStr)
 				fc.emitStderrWriteLiteral(labelName, len(processedStr), isWindows)
 			}
@@ -13836,7 +12620,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 				if strExpr, ok := arg.(*StringExpr); ok {
 					labelName := fmt.Sprintf("str_%d", fc.stringCounter)
 					fc.stringCounter++
-					processedStr := processEscapeSequences(strExpr.Value) + "\n"
+					processedStr := strExpr.Value + "\n"
 					fc.eb.Define(labelName, processedStr)
 					fc.emitStderrWriteLiteral(labelName, len(processedStr), isWindows)
 				} else {
@@ -13862,7 +12646,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			if strExpr, ok := arg.(*StringExpr); ok {
 				labelName := fmt.Sprintf("str_%d", fc.stringCounter)
 				fc.stringCounter++
-				processedStr := processEscapeSequences(strExpr.Value)
+				processedStr := strExpr.Value
 				fc.eb.Define(labelName, processedStr)
 				fc.emitStderrWriteLiteral(labelName, len(processedStr), isWindows)
 			} else {
@@ -13901,7 +12685,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			}
 
 			// Process format string just like eprintf does
-			processedFormat := processEscapeSequences(strExpr.Value)
+			processedFormat := strExpr.Value
 			boolPositions := make(map[int]bool)
 			stringPositions := make(map[int]bool)
 			integerPositions := make(map[int]bool)
@@ -14117,7 +12901,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 				if strExpr, ok := arg.(*StringExpr); ok {
 					labelName := fmt.Sprintf("str_%d", fc.stringCounter)
 					fc.stringCounter++
-					processedStr := processEscapeSequences(strExpr.Value) + "\n"
+					processedStr := strExpr.Value + "\n"
 					fc.eb.Define(labelName, processedStr)
 					fc.emitStderrWriteLiteral(labelName, len(processedStr), isWin)
 				} else {
@@ -14140,7 +12924,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 				if strExpr, ok := arg.(*StringExpr); ok {
 					labelName := fmt.Sprintf("str_%d", fc.stringCounter)
 					fc.stringCounter++
-					processedStr := processEscapeSequences(strExpr.Value)
+					processedStr := strExpr.Value
 					fc.eb.Define(labelName, processedStr)
 					fc.emitStderrWriteLiteral(labelName, len(processedStr), isWin)
 				} else {
@@ -17451,513 +16235,6 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 	}
 }
 
-func (fc *TimCompiler) compilePipeExpr(expr *PipeExpr) {
-	// Use ParallelExpr implementation for list mapping
-	// Behavior depends on left type:
-	// - If list: map function over elements (use ParallelExpr)
-	// - If scalar: call function with single value
-
-	leftType := fc.getExprType(expr.Left)
-
-	if leftType == "list" {
-		// List mapping: delegate to ParallelExpr
-		parallelExpr := &ParallelExpr{
-			List:      expr.Left,
-			Operation: expr.Right,
-		}
-		fc.compileParallelExpr(parallelExpr)
-		return
-	}
-
-	// Scalar pipe: evaluate left, then call right with result
-	fc.compileExpression(expr.Left)
-
-	switch right := expr.Right.(type) {
-	case *LambdaExpr:
-		// Direct lambda: compile and call with value in xmm0
-		fc.out.SubImmFromReg("rsp", 16)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-
-		fc.compileExpression(right)
-
-		fc.out.MovXmmToMem("xmm0", "rsp", StackSlotSize)
-		fc.out.MovMemToReg("r12", "rsp", StackSlotSize)
-
-		fc.out.MovMemToReg("r11", "r12", 0)
-		fc.out.MovMemToReg("r15", "r12", 8)
-
-		fc.out.MovMemToXmm("xmm0", "rsp", 0)
-		fc.out.AddImmToReg("rsp", 16)
-
-		fc.out.CallRegister("r11")
-
-	case *IdentExpr:
-		// Variable reference (lambda stored in variable)
-		fc.out.SubImmFromReg("rsp", 16)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-
-		fc.compileExpression(right)
-
-		fc.out.MovXmmToMem("xmm0", "rsp", StackSlotSize)
-		fc.out.MovMemToReg("r12", "rsp", StackSlotSize)
-
-		fc.out.MovMemToReg("r11", "r12", 0)
-		fc.out.MovMemToReg("r15", "r12", 8)
-
-		fc.out.MovMemToXmm("xmm0", "rsp", 0)
-		fc.out.AddImmToReg("rsp", 16)
-
-		fc.out.CallRegister("r11")
-
-	default:
-		fc.compileExpression(expr.Right)
-	}
-}
-
-func (fc *TimCompiler) compileComposeExpr(expr *ComposeExpr) {
-	// Function composition: f <> g creates a new function x -> f(g(x))
-	// For now, we'll create a simpler implementation that generates
-	// an inline lambda expression: (x -> left(right(x)))
-	//
-	// TODO: Full implementation with proper closure generation
-	// Currently this is a simplified approach that works for simple cases
-
-	compilerError("function composition operator <> not yet fully implemented\n" +
-		"Use explicit lambda instead: compose = x -> f(g(x))\n" +
-		"Full composition support requires closure capture implementation")
-}
-
-func (fc *TimCompiler) compileSendExpr(expr *SendExpr) {
-	// Send operator: target <== message
-	// Target must be a string: ":5000", "localhost:5000", "192.168.1.1:5000"
-	// Message should be a string
-
-	// For now, only support compile-time string literals as targets
-	targetStr, ok := expr.Target.(*StringExpr)
-	if !ok {
-		compilerError("send operator target must be a string literal (e.g., \":5000\")")
-	}
-
-	// Parse target string to extract port number
-	// Format: ":5000" or "host:5000"
-	addr := targetStr.Value
-	var port int
-	if addr[0] == ':' {
-		// Port only (localhost)
-		var err error
-		port, err = strconv.Atoi(addr[1:])
-		if err != nil || port < 1 || port > 65535 {
-			compilerError("invalid port in send target: %s", addr)
-		}
-	} else {
-		// TODO: Handle "host:port" format
-		compilerError("send target format not yet supported: %s (use \":port\" for localhost)", addr)
-	}
-
-	// Allocate stack space for: message map (8), socket fd (8), sockaddr_in (16), message buffer (256)
-	stackSpace := int64(288)
-	fc.out.SubImmFromReg("rsp", stackSpace)
-	fc.runtimeStack += int(stackSpace)
-
-	// Step 1: Evaluate and save message
-	fc.compileExpression(expr.Message)
-	fc.out.MovXmmToMem("xmm0", "rsp", 0) // message map at rsp+0
-
-	// Step 2: Create UDP socket (syscall 41: socket)
-	// socket(AF_INET=2, SOCK_DGRAM=2, protocol=0)
-	fc.out.MovImmToReg("rax", "41") // socket syscall
-	fc.out.MovImmToReg("rdi", "2")  // AF_INET
-	fc.out.MovImmToReg("rsi", "2")  // SOCK_DGRAM
-	fc.out.MovImmToReg("rdx", "0")  // protocol
-	fc.out.Syscall()
-	fc.out.MovRegToMem("rax", "rsp", 8) // socket fd at rsp+8
-
-	// Step 3: Build sockaddr_in structure at rsp+16
-	// struct sockaddr_in: family(2), port(2), addr(4), zero(8) = 16 bytes
-
-	// sin_family = AF_INET (2)
-	fc.out.MovImmToReg("rax", "2")
-	fc.out.MovU16RegToMem("ax", "rsp", 16)
-
-	// sin_port = htons(port) - convert to network byte order
-	portNetOrder := (port&0xff)<<8 | (port>>8)&0xff // Manual byte swap
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", portNetOrder))
-	fc.out.MovU16RegToMem("ax", "rsp", 18)
-
-	// sin_addr = INADDR_ANY (0.0.0.0) for localhost
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.MovRegToMem("rax", "rsp", 20)
-
-	// sin_zero = 0 (padding)
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.MovRegToMem("rax", "rsp", 24)
-
-	// Step 4: Extract string bytes from message map to buffer at rsp+32
-	// Strings in Tim are stored as map[uint64]float64:
-	// [count][key0][val0][key1][val1]...
-	// Where count = length, keys = indices, vals = character codes
-
-	fc.out.MovMemToReg("rax", "rsp", 0)  // load message map pointer
-	fc.out.MovMemToXmm("xmm0", "rax", 0) // load count from first 8 bytes into xmm0
-	fc.out.Cvttsd2si("rcx", "xmm0")      // convert count from float64 to integer
-
-	// Write test message "TEST" (4 bytes) for now
-	// TODO: Implement proper map iteration to extract actual string bytes
-	fc.out.MovImmToReg("r10", "0x54534554") // "TEST" in little-endian (T=0x54, E=0x45, S=0x53, T=0x54)
-	fc.out.MovRegToMem("r10", "rsp", 32)
-	fc.out.MovImmToReg("rcx", "4") // length
-
-	// Step 5: Send packet (syscall 44: sendto)
-	// sendto(sockfd, buf, len, flags, dest_addr, addrlen)
-	fc.out.MovMemToReg("rdi", "rsp", 8)                           // socket fd
-	fc.out.LeaMemToReg("rsi", "rsp", 32)                          // buffer
-	fc.out.MovRegToReg("rdx", "rcx")                              // length (copy rcx to rdx)
-	fc.out.MovImmToReg("r10", "0")                                // flags
-	fc.out.LeaMemToReg("r8", "rsp", 16)                           // sockaddr_in
-	fc.out.MovImmToReg("r9", fmt.Sprintf("%d", socketStructSize)) // addrlen
-	fc.out.MovImmToReg("rax", "44")                               // sendto syscall
-	fc.out.Syscall()
-
-	// Save result
-	fc.out.MovRegToReg("rbx", "rax")
-
-	// Step 6: Close socket (syscall 3: close)
-	fc.out.MovMemToReg("rdi", "rsp", 8) // socket fd
-	fc.out.MovImmToReg("rax", "3")      // close syscall
-	fc.out.Syscall()
-
-	// Clean up stack
-	fc.out.AddImmToReg("rsp", stackSpace)
-	fc.runtimeStack -= int(stackSpace)
-
-	// Return result (bytes sent, or -1 on error)
-	fc.out.MovRegToReg("rax", "rbx")
-	fc.out.Cvtsi2sd("xmm0", "rax")
-}
-
-func (fc *TimCompiler) compileReceiveExpr(expr *ReceiveExpr) {
-	// Receive operator: <= source
-	// Source must be an address literal: &8080 or &host:8080
-	// Receives one message from the address and returns it as a string
-
-	// For now, only support AddressLiteralExpr
-	addrExpr, ok := expr.Source.(*AddressLiteralExpr)
-	if !ok {
-		compilerError("receive operator source must be an address literal (e.g., &8080)")
-	}
-
-	// Extract port from address literal
-	addr := addrExpr.Value
-	var port int
-
-	// Parse address: &8080, &:8080, &localhost:8080, &192.168.1.1:8080
-	colonIdx := -1
-	for i, ch := range addr {
-		if ch == ':' {
-			colonIdx = i
-			break
-		}
-	}
-
-	if colonIdx == -1 {
-		// No colon - just port number after &
-		var err error
-		port, err = strconv.Atoi(addr[1:]) // Skip &
-		if err != nil || port < 1 || port > 65535 {
-			compilerError("invalid port in receive address: %s", addr)
-		}
-	} else {
-		// Has colon - parse port after colon
-		var err error
-		port, err = strconv.Atoi(addr[colonIdx+1:])
-		if err != nil || port < 1 || port > 65535 {
-			compilerError("invalid port in receive address: %s", addr)
-		}
-	}
-
-	// Allocate stack space for: socket fd (8), sockaddr_in (16), sender addr (16), buffer (256), result map (8)
-	stackSpace := int64(304)
-	fc.out.SubImmFromReg("rsp", stackSpace)
-	fc.runtimeStack += int(stackSpace)
-
-	// Step 1: Create UDP socket (syscall 41: socket)
-	fc.out.MovImmToReg("rax", "41") // socket syscall
-	fc.out.MovImmToReg("rdi", "2")  // AF_INET
-	fc.out.MovImmToReg("rsi", "2")  // SOCK_DGRAM
-	fc.out.MovImmToReg("rdx", "0")  // protocol
-	fc.out.Syscall()
-	fc.out.MovRegToMem("rax", "rsp", 0) // socket fd at rsp+0
-
-	// Step 2: Build sockaddr_in for binding at rsp+8
-	fc.out.MovImmToReg("rax", "2")
-	fc.out.MovU16RegToMem("ax", "rsp", 8) // sin_family = AF_INET
-
-	// sin_port = htons(port)
-	portNetOrder := (port&0xff)<<8 | (port>>8)&0xff
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", portNetOrder))
-	fc.out.MovU16RegToMem("ax", "rsp", 10)
-
-	// sin_addr = INADDR_ANY (0.0.0.0)
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.MovRegToMem("rax", "rsp", 12)
-	fc.out.MovRegToMem("rax", "rsp", 16) // sin_zero
-
-	// Step 3: Bind socket (syscall 49: bind)
-	fc.out.MovMemToReg("rdi", "rsp", 0)                            // socket fd
-	fc.out.LeaMemToReg("rsi", "rsp", 8)                            // sockaddr_in
-	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", socketStructSize)) // addrlen
-	fc.out.MovImmToReg("rax", "49")                                // bind syscall
-	fc.out.Syscall()
-
-	// Step 4: Receive message (syscall 45: recvfrom)
-	fc.out.MovMemToReg("rdi", "rsp", 0)                            // socket fd
-	fc.out.LeaMemToReg("rsi", "rsp", 40)                           // buffer at rsp+40
-	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", stringBufferSize)) // buffer size
-	fc.out.MovImmToReg("r10", "0")                                 // flags
-	fc.out.LeaMemToReg("r8", "rsp", 24)                            // sender sockaddr_in at rsp+24
-	fc.out.LeaMemToReg("r9", "rsp", 296)                           // sender addrlen at rsp+296
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", socketStructSize))
-	fc.out.MovRegToMem("rax", "rsp", 296) // initialize addrlen
-	fc.out.MovImmToReg("rax", "45")       // recvfrom syscall
-	fc.out.Syscall()
-
-	// rax = bytes received (or -1 on error)
-	fc.out.MovRegToReg("rbx", "rax") // save length
-
-	// Step 5: Close socket (syscall 3: close)
-	fc.out.MovMemToReg("rdi", "rsp", 0) // socket fd
-	fc.out.MovImmToReg("rax", "3")      // close syscall
-	fc.out.Syscall()
-
-	// Step 6: Convert received bytes to Tim string (map[uint64]float64)
-	// For simplicity, create a string map with the bytes as character codes
-	// This requires allocating a map and populating it
-	// For now, return the buffer pointer as a number (temp implementation)
-
-	fc.out.LeaMemToReg("rax", "rsp", 40) // buffer address
-	fc.out.Cvtsi2sd("xmm0", "rax")       // convert to float64
-
-	// TODO: Properly convert buffer to Tim string map
-
-	// Clean up stack
-	fc.out.AddImmToReg("rsp", stackSpace)
-	fc.runtimeStack -= int(stackSpace)
-}
-
-func (fc *TimCompiler) compileReceiveLoopStmt(stmt *ReceiveLoopStmt) {
-	// Receive loop: @ msg, from in ":5000" { }
-	// Target must be a string: ":5000"
-	// Creates socket, binds to port, loops forever receiving messages
-
-	// For now, only support compile-time string literals as addresses
-	addressStr, ok := stmt.Address.(*StringExpr)
-	if !ok {
-		compilerError("receive loop address must be a string literal (e.g., \":5000\")")
-	}
-
-	// Parse address string to extract port number or port range
-	addr := addressStr.Value
-	var startPort, endPort int
-	if addr[0] == ':' {
-		// Port only (bind to all interfaces)
-		// Support ":5000" or ":5000-5010" for port ranges
-		portSpec := addr[1:]
-		if strings.Contains(portSpec, "-") {
-			// Port range: ":5000-5010"
-			parts := strings.Split(portSpec, "-")
-			if len(parts) != 2 {
-				compilerError("invalid port range in receive address: %s", addr)
-			}
-			var err error
-			startPort, err = strconv.Atoi(parts[0])
-			if err != nil || startPort < 1 || startPort > 65535 {
-				compilerError("invalid start port in receive address: %s", addr)
-			}
-			endPort, err = strconv.Atoi(parts[1])
-			if err != nil || endPort < 1 || endPort > 65535 {
-				compilerError("invalid end port in receive address: %s", addr)
-			}
-			if startPort > endPort {
-				compilerError("start port must be <= end port in receive address: %s", addr)
-			}
-		} else {
-			// Single port: ":5000"
-			var err error
-			startPort, err = strconv.Atoi(portSpec)
-			if err != nil || startPort < 1 || startPort > 65535 {
-				compilerError("invalid port in receive address: %s", addr)
-			}
-			endPort = startPort
-		}
-	} else {
-		compilerError("receive address format not yet supported: %s (use \":port\" or \":port1-port2\" for all interfaces)", addr)
-	}
-
-	// Generate unique labels for this loop
-	fc.labelCounter++
-	loopLabel := fmt.Sprintf("receive_loop_%d", fc.labelCounter)
-	endLabel := fmt.Sprintf("receive_end_%d", fc.labelCounter)
-	tryPortLabel := fmt.Sprintf("try_port_%d", fc.labelCounter)
-	bindSuccessLabel := fmt.Sprintf("bind_success_%d", fc.labelCounter)
-	bindFailLabel := fmt.Sprintf("bind_fail_%d", fc.labelCounter)
-
-	// Allocate stack space: we use the base offset from symbol collection
-	// Layout: msg_var(8), sender_var(8), socket_fd(8), [padding], sockaddr_in(16), buffer(256), addrlen(8) = 320 bytes
-	baseOffset := stmt.BaseOffset
-
-	if VerboseMode {
-		debugf("DEBUG: ReceiveLoop baseOffset = %d, port range: %d-%d\n", baseOffset, startPort, endPort)
-	}
-
-	// Stack layout offsets (from rbp going downward):
-	// msg_var:     rbp-(baseOffset+8)
-	// sender_var:  rbp-(baseOffset+16)
-	// socket_fd:   rbp-(baseOffset+24)
-	// sockaddr_in: rbp-(baseOffset+40) [16 bytes: 40,38,36,32 to avoid overlap with socket_fd]
-	//   - sin_family (2 bytes): offset 0 from start = rbp-(baseOffset+40)
-	//   - sin_port (2 bytes):   offset 2 from start = rbp-(baseOffset+38)
-	//   - sin_addr (4 bytes):   offset 4 from start = rbp-(baseOffset+36)
-	//   - sin_zero (8 bytes):   offset 8 from start = rbp-(baseOffset+32)
-	// buffer:      rbp-(baseOffset+56) to rbp-(baseOffset+311) [256 bytes]
-	// addrlen:     rbp-(baseOffset+320)
-
-	// Step 1: Create UDP socket (once, before port loop)
-	fc.out.MovImmToReg("rax", "41") // socket syscall
-	fc.out.MovImmToReg("rdi", "2")  // AF_INET
-	fc.out.MovImmToReg("rsi", "2")  // SOCK_DGRAM
-	fc.out.MovImmToReg("rdx", "0")  // protocol
-	fc.out.Syscall()
-	fc.out.MovRegToMem("rax", "rbp", -(baseOffset + 24)) // socket fd
-
-	// Step 2: Initialize sockaddr_in structure (constant fields)
-	// sin_family = AF_INET (2)
-	fc.out.MovImmToReg("rax", "2")
-	fc.out.MovU16RegToMem("ax", "rbp", -(baseOffset + 40))
-
-	// sin_addr = INADDR_ANY (0.0.0.0)
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.MovRegToMem("rax", "rbp", -(baseOffset + 36))
-
-	// sin_zero = 0 (padding)
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.MovRegToMem("rax", "rbp", -(baseOffset + 32))
-
-	// Step 3: Port availability loop (r12 = current port)
-	fc.out.MovImmToReg("r12", fmt.Sprintf("%d", startPort))
-	fc.eb.MarkLabel(tryPortLabel)
-
-	// Convert current port (r12) to network byte order and store in sin_port
-	// Load port value into rax, then convert to 16-bit with byte swap
-	fc.out.MovRegToReg("rax", "r12") // Copy r12 to rax
-	// Manual byte swap for htons: rol ax, 8
-	// Encoding: 66 C1 C0 08 (16-bit ROL AX by immediate 8)
-	fc.eb.text.WriteByte(0x66) // Operand-size override prefix
-	fc.eb.text.WriteByte(0xC1) // ROL r/m16, imm8
-	fc.eb.text.WriteByte(0xC0) // ModR/M for AX
-	fc.eb.text.WriteByte(0x08) // Immediate value 8
-	fc.out.MovU16RegToMem("ax", "rbp", -(baseOffset + 38))
-
-	// Try to bind socket to current port
-	fc.out.MovMemToReg("rdi", "rbp", -(baseOffset + 24))           // socket fd
-	fc.out.LeaMemToReg("rsi", "rbp", -(baseOffset + 40))           // sockaddr_in structure
-	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", socketStructSize)) // addrlen
-	fc.out.MovImmToReg("rax", "49")                                // bind syscall
-	fc.out.Syscall()
-
-	// Check bind result: rax == 0 means success
-	fc.out.CmpRegToImm("rax", 0)
-	fc.out.JumpConditional(JumpEqual, 0) // Will be patched to bindSuccessLabel
-	bindCheckPos := fc.eb.text.Len()
-
-	// Bind failed, try next port
-	fc.out.IncReg("r12")
-	fc.out.CmpRegToImm("r12", int64(endPort+1))
-	fc.out.JumpConditional(JumpLess, 0) // Will be patched to tryPortLabel
-	tryNextPos := fc.eb.text.Len()
-
-	// All ports failed - close socket and exit
-	fc.eb.MarkLabel(bindFailLabel)
-	fc.out.MovMemToReg("rdi", "rbp", -(baseOffset + 24)) // socket fd
-	fc.out.MovImmToReg("rax", "3")                       // close syscall
-	fc.out.Syscall()
-	fc.out.MovImmToReg("rdi", "1")  // exit code 1
-	fc.out.MovImmToReg("rax", "60") // exit syscall
-	fc.out.Syscall()
-
-	// Bind succeeded, continue to receive loop
-	fc.eb.MarkLabel(bindSuccessLabel)
-
-	// Patch jump to bindSuccessLabel
-	bindSuccessPos := fc.eb.labels[bindSuccessLabel]
-	bindOffset := int32(bindSuccessPos - bindCheckPos)
-	fc.patchJumpImmediate(bindCheckPos-ConditionalJumpSize+2, bindOffset)
-
-	// Patch jump to tryPortLabel
-	tryPortPos := fc.eb.labels[tryPortLabel]
-	tryOffset := int32(tryPortPos - tryNextPos)
-	fc.patchJumpImmediate(tryNextPos-ConditionalJumpSize+2, tryOffset)
-
-	// Step 4: Start receive loop
-	fc.eb.MarkLabel(loopLabel)
-
-	// Initialize addrlen for recvfrom
-	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", socketStructSize))
-	fc.out.MovRegToMem("rax", "rbp", -(baseOffset + 320))
-
-	// Call recvfrom (syscall 45: recvfrom)
-	// recvfrom(sockfd, buf, len, flags, src_addr, addrlen)
-	fc.out.MovMemToReg("rdi", "rbp", -(baseOffset + 24))           // socket fd
-	fc.out.LeaMemToReg("rsi", "rbp", -(baseOffset + 56))           // buffer (starts after sockaddr)
-	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", socketBufferSize)) // buffer size
-	fc.out.MovImmToReg("r10", "0")                                 // flags
-	fc.out.LeaMemToReg("r8", "rbp", -(baseOffset + 40))            // src_addr (sockaddr_in start)
-	fc.out.LeaMemToReg("r9", "rbp", -(baseOffset + 320))           // addrlen pointer
-	fc.out.MovImmToReg("rax", "45")                                // recvfrom syscall
-	fc.out.Syscall()
-
-	// rax now contains bytes received (or -1 on error)
-	// TODO: Check for errors and convert buffer to string
-
-	// For now, just store 0.0 in msg and from variables
-	fc.out.MovImmToReg("rax", "0")
-	fc.out.Cvtsi2sd("xmm0", "rax")
-
-	// Add message and sender variables to variable map for body
-	msgOffset := baseOffset + 8
-	fromOffset := baseOffset + 16
-	fc.variables[stmt.MessageVar] = int(msgOffset)
-	fc.variables[stmt.SenderVar] = int(fromOffset)
-
-	fc.out.MovXmmToMem("xmm0", "rbp", -int(msgOffset))
-	fc.out.MovXmmToMem("xmm0", "rbp", -int(fromOffset))
-
-	// Step 5: Execute loop body
-	for _, bodyStmt := range stmt.Body {
-		fc.compileStatement(bodyStmt)
-	}
-
-	// Step 6: Jump back to loop start
-	fc.out.JumpUnconditional(0) // Will be patched
-	endOfBody := fc.eb.text.Len()
-
-	// Calculate offset back to loop start
-	loopStart := fc.eb.labels[loopLabel]
-	offset := int32(loopStart - endOfBody)
-	fc.patchJumpImmediate(endOfBody-UnconditionalJumpSize+1, offset)
-
-	// End label (for break statements)
-	fc.eb.MarkLabel(endLabel)
-
-	// Clean up: close socket
-	fc.out.MovMemToReg("rdi", "rbp", -(baseOffset + 24)) // socket fd
-	fc.out.MovImmToReg("rax", "3")                       // close syscall
-	fc.out.Syscall()
-
-	// Remove variables from scope
-	delete(fc.variables, stmt.MessageVar)
-	delete(fc.variables, stmt.SenderVar)
-}
-
 // Confidence that this function is working: 95%
 // createErrorResult creates an error Result with the given error code in xmm0
 // The error code should be a 3-4 character string like "out", "arg", "dv0", etc.
@@ -18011,78 +16288,6 @@ func (fc *TimCompiler) callFunction(funcName string, library string) error {
 	return fc.eb.GenerateCallInstruction(funcName)
 }
 
-// callMallocAligned calls malloc with proper stack alignment.
-// This helper ensures the stack is 16-byte aligned before calling malloc,
-// which is required by the x86-64 System V ABI.
-//
-// Parameters:
-//   - sizeReg: register containing the allocation size (will be moved to rdi)
-//   - pushCount: number of registers pushed in the current function
-//     (after function prologue, not including the prologue's push rbp)
-//
-// Returns: allocated pointer in rax
-//
-// Stack alignment calculation:
-//   - call instruction: 8 bytes (return address)
-//   - push rbp: 8 bytes (function prologue)
-//   - push registers: 8 * pushCount bytes
-//     Total: 16 + (8 * pushCount) bytes
-//
-// If total is not a multiple of 16, we subtract 8 more from rsp before calling malloc.
-// The caller must restore rsp after the call.
-func (fc *TimCompiler) callMallocAligned(sizeReg string, pushCount int) {
-	// Calculate current stack usage
-	// call (8) + push rbp (8) + pushes (8 * pushCount)
-	stackUsed := 16 + (8 * pushCount)
-	needsAlignment := (stackUsed % 16) != 0
-
-	// Move size to rdi (first argument)
-	if sizeReg != "rdi" {
-		fc.out.MovRegToReg("rdi", sizeReg)
-	}
-
-	// If stack is misaligned, subtract 8 bytes for alignment
-	var alignmentOffset int
-	if needsAlignment {
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		alignmentOffset = StackSlotSize
-	}
-
-	// Call malloc
-	// Allocate from arena
-	fc.callArenaAlloc()
-
-	// Restore stack alignment offset if we added one
-	if alignmentOffset > 0 {
-		fc.out.AddImmToReg("rsp", int64(alignmentOffset))
-	}
-
-	// SAFETY: Check if malloc returned NULL (out of memory)
-	fc.out.TestRegReg("rax", "rax")
-	okJumpPos := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpNotEqual, 0) // Placeholder, will patch
-
-	// malloc returned NULL - print error and exit
-	fc.out.LeaSymbolToReg("rdi", "_malloc_failed_msg")
-	fc.callFunction("printf", "")
-	fc.out.MovImmToReg("rdi", "1")
-	fc.callFunction("exit", "")
-
-	// Patch the jump to skip error handling
-	okPos := fc.eb.text.Len()
-	okOffset := int32(okPos - (okJumpPos + 6))
-	fc.patchJumpImmediate(okJumpPos+2, okOffset)
-
-	// Result is in rax
-}
-
-// collectFunctionCalls walks an expression and collects all function calls
-// Confidence that this function is working: 95%
-// Confidence that this function is working: 98%
-func collectFunctionCalls(expr Expression, calls map[string]bool) {
-	collectFunctionCallsWithParams(expr, calls, nil)
-}
-
 func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, params map[string]bool) {
 	if expr == nil {
 		return
@@ -18117,16 +16322,6 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 		collectFunctionCallsWithParams(e.Right, calls, params)
 	case *UnaryExpr:
 		collectFunctionCallsWithParams(e.Operand, calls, params)
-	case *PostfixExpr:
-		collectFunctionCallsWithParams(e.Operand, calls, params)
-	case *PipeExpr:
-		collectFunctionCallsWithParams(e.Left, calls, params)
-		collectFunctionCallsWithParams(e.Right, calls, params)
-	case *SendExpr:
-		collectFunctionCallsWithParams(e.Target, calls, params)
-		collectFunctionCallsWithParams(e.Message, calls, params)
-	case *ReceiveExpr:
-		collectFunctionCallsWithParams(e.Source, calls, params)
 	case *MatchExpr:
 		collectFunctionCallsWithParams(e.Condition, calls, params)
 		for _, clause := range e.Clauses {
@@ -18151,22 +16346,6 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 			lambdaParams[param] = true
 		}
 		collectFunctionCallsWithParams(e.Body, calls, lambdaParams)
-	case *PatternLambdaExpr:
-		// Pattern lambdas have an implicit parameter (the matched value)
-		lambdaParams := make(map[string]bool)
-		maps.Copy(lambdaParams, params)
-		for _, clause := range e.Clauses {
-			collectFunctionCallsWithParams(clause.Body, calls, lambdaParams)
-		}
-	case *MultiLambdaExpr:
-		for _, lambda := range e.Lambdas {
-			lambdaParams := make(map[string]bool)
-			maps.Copy(lambdaParams, params)
-			for _, param := range lambda.Params {
-				lambdaParams[param] = true
-			}
-			collectFunctionCallsWithParams(lambda.Body, calls, lambdaParams)
-		}
 	case *RangeExpr:
 		collectFunctionCallsWithParams(e.Start, calls, params)
 		collectFunctionCallsWithParams(e.End, calls, params)
@@ -18210,23 +16389,6 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 		for _, stmt := range e.Body {
 			collectFunctionCallsFromStmtWithParams(stmt, calls, params)
 		}
-	case *ParallelExpr:
-		collectFunctionCallsWithParams(e.List, calls, params)
-		collectFunctionCallsWithParams(e.Operation, calls, params)
-	case *BackgroundExpr:
-		collectFunctionCallsWithParams(e.Expr, calls, params)
-	case *LoopExpr:
-		collectFunctionCallsWithParams(e.Iterable, calls, params)
-		for _, stmt := range e.Body {
-			collectFunctionCallsFromStmtWithParams(stmt, calls, params)
-		}
-		if e.Reducer != nil {
-			collectFunctionCallsWithParams(e.Reducer, calls, params)
-		}
-	case *StructLiteralExpr:
-		for _, fieldExpr := range e.Fields {
-			collectFunctionCallsWithParams(fieldExpr, calls, params)
-		}
 	case *VectorExpr:
 		for _, comp := range e.Components {
 			collectFunctionCallsWithParams(comp, calls, params)
@@ -18238,8 +16400,6 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 	case *InExpr:
 		collectFunctionCallsWithParams(e.Value, calls, params)
 		collectFunctionCallsWithParams(e.Container, calls, params)
-	case *MoveExpr:
-		collectFunctionCallsWithParams(e.Expr, calls, params)
 	}
 }
 
@@ -18328,121 +16488,6 @@ func collectDefinedFromExpr(expr Expression, defined map[string]bool) {
 	case *LambdaExpr:
 		collectDefinedFromExpr(e.Body, defined)
 	}
-}
-
-// checkForwardReferences ensures functions are defined before they're called
-// Returns a list of error messages for forward references
-func checkForwardReferences(program *Program) []string {
-	var errors []string
-	defined := make(map[string]bool)
-
-	// Builtins are always available
-	builtins := map[string]bool{
-		"printf": true, "exit": true, "syscall": true,
-		"getpid": true, "me": true,
-		"print": true, "println": true,
-		"eprint": true, "eprintln": true, "eprintf": true,
-		"exitln": true, "exitf": true,
-		"sqrt": true, "sin": true, "cos": true, "tan": true,
-		"asin": true, "acos": true, "atan": true, "atan2": true,
-		"exp": true, "log": true, "log10": true, "pow": true,
-		"min": true, "max": true,
-		// Raylib graphics (linked directly against libraylib via C FFI)
-		"InitWindow": true, "CloseWindow": true, "DrawRectangle": true,
-		"BeginDrawing": true, "EndDrawing": true, "ClearBackground": true,
-		"WindowShouldClose": true, "SetTargetFPS": true, "DrawPixel": true,
-		"DrawText": true, "DrawCircle": true, "DrawLine": true,
-		"floor": true, "ceil": true, "round": true,
-		"abs": true, "approx": true,
-		"popcount": true, "clz": true, "ctz": true,
-		"chan": true, "close": true,
-		"append": true, "head": true, "tail": true, "pop": true,
-		"error": true, "is_nan": true,
-		"_error_code_extract": true,
-		"printa":              true,
-		"alloc":               true, "free": true,
-		"dlopen": true, "dlsym": true, "dlclose": true,
-		"read_i8": true, "read_u8": true, "read_i16": true, "read_u16": true,
-		"read_i32": true, "read_u32": true, "read_i64": true, "read_u64": true, "read_f32": true, "read_f64": true,
-		"write_i8": true, "write_u8": true, "write_i16": true, "write_u16": true,
-		"write_i32": true, "write_u32": true, "write_i64": true, "write_u64": true, "write_f32": true, "write_f64": true,
-		"call": true, "arena_create": true, "arena_alloc": true, "arena_reset": true, "arena_destroy": true,
-	}
-
-	// Mark builtins as defined
-	for k := range builtins {
-		defined[k] = true
-	}
-
-	// Collect C imports
-	cImports := make(map[string]bool)
-	for _, stmt := range program.Statements {
-		if cImp, ok := stmt.(*CImportStmt); ok {
-			cImports[cImp.Alias] = true
-		}
-	}
-
-	// Pre-scan to find all functions that WILL BE defined (anywhere in the program)
-	allDefined := collectDefinedFunctions(program)
-
-	// Process statements in order
-	for _, stmt := range program.Statements {
-		// Only check top-level calls (not calls inside lambda bodies which execute later)
-		// Get top-level calls from this statement
-		calls := make(map[string]bool)
-		if exprStmt, ok := stmt.(*ExpressionStmt); ok {
-			// Top-level expression statement - check its calls
-			collectFunctionCallsWithParams(exprStmt.Expr, calls, nil)
-		}
-		// Note: We DON'T check calls inside AssignStmt values because those are lambda bodies
-		// Lambda bodies execute later when the function is called, not when it's defined
-
-		// Get the name being defined in this statement (for recursion detection)
-		var definingName string
-		if assign, ok := stmt.(*AssignStmt); ok {
-			definingName = assign.Name
-		}
-
-		for funcName := range calls {
-			// Skip if it's a C import (namespace.function)
-			if strings.Contains(funcName, ".") {
-				parts := strings.SplitN(funcName, ".", 2)
-				if len(parts) == 2 && (cImports[parts[0]] || parts[0] == "c") {
-					continue
-				}
-			}
-
-			// Skip builtin operators
-			if funcName == "+" || funcName == "-" || funcName == "*" || funcName == "/" ||
-				funcName == "mod" || funcName == "%" ||
-				funcName == "<" || funcName == "<=" || funcName == ">" || funcName == ">=" ||
-				funcName == "==" || funcName == "!=" ||
-				funcName == "and" || funcName == "or" || funcName == "not" ||
-				funcName == "~b" || funcName == "&b" || funcName == "|b" || funcName == "^b" ||
-				funcName == "<<" || funcName == ">>" {
-				continue
-			}
-
-			// Skip if this is a recursive call (function calling itself in its own definition)
-			if funcName == definingName {
-				continue
-			}
-
-			// Only flag as forward reference if:
-			// 1. Not currently defined
-			// 2. WILL BE defined later (exists in allDefined)
-			if !defined[funcName] && allDefined[funcName] {
-				errors = append(errors, fmt.Sprintf("  Function '%s' called before it is defined", funcName))
-			}
-		}
-
-		// Now mark new definitions from this statement
-		if assign, ok := stmt.(*AssignStmt); ok {
-			defined[assign.Name] = true
-		}
-	}
-
-	return errors
 }
 
 // Confidence that this function is working: 95%
@@ -18819,134 +16864,6 @@ func processImports(program *Program, platform Platform, sourceFilePath string) 
 	return nil
 }
 
-// desugarClasses converts ClassDecl nodes into regular Tim code (maps and closures)
-func desugarClasses(program *Program) {
-	newStatements := make([]Statement, 0, len(program.Statements))
-
-	for _, stmt := range program.Statements {
-		if classDecl, ok := stmt.(*ClassDecl); ok {
-			// Desugar class to constructor function
-			// class Point { init := (x, y) ==> { .x = x } }
-			// becomes:
-			// Point := (x, y) => { instance := {}; instance["x"] = x; ret instance }
-
-			desugared := desugarClass(classDecl)
-			newStatements = append(newStatements, desugared...)
-		} else {
-			newStatements = append(newStatements, stmt)
-		}
-	}
-
-	program.Statements = newStatements
-}
-
-// desugarClass converts a single ClassDecl into regular Tim statements
-func desugarClass(class *ClassDecl) []Statement {
-	statements := make([]Statement, 0)
-
-	// Extract constructor parameters from 'init' method if it exists
-	initMethod, hasInit := class.Methods["init"]
-	var constructorParams []string
-	var initBody []Statement
-
-	if hasInit {
-		constructorParams = initMethod.Params
-		// Extract init body statements
-		if block, ok := initMethod.Body.(*BlockExpr); ok {
-			initBody = block.Statements
-		}
-	}
-
-	// Create constructor function: ClassName := (params) => { ... }
-	// Build the constructor body
-	constructorBody := &BlockExpr{
-		Statements: make([]Statement, 0),
-	}
-
-	// Add: instance := {}
-	constructorBody.Statements = append(constructorBody.Statements, &AssignStmt{
-		Name:  "instance",
-		Value: &MapExpr{Keys: []Expression{}, Values: []Expression{}},
-	})
-
-	// Add init body statements (transforming .field to instance["field"])
-	for _, stmt := range initBody {
-		transformed := transformDotNotation(stmt, "instance")
-		constructorBody.Statements = append(constructorBody.Statements, transformed)
-	}
-
-	// Add methods to instance
-	for methodName, methodLambda := range class.Methods {
-		if methodName == "init" {
-			continue // Already handled
-		}
-
-		// Transform method body to use instance["field"] instead of .field
-		transformedLambda := &LambdaExpr{
-			Params: methodLambda.Params,
-			Body:   transformDotNotationExpr(methodLambda.Body, "instance"),
-		}
-
-		// Add: instance["methodName"] = lambda
-		constructorBody.Statements = append(constructorBody.Statements, &AssignStmt{
-			Name: "instance",
-			Value: &IndexExpr{
-				List:  &IdentExpr{Name: "instance"},
-				Index: &StringExpr{Value: methodName},
-			},
-			IsUpdate: true, // This is an index assignment, not a new variable
-		})
-		// Actually, index assignment needs different handling. Let me use ExpressionStmt with BinaryExpr
-		// For now, just skip methods other than init
-		_ = transformedLambda
-	}
-
-	// Add: ret instance
-	constructorBody.Statements = append(constructorBody.Statements, &JumpStmt{
-		IsBreak: true,
-		Label:   0,
-		Value:   &IdentExpr{Name: "instance"},
-	})
-
-	// Create the constructor assignment
-	constructor := &AssignStmt{
-		Name: class.Name,
-		Value: &LambdaExpr{
-			Params: constructorParams,
-			Body:   constructorBody,
-		},
-	}
-
-	statements = append(statements, constructor)
-
-	// Handle class variables (ClassName.var = value)
-	for fullName, value := range class.ClassVars {
-		// fullName is like "Point.origin"
-		statements = append(statements, &AssignStmt{
-			Name:  fullName,
-			Value: value,
-		})
-	}
-
-	return statements
-}
-
-// transformDotNotation transforms .field references to instanceName["field"]
-func transformDotNotation(stmt Statement, instanceName string) Statement {
-	// For now, just return the statement as-is
-	// TODO: Implement proper transformation
-	_ = instanceName
-	return stmt
-}
-
-// transformDotNotationExpr transforms .field references in expressions
-func transformDotNotationExpr(expr Expression, instanceName string) Expression {
-	// For now, just return the expression as-is
-	// TODO: Implement proper transformation
-	_ = instanceName
-	return expr
-}
-
 func addNamespaceToFunctions(program *Program, namespace string) {
 	// Store namespace metadata in Program for later use during compilation
 	// We can't rename functions with dots because the parser doesn't support it
@@ -19011,6 +16928,12 @@ func CompileTimWithOptions(inputPath string, outputPath string, platform Platfor
 		return fmt.Errorf("failed to read %s: %v", inputPath, readErr)
 	}
 
+	if !depsOnly {
+		if handled, err := tryCore(content, inputPath, outputPath, platform); handled {
+			return err
+		}
+	}
+
 	// Parse main file
 	parser := NewParserWithFilename(string(content), inputPath)
 	program := parser.ParseProgram()
@@ -19022,7 +16945,6 @@ func CompileTimWithOptions(inputPath string, outputPath string, platform Platfor
 	}
 
 	// Desugar classes to regular Tim code
-	desugarClasses(program)
 
 	// Sibling loading is now handled later, after checking for unknown functions
 	// This prevents loading unnecessary files and avoids conflicts with test files

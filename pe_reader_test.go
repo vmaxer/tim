@@ -1,7 +1,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -220,24 +219,5 @@ func TestCTypeMapping(t *testing.T) {
 			// This would test the actual mapping function once implemented
 			t.Logf("C type '%s' should map to Tim type '%s'", tc.cType, tc.timType)
 		})
-	}
-}
-
-func ExampleParseDLL() {
-	// Example of parsing a DLL to get exported functions
-	exports, err := ParseDLL("SDL3.dll")
-	if err != nil {
-		fmt.Printf("Error: %v\n", err)
-		return
-	}
-
-	fmt.Printf("Found %d exported functions\n", len(exports))
-
-	// Look for a specific function
-	for _, fn := range exports {
-		if fn.Name == "SDL_Init" {
-			fmt.Printf("SDL_Init found at ordinal %d, RVA 0x%x\n", fn.Ordinal, fn.RVA)
-			break
-		}
 	}
 }

@@ -1,0 +1,8 @@
+42| 3.14|hi  |-007|ff|"q"|[1, "a"]|yes|%
+11 line1
+line2 error: input/output error
+read first
+second error: end of input
+1 yes error: undefined
+1
+[exit 3]

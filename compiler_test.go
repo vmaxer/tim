@@ -237,7 +237,7 @@ x = 10
 x <- x + 5
 println(x)
 `,
-			errorContains: "cannot update immutable variable 'x'",
+			errorContains: "cannot update 'x'",
 		},
 		{
 			name: "lambda_bad_syntax",

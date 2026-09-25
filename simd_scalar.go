@@ -499,18 +499,6 @@ func (o *Out) Fld1() {
 	}
 }
 
-// Fldpi - Load π onto ST(0)
-func (o *Out) Fldpi() {
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "fldpi: ")
-	}
-	o.Write(0xD9)
-	o.Write(0xEB)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
 // Fmul - Multiply ST(0) by ST(1), pop, result in ST(0)
 // fmulp st(1), st(0)
 func (o *Out) Fmulp() {
@@ -524,32 +512,6 @@ func (o *Out) Fmulp() {
 	}
 }
 
-// Fdiv - Divide ST(1) by ST(0), pop, result in ST(0)
-// fdivp st(1), st(0)  -> ST(1) / ST(0)
-func (o *Out) Fdivp() {
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "fdivp: ")
-	}
-	o.Write(0xDE)
-	o.Write(0xF9)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// Fdivrp - Divide ST(0) by ST(1), pop, result in ST(0)
-// fdivrp st(1), st(0)  -> ST(0) / ST(1)
-func (o *Out) Fdivrp() {
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "fdivrp: ")
-	}
-	o.Write(0xDE)
-	o.Write(0xF1)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
 // Fadd - Add ST(0) to ST(1), pop, result in ST(0)
 // faddp st(1), st(0)
 func (o *Out) Faddp() {
@@ -558,19 +520,6 @@ func (o *Out) Faddp() {
 	}
 	o.Write(0xDE)
 	o.Write(0xC1)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// Fsub - Subtract ST(0) from ST(1), pop, result in ST(0)
-// fsubp st(1), st(0)  -> ST(1) - ST(0)
-func (o *Out) Fsubp() {
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "fsubp: ")
-	}
-	o.Write(0xDE)
-	o.Write(0xE9)
 	if VerboseMode {
 		fmt.Fprintln(os.Stderr)
 	}
@@ -596,18 +545,6 @@ func (o *Out) Fsqrt() {
 	}
 	o.Write(0xD9)
 	o.Write(0xFA)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr)
-	}
-}
-
-// Fchs - Change sign of ST(0)
-func (o *Out) Fchs() {
-	if VerboseMode {
-		fmt.Fprintf(os.Stderr, "fchs: ")
-	}
-	o.Write(0xD9)
-	o.Write(0xE0)
 	if VerboseMode {
 		fmt.Fprintln(os.Stderr)
 	}

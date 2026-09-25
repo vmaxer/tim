@@ -1,8 +1,8 @@
 import sdl3 as sdl
 
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 printf("SDL_Event size reported: %d\n", c.sizeof_SDL_Event)

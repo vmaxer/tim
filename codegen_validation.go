@@ -15,12 +15,6 @@ func (fc *TimCompiler) validateGeneratedCode() []string {
 		lambdaSet[lambda.Name] = true
 	}
 
-	// Build set of pattern lambdas
-	patternLambdaSet := make(map[string]bool)
-	for _, plambda := range fc.patternLambdaFuncs {
-		patternLambdaSet[plambda.Name] = true
-	}
-
 	// List of common C runtime functions that are always available
 	commonCFunctions := map[string]bool{
 		"printf": true, "exit": true, "malloc": true, "free": true, "realloc": true,
@@ -44,7 +38,7 @@ func (fc *TimCompiler) validateGeneratedCode() []string {
 		}
 
 		// Skip lambda functions - they are internal
-		if lambdaSet[funcName] || patternLambdaSet[funcName] {
+		if lambdaSet[funcName] {
 			continue
 		}
 

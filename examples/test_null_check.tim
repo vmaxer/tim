@@ -6,7 +6,7 @@ get_null = () -> {
 }
 
 // Test if or! detects it
-ptr := get_null()! or! {
+ptr := get_null() or! {
     println("or! block executed - NULL detected correctly")
     ret 0
 }

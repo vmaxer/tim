@@ -1,5 +1,5 @@
 cstruct SDL_Event {
-    type as uint32
+    type: uint32
 }
 
 // This should set varTypes["event"] = "SDL_Event"

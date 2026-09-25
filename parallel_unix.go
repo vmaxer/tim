@@ -4,10 +4,7 @@
 package main
 
 import (
-	"fmt"
-	"sync/atomic"
 	"syscall"
-	"unsafe"
 )
 
 const (
@@ -60,55 +57,6 @@ type ThreadStack struct {
 	Size   int
 }
 
-func AllocateThreadStack(size int) *ThreadStack {
-	if size <= 0 {
-		size = 8 * 1024 * 1024
-	}
-
-	return &ThreadStack{
-		Memory: make([]byte, size),
-		Size:   size,
-	}
-}
-
-func (ts *ThreadStack) StackTop() uintptr {
-	return uintptr(unsafe.Pointer(&ts.Memory[ts.Size-16]))
-}
-
-func CloneThread(fn uintptr, arg uintptr, stack *ThreadStack) (int, error) {
-	stackTop := stack.StackTop()
-
-	tid, _, errno := syscall.RawSyscall6(
-		syscall.SYS_CLONE,
-		uintptr(CLONE_THREAD_FLAGS),
-		stackTop,
-		0,
-		0,
-		0,
-		0,
-	)
-
-	if errno != 0 {
-		return -1, fmt.Errorf("clone() failed: %v", errno)
-	}
-
-	if tid == 0 {
-		executeThreadFunction(fn, arg)
-		syscall.Exit(0)
-	}
-
-	return int(tid), nil
-}
-
-func executeThreadFunction(fn uintptr, arg uintptr) {
-	fmt.Printf("Thread started (placeholder - fn: %x, arg: %x)\n", fn, arg)
-}
-
-func GetTID() int {
-	tid, _, _ := syscall.RawSyscall(syscall.SYS_GETTID, 0, 0, 0)
-	return int(tid)
-}
-
 const (
 	FUTEX_WAIT         = 0
 	FUTEX_WAKE         = 1
@@ -117,72 +65,9 @@ const (
 	FUTEX_WAKE_PRIVATE = FUTEX_WAKE | FUTEX_PRIVATE_FLAG
 )
 
-func FutexWait(addr *int32, val int32) error {
-	_, _, errno := syscall.Syscall6(
-		syscall.SYS_FUTEX,
-		uintptr(unsafe.Pointer(addr)),
-		uintptr(FUTEX_WAIT_PRIVATE),
-		uintptr(val),
-		0,
-		0, 0,
-	)
-	if errno != 0 && errno != syscall.EAGAIN {
-		return errno
-	}
-	return nil
-}
-
-func FutexWake(addr *int32, count int) (int, error) {
-	n, _, errno := syscall.Syscall6(
-		syscall.SYS_FUTEX,
-		uintptr(unsafe.Pointer(addr)),
-		uintptr(FUTEX_WAKE_PRIVATE),
-		uintptr(count),
-		0, 0, 0,
-	)
-	if errno != 0 {
-		return 0, errno
-	}
-	return int(n), nil
-}
-
-func AtomicDecrement(addr *int32) int32 {
-	return atomic.AddInt32(addr, -1)
-}
-
 type Barrier struct {
 	count int32
 	total int32
-}
-
-func NewBarrier(numThreads int) *Barrier {
-	return &Barrier{
-		count: int32(numThreads),
-		total: int32(numThreads),
-	}
-}
-
-func (b *Barrier) Wait() {
-	remaining := AtomicDecrement(&b.count)
-
-	if remaining == 0 {
-		FutexWake(&b.count, int(b.total))
-		return
-	}
-
-	for atomic.LoadInt32(&b.count) > 0 {
-		FutexWait(&b.count, remaining)
-		remaining = atomic.LoadInt32(&b.count)
-	}
-}
-
-func WaitForThreads(barrier *Barrier) error {
-	if barrier == nil {
-		return fmt.Errorf("barrier is nil")
-	}
-
-	barrier.Wait()
-	return nil
 }
 
 func CalculateWorkDistribution(totalItems int, numThreads int) (int, int) {

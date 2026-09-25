@@ -107,7 +107,7 @@ println(0 / 0)
 1e-07
 inf
 -inf
-nan
+error: division by zero
 `
 	if got := compileAndRunTopLevel(t, code); got != want {
 		t.Errorf("got:\n%s\nwant:\n%s", got, want)
@@ -162,11 +162,11 @@ println(1 / 0 or! 42)
 1/3
 12157665459056928801
 1
-0.333333
+0.3333333333333333
 0.5
 2
 7
--1.5
+0.5
 1/3 and 18446744073709551616
 3.75!
 42
@@ -186,7 +186,7 @@ println([])
 println({a: 1, b: 2})
 `
 	got := compileAndRunTopLevel(t, code)
-	for _, want := range []string{"[10, 20.5, 30]\n[10, 20.5, 30]\n", "a [10, 20.5, 30] 3\n", "[]\n", "{1, 2}\n"} {
+	for _, want := range []string{"[10, 20.5, 30]\n[10, 20.5, 30]\n", "a [10, 20.5, 30] 3\n", "[]\n", "{a: 1, b: 2}\n"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("output %q does not contain %q", got, want)
 		}
@@ -216,7 +216,7 @@ func TestArityMismatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := CompileTimWithOptions(src, filepath.Join(dir, "main"), GetDefaultPlatform(), 0, false, false)
-	if err == nil || !strings.Contains(err.Error(), "expects 1 argument(s), got 2") {
+	if err == nil || !strings.Contains(err.Error(), "'f' takes 1 argument, but 2 were given") {
 		t.Errorf("expected arity error, got %v", err)
 	}
 }
@@ -276,12 +276,12 @@ a := [1 / 3, 5, 9]
 }
 
 func TestBitwiseMinMaxBounds(t *testing.T) {
-	code := `println(1 <<b 62)
-println(1 <<b 63)
-println(0xFFFFFFFFFFFFFFFF &b 0xFF)
-println((2 ** 64 + 5) &b 7)
-println(0xcbf29ce484222325 ^b 97)
-println(~b 0)
+	code := `println(1 << 62)
+println(1 << 63)
+println(0xFFFFFFFFFFFFFFFF & 0xFF)
+println((2 ** 64 + 5) & 7)
+println(0xcbf29ce484222325 ^ 97)
+println(~ 0)
 println(min(1 / 3, 0.3))
 println(max(2 ** 70, 2 ** 70 + 1))
 println(min(-1, -1 / 2))

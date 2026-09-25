@@ -992,12 +992,3 @@ func (eb *ExecutableBuilder) PatchPECallsToIAT(iatMap map[string]uint32, textVir
 
 	return nil
 }
-
-// Helper function to write import descriptor
-func writePEImportDescriptor(buf []byte, offset int, ilt, iat, name uint32, timeDateStamp uint32) {
-	binary.LittleEndian.PutUint32(buf[offset:], ilt)             // RVA to ILT
-	binary.LittleEndian.PutUint32(buf[offset+4:], timeDateStamp) // TimeDateStamp
-	binary.LittleEndian.PutUint32(buf[offset+8:], 0)             // ForwarderChain
-	binary.LittleEndian.PutUint32(buf[offset+12:], name)         // RVA to DLL name
-	binary.LittleEndian.PutUint32(buf[offset+16:], iat)          // RVA to IAT
-}

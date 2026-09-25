@@ -13,8 +13,8 @@ func TestIfLexing(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		lexer := &Lexer{input: tt.input}
-		token := lexer.NextToken()
+		toks, _ := Lex(tt.input)
+		token := toks[0]
 		if token.Type != tt.expected {
 			t.Fatalf("expected token %v, got %v", tt.expected, token.Type)
 		}

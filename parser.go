@@ -1,270 +1,36 @@
-// parser.go - Tim Language Parser (Version 1.5.0)
-// Completion: 95%
-//
-// Status: Canonical Implementation of GRAMMAR.md and LANGUAGESPEC.md v1.5.0
-//
-// This parser is the authoritative implementation of GRAMMAR.md and LANGUAGESPEC.md v1.5.0.
-// It implements a complete recursive descent parser for the Tim programming
-// language with direct machine code generation for x86_64, ARM64, and RISCV64.
-//
-// Key Features (Tim 3.0):
-// - Universal type system: map[uint64]float64
-// - Block disambiguation: maps vs matches vs statements
-// - Value match (with expression) and guard match (with |)
-// - Minimal parentheses philosophy
-// - Functions defined with = (not :=) by convention
-// - Bitwise operators with 'b' suffix
-// - ENet-style message passing
-// - Direct machine code generation (no IR)
-//
-// Implementation Coverage:
-// - All GRAMMAR.md grammar constructs
-// - All statement types (cstruct, arena, unsafe, loops, assignments, ret, break, continue)
-// - All expression types (literals, operators, lambdas, match blocks, blocks)
-// - All operators (arithmetic, comparison, logical, bitwise, power, pipe)
-// - Block disambiguation (map literal, match block, statement block)
-// - Guard syntax (| at line start)
-// - C FFI and syscall support
-//
-// This file contains the core parser that transforms Tim source code
-// into an Abstract Syntax Tree (AST). It handles:
-// - Tokenization and lexical analysis via Lexer
-// - Recursive descent parsing with operator precedence
-// - Expression parsing with proper precedence climbing
-// - Statement parsing for all Tim constructs
-// - AST node construction with semantic validation
-
 package main
 
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"os"
-	"runtime/debug"
-	"slices"
 	"strconv"
 	"strings"
 )
 
-var globalParseCallCount = 0
-
-// composeGensymCounter generates unique parameter names for desugared
-// `<>` function compositions. Reset per program parse for determinism.
-var composeGensymCounter = 0
-var debugParser = false // Set to true for parser debugging
-
-const (
-	// Parser recursion and iteration safety limits
-	// These prevent infinite loops and stack overflows during parsing
-	maxParseRecursion  = 1000  // Maximum recursion depth for parser calls
-	maxBlockIterations = 10000 // Maximum iterations for parsing block statements
-	maxASTIterations   = 1000  // Maximum iterations for AST traversal
-
-	// Buffer sizes for runtime operations
-	stringBufferSize = 256 // Maximum string buffer size for conversions
-	socketBufferSize = 256 // Network socket buffer size
-	socketStructSize = 16  // sizeof(struct sockaddr_in)
-	sdlEventSize     = 56  // sizeof(SDL_Event) - used in examples and documentation
-
-	// Stack alignment
-	stackAlignment = 16 // x86_64 ABI requires 16-byte stack alignment
-
-	// Hash table sizes
-	defaultHashTableSize = 512 // Default size for internal hash tables
-
-	// Clone syscall
-	cloneSyscallNumber = 56 // Linux clone() syscall number on x86_64
-)
-
-// parseNumberLiteral parses a number literal which can be decimal, hex (0x...), or binary (0b...)
-func (p *Parser) parseNumberLiteral(s string) float64 {
-	if len(s) >= 2 {
-		prefix := s[0:2]
-		if prefix == "0x" || prefix == "0X" {
-			// Hexadecimal
-			val, err := strconv.ParseUint(s[2:], 16, 64)
-			if err != nil {
-				p.error(fmt.Sprintf("invalid hexadecimal literal: %s", s))
-			}
-			return float64(val)
-		} else if prefix == "0b" || prefix == "0B" {
-			// Binary
-			val, err := strconv.ParseUint(s[2:], 2, 64)
-			if err != nil {
-				p.error(fmt.Sprintf("invalid binary literal: %s", s))
-			}
-			return float64(val)
-		}
-	}
-	// Regular decimal number
-	val, _ := strconv.ParseFloat(s, 64)
-	return val
-}
-
+// Parser is a recursive-descent parser for the grammar in GRAMMAR.md. It
+// produces the AST in ast.go.
 type Parser struct {
-	lexer            *Lexer
-	current          Token
-	peek             Token
-	filename         string
-	source           string
-	loopDepth        int                     // Current loop nesting level (0 = not in loop, 1 = outer loop, etc.)
-	functionDepth    int                     // Current function nesting level (0 = module level, 1+ = inside function/lambda)
-	constants        map[string]Expression   // Compile-time constants (immutable literals)
-	aliases          map[string]TokenType    // Keyword aliases (e.g., "for" -> TOKEN_AT)
-	cstructs         map[string]*CStructDecl // CStruct declarations for metadata access
-	cImports         map[string]bool         // C import namespaces (e.g., "sdl", "c")
-	speculative      bool                    // True when in speculative parsing mode (suppress errors)
-	errors           *ErrorCollector         // Railway-oriented error collector
-	inMatchBlock     bool                    // True when parsing inside a match block (prevents nested match parsing)
-	matchResultDepth int                     // >0 while parsing a match-clause result: a top-level '|' starts the next guard clause, not a pipe
-	inConditionLoop  bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
-	inMapKey         bool                    // True while parsing a map-literal key, so a ':' there is the key separator, not a `:`-as-`as` cast
-	inTernaryThen    bool                    // True while parsing a ternary then-branch, so a ':' there is the ternary separator, not a `:`-as-`as` cast
-	scopes           []map[string]bool       // Stack of variable scopes for shadow detection
-	lambdaParams     []string                // Temporary storage for lambda parameters being parsed
-	pendingHoists    []Statement             // Synthesized top-level defs to inject before the current statement
+	toks     []Token
+	i        int
+	filename string
+	source   string
+	lexErr   *LexError
+	errors   *ErrorCollector
+	cstructs map[string]*CStructDecl
+	cImports map[string]bool
+	scopes   []map[string]bool
+	loops    int
+	noMatch  int // > 0: `{` after an expression is a body, not a match (if/loop headers)
+	noPipe   int // > 0: `|` ends the expression (guard clause results)
+	tmp      int
 }
 
-type parserState struct {
-	lexerPos  int
-	lexerLine int
-	current   Token
-	peek      Token
-}
+// parseBailout unwinds the parser to the enclosing statement after an error.
+type parseBailout struct{}
 
-func (p *Parser) saveState() parserState {
-	return parserState{
-		lexerPos:  p.lexer.pos,
-		lexerLine: p.lexer.line,
-		current:   p.current,
-		peek:      p.peek,
-	}
-}
-
-func (p *Parser) restoreState(state parserState) {
-	p.lexer.pos = state.lexerPos
-	p.lexer.line = state.lexerLine
-	p.current = state.current
-	p.peek = state.peek
-}
-
-// bangIsBound reports whether p.peek is a '!' that begins a loop/recursion
-// bound, i.e. it is immediately followed by a number or 'inf'. This lets the
-// parser distinguish the iteration-bound '!' (e.g. "@ x < 10 ! 100") from the
-// postfix move / raw-bitcast '!' (e.g. "x!" or "call()!"). It performs a
-// single-token lookahead past p.peek without disturbing parser state.
-func (p *Parser) bangIsBound() bool {
-	if p.peek.Type != TOKEN_BANG {
-		return false
-	}
-	st := p.lexer.save()
-	next := p.lexer.NextToken()
-	p.lexer.restore(st)
-	return next.Type == TOKEN_NUMBER || next.Type == TOKEN_INF
-}
-
-func NewParser(input string) *Parser {
-	globalParseCallCount = 0 // Reset global counter for each parser instance
-	p := &Parser{
-		lexer:     NewLexer(input),
-		filename:  "<input>",
-		source:    input,
-		constants: make(map[string]Expression),
-		aliases:   make(map[string]TokenType),
-		cstructs:  make(map[string]*CStructDecl),
-		cImports:  make(map[string]bool),
-		errors:    NewErrorCollector(10),
-		scopes:    []map[string]bool{make(map[string]bool)}, // Start with module scope
-	}
-	// Register built-in C namespace (both `c` and `C` reach the C library)
-	p.cImports["c"] = true
-	p.cImports["C"] = true
-	p.errors.SetSourceCode(input)
-	p.nextToken()
-	p.nextToken()
-	return p
-}
-
-func NewParserWithFilename(input, filename string) *Parser {
-	globalParseCallCount = 0 // Reset global counter for each parser instance
-	p := &Parser{
-		lexer:     NewLexer(input),
-		filename:  filename,
-		source:    input,
-		constants: make(map[string]Expression),
-		aliases:   make(map[string]TokenType),
-		cstructs:  make(map[string]*CStructDecl),
-		cImports:  make(map[string]bool),
-		errors:    NewErrorCollector(10),
-		scopes:    []map[string]bool{make(map[string]bool)}, // Start with module scope
-	}
-	// Register built-in C namespace (both `c` and `C` reach the C library)
-	p.cImports["c"] = true
-	p.cImports["C"] = true
-	p.errors.SetSourceCode(input)
-	p.nextToken()
-	p.nextToken()
-	return p
-}
-
-// error collects a parsing error in the ErrorCollector (railway-oriented approach)
-// In speculative mode, errors are suppressed and parsing fails silently
-func (p *Parser) error(msg string) {
-	if p.speculative {
-		// In speculative mode, don't panic - let the caller handle failure
-		panic(speculativeError{})
-	}
-
-	// An unterminated string swallows the rest of the file, so whatever error
-	// the parser stumbles into afterwards is a symptom. Report the real cause
-	// at the opening quote instead.
-	if tok := p.lexer.unterminatedString; tok != nil {
-		msg = "unterminated string literal"
-		if tok.Type == TOKEN_FSTRING {
-			msg = "unterminated f-string literal"
-		}
-		p.errors.AddError(SyntaxError(msg, SourceLocation{
-			File:   p.filename,
-			Line:   tok.Line,
-			Column: tok.Column,
-			Length: 1,
-		}))
-		p.lexer.unterminatedString = nil
-		if p.errors.ShouldStop() {
-			if report := p.errors.Report(true); report != "" {
-				fmt.Fprintln(os.Stderr, report)
-			}
-			panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-		}
-		return
-	}
-
-	// Railway-oriented: collect error and continue if possible
-	err := SyntaxError(msg, SourceLocation{
-		File:   p.filename,
-		Line:   p.current.Line,
-		Column: p.current.Column,
-		Length: len(p.current.Value),
-	})
-	p.errors.AddError(err)
-
-	// For backwards compatibility during transition: if we hit max errors, panic
-	// This will be removed once all error handling is converted
-	if p.errors.ShouldStop() {
-		// Print all collected errors before aborting (see ErrAlreadyReported); the
-		// panic still carries the plain text so callers can inspect the message.
-		if report := p.errors.Report(true); report != "" {
-			fmt.Fprintln(os.Stderr, report)
-		}
-		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-	}
-}
-
-// speculativeError is used to signal parse failure during speculative parsing
-type speculativeError struct{}
-
-// compilerError prints an error message and panics (to be recovered by CompileTim)
-// Use this instead of fmt.Fprintf + os.Exit in code generation
+// compilerError aborts code generation with a message (recovered by the compile driver).
 func compilerError(format string, args ...any) {
 	msg := fmt.Sprintf(format, args...)
 	if VerboseMode {
@@ -273,5860 +39,1766 @@ func compilerError(format string, args ...any) {
 	panic(fmt.Errorf("%s", msg))
 }
 
-func (p *Parser) nextToken() {
-	p.current = p.peek
-	p.peek = p.lexer.NextToken()
+func NewParser(input string) *Parser { return NewParserWithFilename(input, "<input>") }
 
-	// Apply aliases: if current token is an identifier that matches an alias, replace its type
-	if p.current.Type == TOKEN_IDENT {
-		if aliasTarget, exists := p.aliases[p.current.Value]; exists {
-			p.current.Type = aliasTarget
+func NewParserWithFilename(input, filename string) *Parser {
+	toks, lexErr := Lex(input)
+	p := &Parser{
+		toks:     toks,
+		filename: filename,
+		source:   input,
+		lexErr:   lexErr,
+		errors:   NewErrorCollector(10),
+		cstructs: map[string]*CStructDecl{},
+		cImports: map[string]bool{"c": true, "C": true},
+		scopes:   []map[string]bool{{}},
+	}
+	if lexErr != nil {
+		p.toks = []Token{{Type: TOKEN_EOF, Line: lexErr.Line, Column: lexErr.Column}}
+	}
+	p.errors.SetSourceCode(input)
+	return p
+}
+
+// ParseProgram parses a whole file, reporting every syntax error it finds.
+func (p *Parser) ParseProgram() *Program {
+	program := p.ParseProgramRaw()
+	uniquifyLocalFunctions(program)
+	return optimizeProgram(program)
+}
+
+// ParseProgramRaw parses a file without the legacy AST optimizations.
+func (p *Parser) ParseProgramRaw() *Program {
+	program := &Program{}
+	if p.lexErr != nil {
+		p.errors.AddError(SyntaxError(p.lexErr.Msg, SourceLocation{File: p.filename, Line: p.lexErr.Line, Column: p.lexErr.Column, Length: 1}))
+	}
+	p.skipEnds()
+	for !p.at(TOKEN_EOF) && !p.errors.ShouldStop() {
+		p.topStatement(program)
+		p.skipEnds()
+	}
+	if p.errors.HasErrors() {
+		fmt.Fprintln(os.Stderr, p.errors.Report(true))
+		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
+	}
+	program.CStructs = p.cstructs
+	return program
+}
+
+func (p *Parser) topStatement(program *Program) {
+	start := p.i
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(parseBailout); !ok {
+				panic(r)
+			}
+			p.syncToStatement(start)
+		}
+	}()
+	stmt := p.statement()
+	if exp, ok := stmt.(*ExportStmt); ok {
+		if exp.Mode == "*" {
+			program.ExportMode = "*"
+		} else {
+			program.ExportedFuncs = append(program.ExportedFuncs, exp.Functions...)
+		}
+	} else if stmt != nil {
+		program.Statements = append(program.Statements, stmt)
+	}
+	p.endStatement()
+}
+
+// syncToStatement skips to the end of the top-level statement that began at start.
+func (p *Parser) syncToStatement(start int) {
+	depth := 0
+	for k := start; k < p.i; k++ {
+		switch p.toks[k].Type {
+		case TOKEN_LBRACE:
+			depth++
+		case TOKEN_RBRACE:
+			depth--
 		}
 	}
-	if p.peek.Type == TOKEN_IDENT {
-		if aliasTarget, exists := p.aliases[p.peek.Value]; exists {
-			p.peek.Type = aliasTarget
-		}
-	}
-}
-
-// Scope management for shadow keyword detection
-func (p *Parser) pushScope() {
-	p.scopes = append(p.scopes, make(map[string]bool))
-}
-
-func (p *Parser) popScope() {
-	if len(p.scopes) > 1 {
-		p.scopes = p.scopes[:len(p.scopes)-1]
-	}
-}
-
-func (p *Parser) declareVariable(name string) {
-	if len(p.scopes) > 0 {
-		p.scopes[len(p.scopes)-1][name] = true
-	}
-}
-
-func (p *Parser) wouldShadow(name string) bool {
-	// Check if name exists in any outer scope (case-insensitive)
-	nameLower := strings.ToLower(name)
-	for i := len(p.scopes) - 2; i >= 0; i-- { // Skip current scope
-		for varName := range p.scopes[i] {
-			if strings.ToLower(varName) == nameLower {
-				return true
+	for !p.at(TOKEN_EOF) {
+		switch p.cur().Type {
+		case TOKEN_LBRACE:
+			depth++
+		case TOKEN_RBRACE:
+			depth--
+		case TOKEN_NEWLINE, TOKEN_SEMICOLON:
+			if depth <= 0 {
+				return
 			}
 		}
+		p.i++
+	}
+}
+
+// Token helpers.
+
+func (p *Parser) cur() Token { return p.toks[p.i] }
+
+func (p *Parser) pos() Pos { return tokPos(p.toks[p.i]) }
+
+func tokPos(t Token) Pos { return Pos{t.Line, t.Column} }
+
+func (p *Parser) peekAt(n int) Token {
+	if p.i+n < len(p.toks) {
+		return p.toks[p.i+n]
+	}
+	return p.toks[len(p.toks)-1]
+}
+
+func (p *Parser) at(t TokenType) bool { return p.toks[p.i].Type == t }
+
+func (p *Parser) advance() Token {
+	t := p.toks[p.i]
+	if t.Type != TOKEN_EOF {
+		p.i++
+	}
+	return t
+}
+
+func (p *Parser) accept(t TokenType) bool {
+	if p.at(t) {
+		p.advance()
+		return true
 	}
 	return false
 }
 
-// isDeclaredVariable reports whether name is a variable declared in any
-// currently-visible scope. A declared variable shadows an implicit C-import
-// namespace: e.g. a local `c = V(...)` makes `c.x` a struct-field access rather
-// than a `c.`-namespace / C-FFI reference (the `c` and `C` namespaces are always
-// registered, so without this any variable named `c`/`C` would be unusable).
-func (p *Parser) isDeclaredVariable(name string) bool {
-	for i := len(p.scopes) - 1; i >= 0; i-- {
-		if p.scopes[i][name] {
+func (p *Parser) expect(t TokenType, what string) Token {
+	if !p.at(t) {
+		p.fail("expected %s, found %s", what, p.cur())
+	}
+	return p.advance()
+}
+
+func (p *Parser) fail(format string, args ...any) {
+	t := p.cur()
+	length := max(1, len(t.Value))
+	if t.Type == TOKEN_NEWLINE || t.Type == TOKEN_EOF {
+		length = 1
+	}
+	p.errors.AddError(SyntaxError(fmt.Sprintf(format, args...), SourceLocation{File: p.filename, Line: t.Line, Column: t.Column, Length: length}))
+	panic(parseBailout{})
+}
+
+func (p *Parser) skipNewlines() {
+	for p.at(TOKEN_NEWLINE) {
+		p.advance()
+	}
+}
+
+func (p *Parser) skipEnds() {
+	for p.at(TOKEN_NEWLINE) || p.at(TOKEN_SEMICOLON) {
+		p.advance()
+	}
+}
+
+// endStatement requires a statement terminator (or a closing brace / EOF).
+func (p *Parser) endStatement() {
+	switch p.cur().Type {
+	case TOKEN_NEWLINE, TOKEN_SEMICOLON:
+		p.skipEnds()
+	case TOKEN_RBRACE, TOKEN_EOF:
+	default:
+		p.fail("unexpected %s after statement", p.cur())
+	}
+}
+
+// Scopes, for telling variables from C namespaces.
+
+func (p *Parser) declare(name string) { p.scopes[len(p.scopes)-1][name] = true }
+func (p *Parser) pushScope()          { p.scopes = append(p.scopes, map[string]bool{}) }
+func (p *Parser) popScope()           { p.scopes = p.scopes[:len(p.scopes)-1] }
+func (p *Parser) isNamespace(n string) bool {
+	if !p.cImports[n] {
+		return false
+	}
+	for _, s := range p.scopes {
+		if s[n] {
+			return false
+		}
+	}
+	return true
+}
+
+// bitBuiltins are functions that map onto machine operations.
+var bitBuiltins = map[string]string{"bit": "?b", "rotl": "<<<b", "rotr": ">>>b"}
+
+func (p *Parser) isDeclared(n string) bool {
+	for _, s := range p.scopes {
+		if s[n] {
 			return true
 		}
 	}
 	return false
 }
 
-func (p *Parser) skipNewlines() {
-	for p.current.Type == TOKEN_NEWLINE || p.current.Type == TOKEN_SEMICOLON {
-		p.nextToken()
-	}
+// nested parses f with the context flags reset, as inside brackets.
+func nested[T any](p *Parser, f func() T) T {
+	noMatch, noPipe := p.noMatch, p.noPipe
+	p.noMatch, p.noPipe = 0, 0
+	defer func() { p.noMatch, p.noPipe = noMatch, noPipe }()
+	return f()
 }
 
-// skipExprNewlines skips newline tokens in the MIDDLE of an expression. It is
-// called right after consuming a binary operator, where the expression is
-// definitionally incomplete, so a following newline is a line continuation
-// rather than a statement terminator (e.g. `a +\n    b` parses as `a + b`).
-// This only fires for a *trailing* operator (`a +` at end of line); `a\n + b`
-// is unaffected because the operator loop never starts (peek is a newline).
-func (p *Parser) skipExprNewlines() {
-	for p.current.Type == TOKEN_NEWLINE {
-		p.nextToken()
-	}
+func (p *Parser) tempName() string {
+	p.tmp++
+	return fmt.Sprintf("tmp·%d", p.tmp)
 }
 
-func (p *Parser) ParseProgram() *Program {
-	globalParseCallCount = 0 // Reset for each program parse
-	composeGensymCounter = 0 // Reset for deterministic composition desugaring
-	program := &Program{}
+// Statements.
 
-	p.skipNewlines()
-	for p.current.Type != TOKEN_EOF {
-		stmt := p.parseStatement()
-		// Inject any definitions hoisted while parsing this statement (e.g. lambda
-		// operands of `<>` composition) before the statement that uses them.
-		if len(p.pendingHoists) > 0 {
-			program.Statements = append(program.Statements, p.pendingHoists...)
-			p.pendingHoists = nil
+func (p *Parser) statement() Statement {
+	switch p.cur().Type {
+	case TOKEN_IMPORT:
+		return p.importStmt()
+	case TOKEN_EXPORT:
+		return p.exportStmt()
+	case TOKEN_CSTRUCT:
+		return p.cstructDecl()
+	case TOKEN_AT:
+		return p.loop()
+	case TOKEN_BREAK, TOKEN_CONTINUE:
+		return p.jump()
+	case TOKEN_RET, TOKEN_ERR:
+		return p.ret()
+	case TOKEN_DEFER:
+		p.advance()
+		return &DeferStmt{Call: p.expr()}
+	case TOKEN_ARENA:
+		p.advance()
+		return &ArenaStmt{Body: p.blockStmts()}
+	case TOKEN_IF:
+		return p.ifStmt()
+	case TOKEN_ELIF, TOKEN_ELSE:
+		p.fail("'%s' without a preceding 'if'", p.cur().Value)
+	case TOKEN_IDENT:
+		if s := p.definition(); s != nil {
+			return s
 		}
-		if stmt != nil {
-			// Handle alias statements: process them immediately and don't add to AST
-			if aliasStmt, ok := stmt.(*AliasStmt); ok {
-				// Store the alias in the parser's alias map
-				p.aliases[aliasStmt.NewName] = aliasStmt.Target
-			} else if exportStmt, ok := stmt.(*ExportStmt); ok {
-				// Handle export statements: store in program metadata
-				if exportStmt.Mode == "*" {
-					program.ExportMode = "*"
-				} else {
-					program.ExportedFuncs = append(program.ExportedFuncs, exportStmt.Functions...)
-				}
-				// Don't add export statements to the AST
-			} else {
-				// Regular statements are added to the program
-				program.Statements = append(program.Statements, stmt)
+		if s := p.binding(); s != nil {
+			return s
+		}
+		if s := p.update(); s != nil {
+			return s
+		}
+	}
+	return &ExpressionStmt{Expr: p.expr()}
+}
+
+func (p *Parser) importStmt() Statement {
+	p.advance()
+	var source strings.Builder
+	switch t := p.cur(); t.Type {
+	case TOKEN_STRING, TOKEN_IDENT, TOKEN_DOT, TOKEN_SLASH:
+		source.WriteString(p.advance().Value)
+		for {
+			switch p.cur().Type {
+			case TOKEN_DOT, TOKEN_SLASH, TOKEN_IDENT, TOKEN_NUMBER, TOKEN_AT, TOKEN_MINUS, TOKEN_COLON:
+				source.WriteString(p.advance().Value)
+				continue
 			}
+			break
 		}
-		p.nextToken()
-		p.skipNewlines()
+	default:
+		p.fail("expected a library, path or repository after 'import', found %s", t)
 	}
-
-	// Check for parse errors
-	if p.errors.HasErrors() {
-		// Print all collected errors (formatted with source snippet + caret) to the
-		// user, then abort with an already-reported error that still carries the
-		// plain text — so the top level does not print a second copy, but callers
-		// and tests can still inspect the message.
-		fmt.Fprintln(os.Stderr, p.errors.Report(true))
-		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-	}
-
-	// Copy cstructs from parser to program
-	program.CStructs = p.cstructs
-
-	// Don't add automatic exit(0) statement - the compiler will emit exit code
-	// after processing deferred statements (see lines 2658-2669 in compileStatement)
-
-	// Apply optimizations here so every ParseProgram caller (main file,
-	// siblings, dependencies, incremental) gets an optimized AST without
-	// having to remember a separate phase call.
-	uniquifyLocalFunctions(program)
-	program = optimizeProgram(program)
-
-	return program
-}
-
-func (p *Parser) parseImport() Statement {
-	p.nextToken() // skip 'import'
-
-	// Parse import source (string literal or identifier chain)
-	// Examples:
-	// - import "sdl3" as sdl                                 (library)
-	// - import "github.com/user/repo" as repo                (git)
-	// - import "github.com/user/repo@v1.0.0" as repo         (git with version)
-	// - import "." as local                                  (directory)
-	// - import "/path/to/lib.so" as lib                      (library file)
-
-	var source string
-	var isLibraryFile bool
-
-	if p.current.Type == TOKEN_STRING {
-		source = p.current.Value
-
-		// Check if it's a library file (.so, .dll, .dylib)
-		isLibraryFile = strings.HasSuffix(source, ".so") ||
-			strings.Contains(source, ".so.") ||
-			strings.HasSuffix(source, ".dll") ||
-			strings.HasSuffix(source, ".dylib")
-
-		p.nextToken()
-	} else if p.current.Type == TOKEN_IDENT {
-		// Bare identifier for library: import sdl3 as sdl
-		source = p.current.Value
-		p.nextToken()
-	} else {
-		p.error("expected string or identifier after 'import'")
-		return nil
-	}
-
-	// Parse optional 'as alias'
-	var alias string
-	if p.current.Type == TOKEN_AS {
-		p.nextToken()
-
-		if p.current.Type != TOKEN_IDENT && p.current.Type != TOKEN_STAR {
-			p.error("expected alias or '*' after 'as'")
+	alias := ""
+	if p.accept(TOKEN_AS) {
+		if p.at(TOKEN_STAR) {
+			alias = p.advance().Value
+		} else {
+			alias = p.expect(TOKEN_IDENT, "an alias after 'as'").Value
 		}
-		alias = p.current.Value
-		p.nextToken()
 	} else {
-		// No "as" provided - derive alias from source
-		// For "github.com/user/repo" -> "repo"
-		// For "sdl3" -> "sdl3"
-		alias = deriveAliasFromSource(source)
+		alias = deriveAliasFromSource(source.String())
 	}
-
-	// Parse the import spec
-	spec, err := ParseImportSource(source)
+	src := source.String()
+	spec, err := ParseImportSource(src)
 	if err != nil {
-		p.error(fmt.Sprintf("invalid import source: %v", err))
-		return nil
+		p.fail("invalid import source: %v", err)
 	}
-
-	// Determine import type based on source
-	// Library files are always treated as C imports
-	if isLibraryFile {
-		// Extract just the filename from the path
-		filename := source
-		if lastSlash := strings.LastIndex(source, "/"); lastSlash != -1 {
-			filename = source[lastSlash+1:]
-		} else if lastSlash := strings.LastIndex(source, "\\"); lastSlash != -1 {
-			filename = source[lastSlash+1:]
-		}
-
-		// Register C import namespace
+	if strings.HasSuffix(src, ".so") || strings.Contains(src, ".so.") ||
+		strings.HasSuffix(src, ".dll") || strings.HasSuffix(src, ".dylib") {
 		p.cImports[alias] = true
-		return &CImportStmt{Library: filename, Alias: alias, SoPath: source}
+		name := src[strings.LastIndexAny(src, `/\`)+1:]
+		return &CImportStmt{Library: name, Alias: alias, SoPath: src}
 	}
-
-	// If it's a local path (., ./path, /path) or has version or looks like git URL, it's ImportStmt
-	if spec.IsLocal || spec.Version != "" || isGitURL(source) ||
-		strings.Contains(source, "/") || strings.Contains(source, "\\") {
-		// Git repository or directory import
+	if spec.IsLocal || spec.Version != "" || isGitURL(src) || strings.ContainsAny(src, `/\`) {
 		return &ImportStmt{URL: spec.Source, Version: spec.Version, Alias: alias}
 	}
-
-	// Otherwise, it's a library name (C import)
 	p.cImports[alias] = true
-	return &CImportStmt{Library: source, Alias: alias}
+	return &CImportStmt{Library: src, Alias: alias}
 }
 
-func (p *Parser) parseExport() Statement {
-	p.nextToken() // skip 'export'
-
-	// Check for "export *"
-	if p.current.Type == TOKEN_STAR {
-		p.nextToken()
-		return &ExportStmt{Mode: "*", Functions: nil}
+func (p *Parser) exportStmt() Statement {
+	p.advance()
+	if p.accept(TOKEN_STAR) {
+		return &ExportStmt{Mode: "*"}
 	}
-
-	// Parse list of function names: "export func1 func2 func3"
-	var functions []string
-	for p.current.Type == TOKEN_IDENT {
-		functions = append(functions, p.current.Value)
-		p.nextToken()
-
-		// Allow optional commas between function names
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken()
-		}
+	var names []string
+	for p.at(TOKEN_IDENT) {
+		names = append(names, p.advance().Value)
+		p.accept(TOKEN_COMMA)
 	}
-
-	if len(functions) == 0 {
-		p.error("expected '*' or function names after 'export'")
+	if len(names) == 0 {
+		p.fail("expected '*' or function names after 'export'")
 	}
-
-	return &ExportStmt{Mode: "", Functions: functions}
+	return &ExportStmt{Functions: names}
 }
 
-func (p *Parser) parseArenaStmt() *ArenaStmt {
-	p.nextToken() // skip 'arena'
-
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' after 'arena'")
-	}
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	var body []Statement
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-		p.nextToken()
-		p.skipNewlines()
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of arena block")
-	}
-
-	return &ArenaStmt{Body: body}
-}
-
-// parseWithStmt parses a subject-injection block: with <subject> { statements }.
-// The subject expression is prepended as the first argument of every direct call
-// statement in the body, so `with ren { clear(); draw(t) }` desugars to
-// `clear(ren); draw(ren, t)`. Injection happens here at parse time; the resulting
-// WithStmt just carries the already-injected body (see WithStmt in ast.go).
-func (p *Parser) parseWithStmt() *WithStmt {
-	p.nextToken() // skip 'with'
-
-	// Parse the subject. Set inConditionLoop so the body's opening '{' is not
-	// eaten as a block/struct argument of the subject (same guard if/while use).
-	oldCL := p.inConditionLoop
-	p.inConditionLoop = true
-	subject := p.parseExpression()
-	p.inConditionLoop = oldCL
-
-	if p.peek.Type != TOKEN_LBRACE {
-		p.error("expected '{' after 'with <subject>'")
-	}
-	p.nextToken() // move to '{'
-	body := p.parseStatementBlock()
-
-	// Inject the subject as the first argument of each direct call statement.
-	for _, stmt := range body {
-		injectWithSubject(stmt, subject)
-	}
-
-	return &WithStmt{Subject: subject, Body: body}
-}
-
-// injectWithSubject prepends the with-block subject as the first argument of a
-// body statement when that statement is a direct call (a bare `f(...)` or a
-// dotted `ns.f(...)`). Non-call statements are left untouched, so `with`
-// bodies can still hold assignments or other statements without surprise.
-func injectWithSubject(stmt Statement, subject Expression) {
-	es, ok := stmt.(*ExpressionStmt)
-	if !ok {
-		return
-	}
-	switch call := es.Expr.(type) {
-	case *CallExpr:
-		call.Args = append([]Expression{subject}, call.Args...)
-	case *DirectCallExpr:
-		call.Args = append([]Expression{subject}, call.Args...)
-	}
-}
-
-func (p *Parser) parseStatementBlock() []Statement {
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' to start block")
-	}
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	var body []Statement
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-		p.nextToken()
-		p.skipNewlines()
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of block")
-	}
-
-	return body
-}
-
-// parseIfExpression parses `if c { A } elif c2 { B } else { C }` in expression
-// position and lowers it to a guard MatchExpr (lazy: only the taken branch runs).
-// Each `{ … }` is a block whose value is its last expression. current is on `if`.
-func (p *Parser) parseIfExpression() Expression {
-	var clauses []*MatchClause
-	for p.current.Type == TOKEN_IF || p.current.Type == TOKEN_ELIF {
-		p.nextToken() // skip 'if' / 'elif'
-
-		// Parse the condition without letting the body '{' be eaten as a block arg.
-		oldCL := p.inConditionLoop
-		p.inConditionLoop = true
-		cond := p.parseExpression()
-		p.inConditionLoop = oldCL
-
-		if p.peek.Type != TOKEN_LBRACE {
-			p.error("expected '{' after if/elif condition")
-		}
-		p.nextToken()            // move to '{'
-		body := p.parsePrimary() // parse the { … } block as a BlockExpr value
-		clauses = append(clauses, &MatchClause{Guard: cond, Result: body})
-
-		for p.peek.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-		if p.peek.Type == TOKEN_ELIF {
-			p.nextToken() // move to 'elif'
-			continue
-		}
-		break
-	}
-
-	var defaultExpr Expression = &NumberExpr{Value: 0.0}
-	for p.peek.Type == TOKEN_NEWLINE {
-		p.nextToken()
-	}
-	if p.peek.Type == TOKEN_ELSE {
-		p.nextToken() // move to 'else'
-		if p.peek.Type != TOKEN_LBRACE {
-			p.error("expected '{' after else")
-		}
-		p.nextToken() // move to '{'
-		defaultExpr = p.parsePrimary()
-	}
-
-	return &MatchExpr{
-		Condition:   &NumberExpr{Value: 1.0},
-		Clauses:     clauses,
-		DefaultExpr: defaultExpr,
-	}
-}
-
-func (p *Parser) parseIfStatement() *IfStmt {
-	var branches []IfBranch
-
-	for p.current.Type == TOKEN_IF || p.current.Type == TOKEN_ELIF {
-		p.nextToken() // skip 'if' or 'elif'
-
-		condition := p.parseExpression()
-		if condition == nil {
-			p.error("expected condition expression after if/elif")
-		}
-
-		if p.peek.Type != TOKEN_LBRACE {
-			p.error("expected '{' after if/elif condition")
-		}
-		p.nextToken() // move to '{'
-		body := p.parseStatementBlock()
-
-		branches = append(branches, IfBranch{
-			Condition: condition,
-			Body:      body,
-		})
-
-		for p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-			p.nextToken()
-		}
-
-		if p.peek.Type == TOKEN_ELIF {
-			p.nextToken() // move to 'elif' for next loop iteration
-			continue
-		}
-		break
-	}
-
-	var elseBody []Statement
-	if p.peek.Type == TOKEN_ELSE {
-		p.nextToken() // move to 'else'
-		p.nextToken() // skip 'else'
-
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected '{' after else")
-		}
-		elseBody = p.parseStatementBlock()
-	}
-
-	return &IfStmt{
-		Branches: branches,
-		ElseBody: elseBody,
-	}
-}
-
-func (p *Parser) parseDeferStmt() *DeferStmt {
-	p.nextToken() // skip 'defer'
-
-	// Parse the expression to be deferred (typically a function call)
-	expr := p.parseExpression()
-	if expr == nil {
-		p.error("expected expression after 'defer'")
-	}
-
-	return &DeferStmt{Call: expr}
-}
-
-func (p *Parser) parseSpawnStmt() *SpawnStmt {
-	p.nextToken() // skip 'spawn'
-
-	// Parse the expression to spawn
-	expr := p.parseExpression()
-	if expr == nil {
-		p.error("expected expression after 'spawn'")
-	}
-
-	// Check for optional pipe syntax: | params | block
-	var params []string
-	var block *BlockExpr
-
-	if p.peek.Type == TOKEN_PIPE {
-		p.nextToken() // move to PIPE
-		p.nextToken() // skip PIPE
-
-		// Parse parameter list (comma-separated identifiers)
-		// For now, only support simple identifiers, not map destructuring
-		for {
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected identifier in spawn pipe parameters")
-			}
-			params = append(params, p.current.Value)
-			p.nextToken()
-
-			if p.current.Type == TOKEN_COMMA {
-				p.nextToken() // skip comma
-			} else if p.current.Type == TOKEN_PIPE {
-				break
-			} else {
-				p.error("expected ',' or '|' in spawn pipe parameters")
-			}
-		}
-
-		p.nextToken() // skip final PIPE
-
-		// Parse block
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected block after spawn pipe parameters")
-		}
-
-		// Parse as BlockExpr
-		block = &BlockExpr{}
-		p.nextToken() // skip '{'
-		p.skipNewlines()
-
-		for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			stmt := p.parseStatement()
-			if stmt != nil {
-				block.Statements = append(block.Statements, stmt)
-			}
-			p.nextToken()
-			p.skipNewlines()
-		}
-
-		if p.current.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of spawn block")
-		}
-	}
-
-	return &SpawnStmt{
-		Expr:   expr,
-		Params: params,
-		Block:  block,
-	}
-}
-
-func (p *Parser) parseAliasStmt() *AliasStmt {
-	p.nextToken() // skip 'alias'
-
-	// Parse new keyword name
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after 'alias'")
-	}
-	newName := p.current.Value
-	p.nextToken()
-
-	// Expect '='
-	if p.current.Type != TOKEN_EQUALS {
-		p.error("expected '=' in alias declaration")
-	}
-	p.nextToken()
-
-	// Parse target keyword/token
-	targetName := p.current.Value
-	targetType := p.current.Type
-
-	// Validate that target is a valid keyword or operator
-	validTargets := map[TokenType]bool{
-		TOKEN_AT: true, TOKEN_IN: true, TOKEN_RET: true, TOKEN_ERR: true,
-		TOKEN_UNSAFE: true, TOKEN_ARENA: true, TOKEN_DEFER: true,
-		TOKEN_INF: true, TOKEN_AND: true, TOKEN_OR: true,
-		TOKEN_NOT: true, TOKEN_XOR: true, TOKEN_AT_PLUSPLUS: true,
-		TOKEN_IF: true, TOKEN_ELIF: true, TOKEN_ELSE: true,
-	}
-
-	// Special handling for @ operators (break/continue)
-	if targetName == "@-" {
-		targetType = TOKEN_AT // Break will be handled by checking targetName
-	} else if targetName == "@=" || targetName == "@++" {
-		targetType = TOKEN_AT_PLUSPLUS
-	} else if !validTargets[targetType] {
-		p.error("alias target must be a valid keyword or operator (e.g., @, @-, @=, in, ret, etc.)")
-	}
-
-	p.nextToken()
-
-	return &AliasStmt{
-		NewName:    newName,
-		TargetName: targetName,
-		Target:     targetType,
-	}
-}
-
-// cTypeAliases maps short type names to the canonical C type used internally.
 var cTypeAliases = map[string]string{
 	"i8": "int8", "i16": "int16", "i32": "int32", "i64": "int64",
 	"u8": "uint8", "u16": "uint16", "u32": "uint32", "u64": "uint64",
 	"f32": "float32", "f64": "float64",
 }
 
-// resolveCStructFieldType normalizes a struct field type name. It returns the
-// canonical C type and, for a nested cstruct-valued field, the cstruct's name
-// (the field is then stored as an 8-byte pointer).
-func (p *Parser) resolveCStructFieldType(name string) (ctype, structName string) {
-	if canon, ok := cTypeAliases[name]; ok {
-		name = canon
-	}
-	switch name {
-	case "int8", "int16", "int32", "int64",
-		"uint8", "uint16", "uint32", "uint64",
-		"float32", "float64", "ptr", "cstr":
-		return name, ""
-	}
-	if _, ok := p.cstructs[name]; ok {
-		// A nested cstruct value is held by pointer (8 bytes).
-		return "ptr", name
-	}
-	p.error(fmt.Sprintf("invalid field type '%s' (a primitive like f64/i32/ptr, or a cstruct name)", name))
-	return "ptr", ""
-}
-
-func (p *Parser) parseCStructDecl() *CStructDecl {
-	p.nextToken() // skip 'cstruct'
-
-	// Parse struct name
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected struct name after 'cstruct'")
-	}
-	name := p.current.Value
-	p.nextToken() // skip struct name
-
-	// Check for optional 'packed' modifier
-	packed := false
-	if p.current.Type == TOKEN_PACKED {
-		packed = true
-		p.nextToken() // skip 'packed'
-	}
-
-	// Check for optional 'aligned(N)' modifier
-	align := 0
-	if p.current.Type == TOKEN_ALIGNED {
-		p.nextToken() // skip 'aligned'
-		if p.current.Type != TOKEN_LPAREN {
-			p.error("expected '(' after 'aligned'")
-		}
-		p.nextToken() // skip '('
-		if p.current.Type != TOKEN_NUMBER {
-			p.error("expected alignment value")
-		}
-		alignVal, err := strconv.Atoi(p.current.Value)
-		if err != nil || alignVal <= 0 {
-			p.error("alignment must be a positive integer")
-		}
-		align = alignVal
-		p.nextToken() // skip number
-		if p.current.Type != TOKEN_RPAREN {
-			p.error("expected ')' after alignment value")
-		}
-		p.nextToken() // skip ')'
-	}
-
-	// Expect '{'
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' after struct name")
-	}
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	// Parse field list. A field is `name as Type` or `name: Type`; several names
-	// may share one type, `x, y, z: f64`. Type names may use short aliases
-	// (f64/u32/...) or another cstruct's name (a nested value field).
-	fields := []CStructField{}
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		// One or more comma-separated field names up to the `as`/`:` separator.
-		group := []string{}
-		for {
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected field name in struct definition")
-				break
+func (p *Parser) cstructDecl() Statement {
+	p.advance()
+	decl := &CStructDecl{Name: p.expect(TOKEN_IDENT, "a struct name").Value}
+	for p.at(TOKEN_IDENT) {
+		switch p.cur().Value {
+		case "packed":
+			p.advance()
+			decl.Packed = true
+		case "aligned":
+			p.advance()
+			p.expect(TOKEN_LPAREN, "'('")
+			n, err := strconv.Atoi(p.expect(TOKEN_NUMBER, "an alignment").Value)
+			if err != nil || n <= 0 {
+				p.fail("alignment must be a positive integer")
 			}
-			group = append(group, p.current.Value)
-			p.nextToken() // skip field name
-			if p.current.Type == TOKEN_COMMA {
-				p.nextToken() // skip ',' between grouped names
-				p.skipNewlines()
-				continue
+			decl.Align = n
+			p.expect(TOKEN_RPAREN, "')'")
+		default:
+			p.fail("unexpected %s in cstruct header", p.cur())
+		}
+	}
+	p.expect(TOKEN_LBRACE, "'{'")
+	p.skipEnds()
+	for !p.at(TOKEN_RBRACE) {
+		names := []string{p.expect(TOKEN_IDENT, "a field name").Value}
+		for p.accept(TOKEN_COMMA) {
+			names = append(names, p.expect(TOKEN_IDENT, "a field name").Value)
+		}
+		p.expect(TOKEN_COLON, "':' and a field type")
+		typeTok := p.expect(TOKEN_IDENT, "a field type")
+		ctype, nested := typeTok.Value, ""
+		if canon, ok := cTypeAliases[ctype]; ok {
+			ctype = canon
+		}
+		switch ctype {
+		case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "float32", "float64", "ptr", "cstr":
+		default:
+			if _, ok := p.cstructs[ctype]; !ok {
+				p.i--
+				p.fail("unknown field type '%s' (use int8..uint64, float32, float64, ptr, cstr or a cstruct)", ctype)
 			}
-			break
+			ctype, nested = "ptr", typeTok.Value
 		}
-
-		// Separator: `as` or `:`.
-		if p.current.Type != TOKEN_AS && p.current.Type != TOKEN_COLON {
-			p.error("expected 'as' or ':' after field name(s)")
+		for _, n := range names {
+			decl.Fields = append(decl.Fields, CStructField{Name: n, Type: ctype, StructName: nested})
 		}
-		p.nextToken() // skip 'as' / ':'
-
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected field type")
-		}
-		fieldType, structName := p.resolveCStructFieldType(p.current.Value)
-		p.nextToken() // skip type name
-
-		for _, fname := range group {
-			fields = append(fields, CStructField{Name: fname, Type: fieldType, StructName: structName})
-		}
-
-		p.skipNewlines()
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // optional ',' between fields
-			p.skipNewlines()
-		}
+		p.accept(TOKEN_COMMA)
+		p.skipEnds()
 	}
-
-	// Expect '}'
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of struct definition")
-	}
-
-	// Create struct declaration and calculate layout
-	decl := &CStructDecl{
-		Name:   name,
-		Fields: fields,
-		Packed: packed,
-		Align:  align,
-	}
+	p.expect(TOKEN_RBRACE, "'}'")
 	decl.CalculateStructLayout()
-
-	// Store the cstruct declaration for metadata access (Type.size, Type.field.offset)
-	p.cstructs[name] = decl
-
-	// Register constants for struct size and field offsets
-	// These can be used in expressions like: SDL_Rect_SIZEOF, SDL_Rect_x_OFFSET
-	p.constants[name+"_SIZEOF"] = &NumberExpr{Value: float64(decl.Size)}
-	for _, field := range decl.Fields {
-		constantName := name + "_" + field.Name + "_OFFSET"
-		p.constants[constantName] = &NumberExpr{Value: float64(field.Offset)}
-	}
-
+	p.cstructs[decl.Name] = decl
 	return decl
 }
 
-func (p *Parser) parseClassDecl() *ClassDecl {
-	p.nextToken() // skip 'class'
-
-	// Parse class name
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected class name after 'class'")
+// definition parses `name(params) = body` and `Type.name(params) = body`.
+func (p *Parser) definition() Statement {
+	j := p.i + 1
+	recv := ""
+	if p.peekAt(1).Type == TOKEN_DOT && p.peekAt(2).Type == TOKEN_IDENT && p.peekAt(3).Type == TOKEN_LPAREN {
+		recv = p.cur().Value
+		j = p.i + 3
 	}
-	name := p.current.Value
-	p.nextToken() // skip class name
-
-	// Parse optional compositions: <> Mixin1 <> Mixin2 ...
-	compositions := []string{}
-	for p.current.Type == TOKEN_LTGT {
-		p.nextToken() // skip '<>'
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier after '<>' in class declaration")
+	if p.toks[j].Type != TOKEN_LPAREN {
+		return nil
+	}
+	close := p.matching(j)
+	if close < 0 {
+		return nil
+	}
+	k := close + 1
+	if p.toks[k].Type == TOKEN_COLON && p.toks[k+1].Type == TOKEN_IDENT {
+		k += 2
+	}
+	if p.toks[k].Type != TOKEN_ASSIGN {
+		return nil
+	}
+	defPos := p.pos()
+	name := p.advance().Value
+	if recv != "" {
+		p.advance()
+		name = recv + "_" + p.advance().Value
+	}
+	p.declare(name)
+	lambda := p.paramList()
+	if recv != "" {
+		if len(lambda.Params) == 0 {
+			p.fail("a method needs a receiver parameter, e.g. %s.%s(self)", recv, strings.TrimPrefix(name, recv+"_"))
 		}
-		compositions = append(compositions, p.current.Value)
-		p.nextToken() // skip identifier
+		if lambda.ParamCStructTypes == nil {
+			lambda.ParamCStructTypes = map[string]string{}
+		}
+		lambda.ParamCStructTypes[lambda.Params[0]] = recv
 	}
-
-	// Expect '{'
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' after class name (and optional mixins)")
+	if p.accept(TOKEN_COLON) {
+		lambda.ReturnType = p.typeName()
 	}
-	p.nextToken() // skip '{'
+	p.expect(TOKEN_ASSIGN, "'='")
 	p.skipNewlines()
+	lambda.Pos = defPos
+	lambda.Body = p.functionBody(lambda)
+	return &AssignStmt{Pos: defPos, Name: name, Value: lambda}
+}
 
-	// Parse class body
-	classVars := make(map[string]Expression)
-	methods := make(map[string]*LambdaExpr)
-
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		// Parse identifier (for class var or method)
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier in class body")
-		}
-		ident := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Check for dot (class variable: ClassName.var = value)
-		if p.current.Type == TOKEN_DOT {
-			p.nextToken() // skip '.'
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected identifier after '.' in class variable")
+// matching returns the index of the bracket closing the one at open, or -1.
+func (p *Parser) matching(open int) int {
+	depth := 0
+	for k := open; k < len(p.toks); k++ {
+		switch p.toks[k].Type {
+		case TOKEN_LPAREN, TOKEN_LBRACKET, TOKEN_LBRACE:
+			depth++
+		case TOKEN_RPAREN, TOKEN_RBRACKET, TOKEN_RBRACE:
+			depth--
+			if depth == 0 {
+				return k
 			}
-			varName := p.current.Value
-			p.nextToken() // skip var name
-
-			if p.current.Type != TOKEN_EQUALS {
-				p.error("expected '=' after class variable name")
-			}
-			p.nextToken() // skip '='
-
-			// Parse the value expression
-			value := p.parseExpression()
-			classVars[ident+"."+varName] = value
-			p.nextToken() // move past expression
-			p.skipNewlines()
-			continue
+		case TOKEN_EOF:
+			return -1
 		}
+	}
+	return -1
+}
 
-		// Check for method definition: identifier = lambda or identifier := lambda
-		if p.current.Type == TOKEN_EQUALS || p.current.Type == TOKEN_COLON_EQUALS {
-			p.nextToken() // skip '=' or ':='
-
-			// Parse lambda expression - need to handle different lambda forms
-			var lambda *LambdaExpr
-
-			if p.current.Type == TOKEN_LPAREN {
-				// Parenthesized lambda: (x, y) => body
-				expr := p.parseExpression()
-				var ok bool
-				lambda, ok = expr.(*LambdaExpr)
-				if !ok {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
+// paramList parses `( [param {, param}] )` into a lambda without a body.
+func (p *Parser) paramList() *LambdaExpr {
+	lambda := &LambdaExpr{Params: []string{}}
+	p.expect(TOKEN_LPAREN, "'('")
+	for !p.at(TOKEN_RPAREN) {
+		if lambda.VariadicParam != "" {
+			p.fail("the variadic parameter must be the last one")
+		}
+		name := p.expect(TOKEN_IDENT, "a parameter name").Value
+		if p.accept(TOKEN_COLON) {
+			t := p.cur().Value
+			if _, ok := p.cstructs[t]; ok {
+				p.advance()
+				if lambda.ParamCStructTypes == nil {
+					lambda.ParamCStructTypes = map[string]string{}
 				}
-			} else if p.current.Type == TOKEN_IDENT {
-				// Non-parenthesized lambda: x => body or x, y => body
-				expr := p.tryParseNonParenLambda()
-				if expr == nil {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
-				}
-				var ok bool
-				lambda, ok = expr.(*LambdaExpr)
-				if !ok {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
-				}
+				lambda.ParamCStructTypes[name] = t
 			} else {
-				p.error("expected lambda expression after '=' or ':=' in method definition")
-			}
-
-			methods[ident] = lambda
-			p.skipNewlines()
-			continue
-		}
-
-		p.error("expected '=' or ':=' for method, or '.' for class variable in class body")
-	}
-
-	// Expect '}'
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of class definition")
-	}
-
-	return &ClassDecl{
-		Name:         name,
-		ClassVars:    classVars,
-		Methods:      methods,
-		Compositions: compositions,
-	}
-}
-
-func (p *Parser) parseStructLiteral(structName string) *StructLiteralExpr {
-	p.nextToken() // skip identifier (now on '{')
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	fields := make(map[string]Expression)
-
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected field name in struct literal")
-		}
-		fieldName := p.current.Value
-		p.nextToken() // skip field name
-
-		if p.current.Type != TOKEN_COLON {
-			p.error("expected ':' after field name in struct literal")
-		}
-		p.nextToken() // skip ':'
-
-		fieldValue := p.parseExpression()
-		fields[fieldName] = fieldValue
-
-		p.nextToken() // move past expression
-		p.skipNewlines()
-
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip ','
-			p.skipNewlines()
-		} else if p.current.Type != TOKEN_RBRACE {
-			p.error("expected ',' or '}' in struct literal")
-		}
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of struct literal")
-	}
-
-	return &StructLiteralExpr{
-		StructName: structName,
-		Fields:     fields,
-	}
-}
-
-// Confidence that this function is working: 100%
-func (p *Parser) parseStatement() Statement {
-	// Check for fun keyword (optional function definition marker)
-	if p.current.Type == TOKEN_FUN {
-		p.nextToken() // skip 'fun'
-		// `fun name(params) { ... }` desugars to `name = (params) -> { ... }`.
-		// `fun Type.method(params) { ... }` is a method: it desugars to a function
-		// `Type_method` with an implicit `self: Type` first parameter.
-		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_DOT {
-			recvType := p.current.Value
-			p.nextToken() // skip type name
-			p.nextToken() // skip '.'
-			return p.parseFunDefinition(recvType)
-		}
-		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_LPAREN {
-			return p.parseFunDefinition("")
-		}
-		return p.parseAssignment()
-	}
-
-	// Check for break keyword (alias for ret @)
-	if p.current.Type == TOKEN_BREAK {
-		return p.parseBreakStatement()
-	}
-
-	// Guard statement: `| cond => stmt` — a statement-level guard-match clause,
-	// sugar for `if cond { stmt }`. The canonical early-exit form:
-	//   | b == 0 => err "division by zero"
-	if p.current.Type == TOKEN_PIPE {
-		return p.parseGuardStatement()
-	}
-
-	// Check for if/elif/else conditionals
-	if p.current.Type == TOKEN_IF {
-		return p.parseIfStatement()
-	}
-	if p.current.Type == TOKEN_ELIF || p.current.Type == TOKEN_ELSE {
-		p.error(fmt.Sprintf("unexpected '%s' without preceding if", p.current.Value))
-	}
-
-	// Check for continue keyword (alias for continue)
-	if p.current.Type == TOKEN_CONTINUE {
-		return p.parseContinueStatement()
-	}
-
-	// Check for foreach keyword (alias for @ ... in)
-	if p.current.Type == TOKEN_FOREACH {
-		return p.parseForeachStatement()
-	}
-
-	// Check for while keyword: `while cond { body }` is a condition loop with no
-	// explicit iteration bound (runs until the condition is false).
-	if p.current.Type == TOKEN_WHILE {
-		return p.parseWhileStatement()
-	}
-
-	// Check for use keyword (imports)
-	if p.current.Type == TOKEN_USE {
-		p.nextToken() // skip 'use'
-		if p.current.Type != TOKEN_STRING {
-			p.error("expected string after 'use'")
-		}
-		path := p.current.Value
-		return &UseStmt{Path: path}
-	}
-
-	// Check for export keyword
-	if p.current.Type == TOKEN_EXPORT {
-		return p.parseExport()
-	}
-
-	// Check for import keyword (git URL imports)
-	if p.current.Type == TOKEN_IMPORT {
-		return p.parseImport()
-	}
-
-	// Check for cstruct keyword (C-compatible struct definition)
-	if p.current.Type == TOKEN_CSTRUCT {
-		return p.parseCStructDecl()
-	}
-
-	// Check for class keyword (class definition)
-	if p.current.Type == TOKEN_CLASS {
-		return p.parseClassDecl()
-	}
-
-	// Check for arena keyword
-	if p.current.Type == TOKEN_ARENA {
-		return p.parseArenaStmt()
-	}
-
-	// Check for with keyword (subject-injection block)
-	if p.current.Type == TOKEN_WITH {
-		return p.parseWithStmt()
-	}
-
-	// Check for defer keyword
-	if p.current.Type == TOKEN_DEFER {
-		return p.parseDeferStmt()
-	}
-
-	// Check for alias keyword
-	if p.current.Type == TOKEN_ALIAS {
-		return p.parseAliasStmt()
-	}
-
-	// Check for spawn keyword (spawn process)
-	if p.current.Type == TOKEN_SPAWN {
-		return p.parseSpawnStmt()
-	}
-
-	// Check for ret/err keywords (but not if followed by assignment operator)
-	if p.current.Type == TOKEN_RET || p.current.Type == TOKEN_ERR {
-		// If TOKEN_RET followed by assignment operator, treat as identifier for assignment
-		if p.current.Type == TOKEN_RET &&
-			(p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_EQUALS ||
-				p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_COLON ||
-				p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-				p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS ||
-				p.peek.Type == TOKEN_MOD_EQUALS) {
-			// Treat TOKEN_RET as TOKEN_IDENT for assignment purposes
-			// by converting the token type temporarily
-			p.current.Type = TOKEN_IDENT
-			return p.parseAssignment()
-		}
-		return p.parseJumpStatement()
-	}
-
-	// Check for @++ (continue current loop)
-	if p.current.Type == TOKEN_AT_PLUSPLUS {
-		return p.parseLoopStatement()
-	}
-
-	// Check for parallel loops: @@ or N @
-	if p.current.Type == TOKEN_AT_AT {
-		// @@ means parallel loop with all cores
-		return p.parseLoopStatement()
-	}
-
-	// Check for N @ (parallel loop with N threads)
-	if p.current.Type == TOKEN_NUMBER && p.peek.Type == TOKEN_AT {
-		// This is N @ syntax for parallel loops
-		return p.parseLoopStatement()
-	}
-
-	// Check for @ (loop)
-
-	// Check for @ (either loop @N, loop @ ident, or jump @N)
-	if p.current.Type == TOKEN_AT {
-		return p.parseLoopStatement()
-	}
-
-	// Check for indexed assignment: ptr[offset] <- value
-	if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_LBRACKET {
-		// Look ahead to see if this is an indexed assignment (ptr[...] <- ...)
-		// We need to check if after the [...] there's a <-
-
-		// Save lexer state for restoration
-		lexerState := p.lexer.save()
-		savedCurrent := p.current
-		savedPeek := p.peek
-
-		p.nextToken() // skip identifier
-		p.nextToken() // skip '['
-
-		// Skip over the index expression
-		bracketDepth := 1
-		for bracketDepth > 0 && p.current.Type != TOKEN_EOF {
-			if p.current.Type == TOKEN_LBRACKET {
-				bracketDepth++
-			} else if p.current.Type == TOKEN_RBRACKET {
-				bracketDepth--
-			}
-			p.nextToken()
-		}
-
-		// Check if followed by <-
-		isIndexedAssignment := p.current.Type == TOKEN_LEFT_ARROW
-
-		// Restore lexer state
-		p.lexer.restore(lexerState)
-		p.current = savedCurrent
-		p.peek = savedPeek
-
-		if isIndexedAssignment {
-			return p.parseIndexedAssignment()
-		}
-	}
-
-	// Check for `.field` assignment (this.field = value)
-	if p.current.Type == TOKEN_DOT && p.peek.Type == TOKEN_IDENT {
-		p.nextToken() // skip '.'
-		fieldName := "this." + p.current.Value
-		p.current.Value = fieldName
-		p.current.Type = TOKEN_IDENT
-		// Now handle as regular assignment
-		if p.peek.Type == TOKEN_EQUALS || p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_LEFT_ARROW ||
-			p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-			p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS || p.peek.Type == TOKEN_MOD_EQUALS {
-			return p.parseAssignment()
-		}
-	}
-
-	// Check for shadow keyword (variable declaration)
-	if p.current.Type == TOKEN_SHADOW {
-		return p.parseAssignment()
-	}
-
-	// Check for assignment (=, :=, ->>, <-, with optional type annotation, and compound assignments)
-	if p.current.Type == TOKEN_IDENT {
-		// Check for multiple assignment: a, b, c = expr
-		if p.peek.Type == TOKEN_COMMA {
-			// Could be multiple assignment or lambda params - lookahead
-			if stmt := p.tryParseMultipleAssignment(); stmt != nil {
-				return stmt
-			}
-		}
-
-		// Check for type annotation: x: num = value
-		// This needs to be distinguished from map literal at module level
-		// Type annotation: x: <type_keyword> = ...
-		// Map literal starts with { or is part of an expression
-		if p.peek.Type == TOKEN_COLON && p.functionDepth == 0 {
-			// Look ahead to see if this is a type annotation
-			// Save state
-			saved := p.saveState()
-			p.nextToken() // skip identifier
-			p.nextToken() // skip ':'
-
-			// Check if next token is a type keyword (contextual - comes as IDENT or TOKEN_BOOL)
-			isTypeAnnotation := false
-			if p.current.Type == TOKEN_IDENT {
-				switch p.current.Value {
-				case "num", "str", "list", "map", "bool",
-					"cstring", "cptr", "cint", "clong",
-					"cfloat", "cdouble", "cbool", "cvoid":
-					isTypeAnnotation = true
+				if lambda.ParamTypes == nil {
+					lambda.ParamTypes = map[string]*TimType{}
 				}
-			} else if p.current.Type == TOKEN_BOOL {
-				// bool is a keyword token, not an identifier
-				isTypeAnnotation = true
-			}
-
-			// Restore state
-			p.restoreState(saved)
-
-			// If it's a type annotation, parse as assignment
-			if isTypeAnnotation {
-				return p.parseAssignment()
+				lambda.ParamTypes[name] = p.typeName()
 			}
 		}
-
-		if p.peek.Type == TOKEN_EQUALS || p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_COLON ||
-			p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-			p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS || p.peek.Type == TOKEN_MOD_EQUALS {
-			return p.parseAssignment()
+		if p.accept(TOKEN_ELLIPSIS) {
+			lambda.VariadicParam = name
+		} else {
+			lambda.Params = append(lambda.Params, name)
 		}
-	}
-
-	// Otherwise, it's an expression statement (or match expression)
-	expr := p.parseExpression()
-	if expr != nil {
-		// Only parse match blocks if we're not already inside one
-		if !p.inMatchBlock && p.peek.Type == TOKEN_LBRACE {
-			if VerboseMode {
-				debugf("DEBUG parseStatement: calling parseMatchBlock with expr=%T, inMatchBlock=%v\n", expr, p.inMatchBlock)
-			}
-			p.nextToken() // move to '{'
-			p.nextToken() // skip '{'
-			p.skipNewlines()
-			matchExpr := p.parseMatchBlock(expr)
-			return &ExpressionStmt{Expr: matchExpr}
-		}
-
-		return &ExpressionStmt{Expr: expr}
-	}
-
-	return nil
-}
-
-// tryParseNonParenLambda attempts to parse a lambda without parentheses: x => expr or x, y => expr
-// Returns nil if current position doesn't look like a lambda
-func (p *Parser) tryParseNonParenLambda() Expression {
-	if p.current.Type != TOKEN_IDENT {
-		return nil
-	}
-
-	// Single param: x ->
-	firstParam := p.current.Value
-	if p.peek.Type == TOKEN_ARROW {
-		p.nextToken()                         // skip param
-		p.nextToken()                         // skip '->'
-		p.lambdaParams = []string{firstParam} // Store params for parseLambdaBody
-		body := p.parseLambdaBody()
-		p.lambdaParams = nil // Clear after use
-		return &LambdaExpr{Params: []string{firstParam}, VariadicParam: "", Body: body}
-	}
-
-	// If we see => it's not a lambda (it's a match arrow), just return nil
-	if p.peek.Type == TOKEN_FAT_ARROW {
-		return nil
-	}
-
-	// Multi param: x, y, z =>
-	// Parameters are comma-separated
-	if p.peek.Type != TOKEN_COMMA {
-		return nil
-	}
-
-	// Collect parameters until we find => or something else
-	params := []string{firstParam}
-
-	for p.peek.Type == TOKEN_COMMA {
-		p.nextToken() // skip current param
-		p.nextToken() // skip ','
-
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected parameter name after ','")
-		}
-
-		params = append(params, p.current.Value)
-
-		if p.peek.Type == TOKEN_ARROW {
-			// Found the arrow! This is a lambda
-			p.nextToken()           // skip last param
-			p.nextToken()           // skip '->'
-			p.lambdaParams = params // Store params for parseLambdaBody
-			body := p.parseLambdaBody()
-			p.lambdaParams = nil // Clear after use
-			return &LambdaExpr{Params: params, VariadicParam: "", Body: body}
-		}
-
-		// If we see => it's not a lambda, just return nil
-		if p.peek.Type == TOKEN_FAT_ARROW {
-			return nil
-		}
-	}
-
-	// We have multiple identifiers separated by commas but no arrow following
-	p.error(fmt.Sprintf("expected '->' after lambda parameters (%s), got %v", strings.Join(params, ", "), p.peek.Type))
-	return nil
-}
-
-// parseFString parses an f-string and returns an FStringExpr
-// F-strings have the format: f"text {expr} more text {expr2}"
-// We convert this to alternating string literals and expressions
-func (p *Parser) parseFString() Expression {
-	raw := p.current.Value // Raw f-string content without f" and "
-
-	var parts []Expression
-	currentPos := 0
-
-	for currentPos < len(raw) {
-		// Find next {
-		nextBrace := -1
-		for i := currentPos; i < len(raw); i++ {
-			if raw[i] == '{' {
-				// Check if it's escaped {{
-				if i+1 < len(raw) && raw[i+1] == '{' {
-					i++ // Skip the second {
-					continue
-				}
-				nextBrace = i
-				break
-			}
-		}
-
-		// If no more braces, add remaining text as string literal
-		if nextBrace == -1 {
-			if currentPos < len(raw) {
-				text := raw[currentPos:]
-				// Process escape sequences and unescape {{  }}
-				text = strings.ReplaceAll(text, "{{", "{")
-				text = strings.ReplaceAll(text, "}}", "}")
-				text = processEscapeSequences(text)
-				parts = append(parts, &StringExpr{Value: text})
-			}
+		if !p.accept(TOKEN_COMMA) {
 			break
 		}
-
-		// Add text before { as string literal
-		if nextBrace > currentPos {
-			text := raw[currentPos:nextBrace]
-			// Process escape sequences and unescape {{ }}
-			text = strings.ReplaceAll(text, "{{", "{")
-			text = strings.ReplaceAll(text, "}}", "}")
-			text = processEscapeSequences(text)
-			parts = append(parts, &StringExpr{Value: text})
-		}
-
-		// Find matching }
-		braceDepth := 1
-		exprStart := nextBrace + 1
-		exprEnd := exprStart
-		for exprEnd < len(raw) && braceDepth > 0 {
-			if raw[exprEnd] == '{' {
-				braceDepth++
-			} else if raw[exprEnd] == '}' {
-				braceDepth--
-			}
-			if braceDepth > 0 {
-				exprEnd++
-			}
-		}
-
-		if braceDepth != 0 {
-			p.error("unclosed { in f-string")
-			return &StringExpr{Value: raw}
-		}
-
-		// Parse the expression inside {...}
-		exprCode := raw[exprStart:exprEnd]
-		exprLexer := NewLexer(exprCode)
-		exprParser := NewParser(exprCode)
-		exprParser.lexer = exprLexer
-		exprParser.current = exprLexer.NextToken()
-		exprParser.peek = exprLexer.NextToken()
-
-		expr := exprParser.parseExpression()
-
-		parts = append(parts, expr)
-
-		currentPos = exprEnd + 1 // Skip past the }
 	}
-
-	// If only one part and it's a string, return a regular StringExpr
-	if len(parts) == 1 {
-		if strExpr, ok := parts[0].(*StringExpr); ok {
-			return strExpr
-		}
-	}
-
-	return &FStringExpr{Parts: parts}
+	p.expect(TOKEN_RPAREN, "')'")
+	return lambda
 }
 
-// Confidence that this function is working: 100%
-// isCastTypeName reports whether name denotes a type usable as a cast target —
-// a declared cstruct or a built-in Tim/C type. Used to recognize the `:`-as-`as`
-// shorthand (and to keep `{ x : Type }` from being misread as a map literal).
-func (p *Parser) isCastTypeName(name string) bool {
-	if _, ok := p.cstructs[name]; ok {
-		return true
+// functionBody parses a lambda or definition body in a new scope.
+func (p *Parser) functionBody(lambda *LambdaExpr) Expression {
+	p.pushScope()
+	defer p.popScope()
+	for _, n := range lambda.Params {
+		p.declare(n)
 	}
-	switch name {
-	case "int8", "int16", "int32", "int64",
-		"uint8", "uint16", "uint32", "uint64",
-		"char", "short", "int", "long", "uchar", "ushort", "uint", "ulong",
-		"size_t", "ssize_t", "ptrdiff_t",
-		"float", "float32", "float64", "double",
-		"cstr", "cptr", "cstring", "ptr", "pointer",
-		"num", "str", "number", "string", "list", "map", "addr",
-		"bool", "boolean", "cbool", "void":
+	if lambda.VariadicParam != "" {
+		p.declare(lambda.VariadicParam)
+	}
+	loops := p.loops
+	p.loops = 0
+	defer func() { p.loops = loops }()
+	return nested(p, p.expr)
+}
+
+var nativeTypes = map[string]TypeKind{
+	"num": TypeNumber, "str": TypeString, "list": TypeList, "map": TypeMap, "bool": TypeBoolean,
+}
+
+var cTypes = map[string]*TimType{
+	"cstring": {Kind: TypeCString, CType: "char*"}, "cptr": {Kind: TypeCPointer, CType: "void*"},
+	"cint": {Kind: TypeCInt, CType: "int"}, "clong": {Kind: TypeCLong, CType: "long"},
+	"cfloat": {Kind: TypeCFloat, CType: "float"}, "cdouble": {Kind: TypeCDouble, CType: "double"},
+	"cbool": {Kind: TypeCBool, CType: "bool"}, "cvoid": {Kind: TypeCVoid},
+}
+
+// typeName parses a type annotation.
+func (p *Parser) typeName() *TimType {
+	t := p.expect(TOKEN_IDENT, "a type")
+	if k, ok := nativeTypes[t.Value]; ok {
+		return &TimType{Kind: k}
+	}
+	if t.Value == "fn" {
+		return &TimType{Kind: TypeUnknown, CType: "fn"}
+	}
+	if ct, ok := cTypes[t.Value]; ok {
+		c := *ct
+		return &c
+	}
+	if _, ok := p.cstructs[t.Value]; ok {
+		return &TimType{Kind: TypeCPointer, CType: t.Value}
+	}
+	p.i--
+	p.fail("unknown type '%s'", t.Value)
+	return nil
+}
+
+// binding parses `x = e`, `x := e`, `x: T = e` and `a, b = e`.
+func (p *Parser) binding() Statement {
+	names := []string{p.cur().Value}
+	k := p.i + 1
+	for p.toks[k].Type == TOKEN_COMMA && p.toks[k+1].Type == TOKEN_IDENT {
+		names = append(names, p.toks[k+1].Value)
+		k += 2
+	}
+	annotated := false
+	if len(names) == 1 && p.toks[k].Type == TOKEN_COLON && p.toks[k+1].Type == TOKEN_IDENT &&
+		(p.toks[k+2].Type == TOKEN_ASSIGN || p.toks[k+2].Type == TOKEN_DEFINE) {
+		annotated = true
+		k += 2
+	}
+	op := p.toks[k].Type
+	if op != TOKEN_ASSIGN && op != TOKEN_DEFINE {
+		return nil
+	}
+	bindPos := p.pos()
+	p.i += 1 + 2*(len(names)-1)
+	var ann *TimType
+	if annotated {
+		p.advance()
+		ann = p.typeName()
+	}
+	p.advance()
+	p.skipNewlines()
+	mutable := op == TOKEN_DEFINE
+	for _, n := range names {
+		p.declare(n)
+	}
+	start := p.i
+	value := p.expr()
+	if len(names) > 1 {
+		return &MultipleAssignStmt{Pos: bindPos, Names: names, Value: value, Mutable: mutable}
+	}
+	if b, ok := value.(*BlockExpr); ok && p.toks[start].Type == TOKEN_LBRACE && p.matching(start) == p.i-1 {
+		value = &LambdaExpr{Pos: tokPos(p.toks[start]), Params: []string{}, Body: b}
+	}
+	return &AssignStmt{Pos: bindPos, Name: names[0], Value: value, Mutable: mutable, TypeAnnotation: ann}
+}
+
+var compoundOps = map[TokenType]string{
+	TOKEN_PLUS_EQ: "+", TOKEN_MINUS_EQ: "-", TOKEN_STAR_EQ: "*", TOKEN_SLASH_EQ: "/", TOKEN_PERCENT_EQ: "%",
+}
+
+// update parses `place <- e` and `place op= e`.
+func (p *Parser) update() Statement {
+	k := p.i + 1
+	for {
+		switch p.toks[k].Type {
+		case TOKEN_LBRACKET:
+			if k = p.matching(k); k < 0 {
+				return nil
+			}
+			k++
+			continue
+		case TOKEN_DOT:
+			if p.toks[k+1].Type == TOKEN_IDENT {
+				k += 2
+				continue
+			}
+		}
+		break
+	}
+	opTok := p.toks[k].Type
+	_, compound := compoundOps[opTok]
+	if opTok != TOKEN_UPDATE && !compound {
+		return nil
+	}
+	updPos := p.pos()
+	name := p.advance().Value
+	var place Expression = &IdentExpr{Pos: updPos, Name: name}
+	var last func(Expression) Statement
+	for p.i < k {
+		elemPos := p.pos()
+		if p.accept(TOKEN_DOT) {
+			field := p.advance().Value
+			obj := place
+			place = &FieldAccessExpr{Pos: elemPos, Object: obj, FieldName: field, Offset: -1}
+			last = func(v Expression) Statement {
+				return &FieldUpdateStmt{Pos: elemPos, Object: obj, Field: field, Value: v}
+			}
+			continue
+		}
+		p.advance()
+		idx := nested(p, p.expr)
+		p.expect(TOKEN_RBRACKET, "']'")
+		obj := place
+		place = &IndexExpr{Pos: elemPos, List: obj, Index: idx}
+		last = func(v Expression) Statement {
+			ident, ok := obj.(*IdentExpr)
+			if !ok {
+				return &IndexUpdateStmt{Pos: elemPos, Target: obj, Index: idx, Value: v}
+			}
+			if c, ok := v.(*CastExpr); ok {
+				if short, ok := map[string]string{"int8": "i8", "int16": "i16", "int32": "i32", "int64": "i64",
+					"uint8": "u8", "uint16": "u16", "uint32": "u32", "uint64": "u64", "float32": "f32", "float64": "f64"}[c.Type]; ok {
+					return &ExpressionStmt{Expr: &CallExpr{Function: "write_" + short, Args: []Expression{ident, &CastExpr{Expr: idx, Type: "int32"}, c.Expr}}}
+				}
+			}
+			return &MapUpdateStmt{Pos: elemPos, MapName: ident.Name, Index: idx, Value: v}
+		}
+	}
+	opPos := p.pos()
+	p.advance()
+	p.skipNewlines()
+	value := p.expr()
+	if compound {
+		value = &BinaryExpr{Pos: opPos, Left: place, Operator: compoundOps[opTok], Right: value}
+	}
+	if last == nil {
+		return &AssignStmt{Pos: updPos, Name: name, Value: value, Mutable: true, IsUpdate: true}
+	}
+	return last(value)
+}
+
+// loop parses `@ [spec] [! bound] block`.
+func (p *Parser) loop() Statement {
+	loopPos := p.pos()
+	p.advance()
+	var iterator, iterType string
+	var iterable, cond Expression
+	switch {
+	case p.at(TOKEN_LBRACE), p.at(TOKEN_BANG):
+	case p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_IN,
+		p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_COLON && p.peekAt(2).Type == TOKEN_IDENT && p.peekAt(3).Type == TOKEN_IN:
+		iterator = p.advance().Value
+		if p.accept(TOKEN_COLON) {
+			iterType = p.advance().Value
+		}
+		p.advance()
+		p.noMatch++
+		iterable = p.expr()
+		p.noMatch--
+	default:
+		p.noMatch++
+		cond = p.expr()
+		p.noMatch--
+	}
+	maxIter, bounded := int64(math.MaxInt64), false
+	if p.accept(TOKEN_BANG) {
+		bounded = true
+		switch t := p.cur(); t.Type {
+		case TOKEN_INF:
+			p.advance()
+			bounded = false
+		case TOKEN_NUMBER:
+			n, err := strconv.ParseInt(t.Value, 0, 64)
+			if err != nil || n < 1 {
+				p.fail("a loop bound must be a positive integer")
+			}
+			maxIter = n
+			p.advance()
+		default:
+			p.fail("expected a number after '!', found %s", t)
+		}
+	}
+	p.pushScope()
+	defer p.popScope()
+	if iterator != "" {
+		p.declare(iterator)
+	}
+	p.loops++
+	body := p.blockStmts()
+	p.loops--
+	if iterable != nil {
+		return &LoopStmt{Pos: loopPos, Iterator: iterator, IteratorType: iterType, Iterable: iterable, Body: body, MaxIterations: maxIter, NeedsMaxCheck: bounded}
+	}
+	if cond == nil {
+		cond = &NumberExpr{Value: 1}
+	}
+	return &WhileStmt{Pos: loopPos, Condition: cond, Body: body, MaxIterations: maxIter}
+}
+
+func (p *Parser) jump() Statement {
+	jumpPos := p.pos()
+	isBreak := p.advance().Type == TOKEN_BREAK
+	word := map[bool]string{true: "break", false: "continue"}[isBreak]
+	if p.loops == 0 {
+		p.i--
+		p.fail("'%s' outside a loop", word)
+	}
+	label := -1
+	if p.accept(TOKEN_AT) {
+		t := p.expect(TOKEN_NUMBER, "a loop number after '@'")
+		n, err := strconv.Atoi(t.Value)
+		if err != nil || n < 1 || n > p.loops {
+			p.i--
+			p.fail("there is no loop @%s here (loops are numbered 1..%d from the outermost)", t.Value, p.loops)
+		}
+		label = n
+	}
+	return &JumpStmt{Pos: jumpPos, IsBreak: isBreak, Label: label}
+}
+
+func (p *Parser) endsValue() bool {
+	switch p.cur().Type {
+	case TOKEN_NEWLINE, TOKEN_SEMICOLON, TOKEN_RBRACE, TOKEN_EOF, TOKEN_DEFAULT:
+		return true
+	case TOKEN_PIPE:
+		return p.noPipe > 0
+	}
+	return false
+}
+
+func (p *Parser) ret() Statement {
+	retPos := p.pos()
+	isErr := p.advance().Type == TOKEN_ERR
+	var value Expression
+	if !p.endsValue() {
+		value = p.expr()
+	}
+	if isErr {
+		if value == nil {
+			value = &StringExpr{Value: "err"}
+		}
+		value = &CallExpr{Pos: retPos, Function: "error", Args: []Expression{value}}
+	}
+	return &JumpStmt{Pos: retPos, IsBreak: true, Value: value}
+}
+
+func (p *Parser) ifStmt() Statement {
+	stmt := &IfStmt{}
+	for p.at(TOKEN_IF) || p.at(TOKEN_ELIF) && len(stmt.Branches) > 0 {
+		p.advance()
+		p.noMatch++
+		cond := p.expr()
+		p.noMatch--
+		stmt.Branches = append(stmt.Branches, IfBranch{Condition: cond, Body: p.scopedBlockStmts()})
+		if !p.continuesIf() {
+			return stmt
+		}
+		if p.at(TOKEN_ELSE) {
+			p.advance()
+			stmt.ElseBody = p.scopedBlockStmts()
+			return stmt
+		}
+	}
+	return stmt
+}
+
+// continuesIf skips line breaks before an elif/else that continues an if.
+func (p *Parser) continuesIf() bool {
+	k := p.i
+	for p.toks[k].Type == TOKEN_NEWLINE {
+		k++
+	}
+	if p.toks[k].Type == TOKEN_ELIF || p.toks[k].Type == TOKEN_ELSE {
+		p.i = k
 		return true
 	}
 	return false
 }
 
-// parseFunDefinition parses the `fun name(params) { body }` function-definition
-// form (the 'fun' keyword and the name being on p.current). Parameters may carry
-// a cstruct type via `name as Type` or `name: Type`. It desugars to
-// `name = (params) -> body`. An optional return-type annotation (`) as Type` /
-// `) : Type`) is accepted and ignored (the runtime type is uniform float64).
-func (p *Parser) parseFunDefinition(recvType string) Statement {
-	name := p.current.Value
-	if recvType != "" {
-		// Method `fun Type.method(...)` → function `Type_method(self: Type, ...)`.
-		name = recvType + "_" + name
-	}
-	p.nextToken() // skip function (or method) name
-	p.nextToken() // skip '('
-
-	var params []string
-	paramTypes := make(map[string]string)
-	variadic := ""
-	if recvType != "" {
-		params = append(params, "self")
-		paramTypes["self"] = recvType
-	}
-	for p.current.Type != TOKEN_RPAREN && p.current.Type != TOKEN_EOF {
-		p.skipNewlines()
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected parameter name in fun definition")
-			break
-		}
-		pname := p.current.Value
-		p.nextToken()
-
-		if p.current.Type == TOKEN_ELLIPSIS {
-			variadic = pname
-			p.nextToken()
-			break
-		}
-		params = append(params, pname)
-
-		// Optional type annotation: `name as Type` or `name: Type`.
-		if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
-			p.nextToken()
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected type name after type annotation in fun parameter")
-			}
-			paramTypes[pname] = p.current.Value
-			p.nextToken()
-		}
-
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken()
-		}
-	}
-	p.nextToken() // skip ')'
-
-	// Optional, ignored return-type annotation: `) as Type` or `) : Type`.
-	if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
-		p.nextToken()
-		if p.current.Type == TOKEN_IDENT {
-			p.nextToken()
-		}
-	}
-	// Optional arrow/equals before an expression body: `fun f() -> expr` or
-	// `fun f() = expr` (both equivalent to a single-expression body).
-	if p.current.Type == TOKEN_ARROW || p.current.Type == TOKEN_EQUALS {
-		p.nextToken()
-	}
-
-	p.lambdaParams = params
-	body := p.parseLambdaBody()
-	p.lambdaParams = nil
-
-	lambda := &LambdaExpr{
-		Params:            params,
-		ParamCStructTypes: paramTypes,
-		VariadicParam:     variadic,
-		Body:              body,
-	}
-	return &AssignStmt{Name: name, Value: lambda}
+func (p *Parser) scopedBlockStmts() []Statement {
+	p.pushScope()
+	defer p.popScope()
+	return p.blockStmts()
 }
 
-func (p *Parser) parseAssignment() *AssignStmt {
-	// Check for shadow keyword
-	hasShadow := false
-	if p.current.Type == TOKEN_SHADOW {
-		hasShadow = true
-		p.nextToken() // skip 'shadow'
-	}
-
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after 'shadow' keyword")
-		return nil
-	}
-
-	name := p.current.Value
-	p.nextToken() // skip identifier
-
-	// Check for type annotation: name: type
-	var precision string
-	var typeAnnotation *TimType
-	if p.current.Type == TOKEN_COLON && (p.peek.Type == TOKEN_IDENT || p.peek.Type == TOKEN_BOOL) {
-		p.nextToken() // skip ':'
-
-		// Try new type system first (num, str, cstring, etc.)
-		typeAnnotation = p.parseTypeAnnotation()
-		if typeAnnotation != nil {
-			p.nextToken() // skip type keyword
-		} else {
-			// Fall back to legacy precision format (bNN or fNN)
-			precision = p.current.Value
-			// Validate precision format (bNN or fNN where NN is a number)
-			if len(precision) < 2 || (precision[0] != 'b' && precision[0] != 'f') {
-				p.error("invalid type annotation: expected num, str, list, map, bool, cstring, cptr, cint, clong, cfloat, cdouble, cbool, cvoid, or legacy bNN/fNN")
+// blockStmts parses `{ stmt ... }`.
+func (p *Parser) blockStmts() []Statement {
+	p.expect(TOKEN_LBRACE, "'{'")
+	return nested(p, func() []Statement {
+		var stmts []Statement
+		p.skipEnds()
+		for !p.at(TOKEN_RBRACE) {
+			if p.at(TOKEN_EOF) {
+				p.fail("expected '}' to close the block")
 			}
-			p.nextToken() // skip precision identifier
-		}
-	}
-
-	// Check for compound assignment operators (+=, -=, *=, **=, /=, %=)
-	var compoundOp string
-	switch p.current.Type {
-	case TOKEN_PLUS_EQUALS:
-		compoundOp = "+"
-	case TOKEN_MINUS_EQUALS:
-		compoundOp = "-"
-	case TOKEN_STAR_EQUALS:
-		compoundOp = "*"
-	case TOKEN_POWER_EQUALS:
-		compoundOp = "**"
-	case TOKEN_SLASH_EQUALS:
-		compoundOp = "/"
-	case TOKEN_MOD_EQUALS:
-		compoundOp = "%"
-	}
-
-	// Determine assignment type
-	// := - mutable definition
-	// = - immutable definition
-	// <- - update (requires existing mutable variable)
-	isUpdate := p.current.Type == TOKEN_LEFT_ARROW
-	mutable := p.current.Type == TOKEN_COLON_EQUALS || isUpdate
-
-	p.nextToken() // skip '=' or ':=' or '<-' or compound operator
-
-	// For recursive functions at module level, declare the name BEFORE parsing the value
-	// This allows the function to reference itself in its body
-	// But only for module-level functions (functionDepth == 0)
-	// Local variables in functions don't need this (they can't recurse anyway)
-	declareNowForRecursion := !isUpdate && p.functionDepth == 0
-	if declareNowForRecursion {
-		// Declare function name in module scope for recursion
-		p.declareVariable(name)
-	}
-
-	// Check for non-parenthesized lambda: x -> expr or x y -> expr
-	var value Expression
-
-	if p.current.Type == TOKEN_IDENT {
-		value = p.tryParseNonParenLambda()
-		if value == nil {
-			value = p.parseExpression()
-		}
-	} else {
-		value = p.parseExpression()
-	}
-
-	// Check for match block after expression
-	if p.peek.Type == TOKEN_LBRACE {
-		p.nextToken() // move to expression
-		p.nextToken() // skip '{'
-		p.skipNewlines()
-		value = p.parseMatchBlock(value)
-	}
-
-	// According to GRAMMAR.md:
-	// Zero-argument lambdas: When a statement block or match block is assigned directly
-	// without parameters, it should be inferred as a zero-arg lambda.
-	// This does NOT apply to map literals (they have : in them).
-	//
-	// Examples:
-	//   main = { println("hello") }      // Inferred: main = -> { println("hello") }
-	//   handler = { | x > 0 => "pos" }   // Inferred: handler = -> { | x > 0 => "pos" }
-	//   config = { port: 8080 }          // NOT wrapped: map literal
-	switch v := value.(type) {
-	case *BlockExpr:
-		// Statement block -> wrap in zero-arg lambda
-		value = &LambdaExpr{Params: []string{}, VariadicParam: "", Body: v}
-	case *MatchExpr:
-		// Match expressions should execute immediately at assignment time
-		// They should NOT be wrapped in lambdas
-		//
-		// Examples that should execute immediately:
-		//   x = n { 0 => "zero" 1 => "one" }  // value match on variable n
-		//   y = { | n == 0 => "zero" | n == 1 => "one" }  // guard match
-		//
-		// The old logic incorrectly wrapped guard matches in zero-arg lambdas,
-		// causing them to return function pointers instead of values.
-		//
-		// Match expressions are always meant to be evaluated immediately.
-		// If the user wants a lambda that returns a match result, they write:
-		//   f = (x) { | x == 0 => "zero" }
-		//
-		// Don't wrap MatchExpr in a lambda - let it execute immediately
-		// MapExpr is NOT wrapped - it's a literal value
-	}
-
-	// Check for multiple lambda dispatch: f = (x) -> x, (y) -> y + 1
-	if lambda, ok := value.(*LambdaExpr); ok && p.peek.Type == TOKEN_COMMA {
-		lambdas := []*LambdaExpr{lambda}
-
-		for p.peek.Type == TOKEN_COMMA {
-			p.nextToken() // move to comma
-			p.nextToken() // skip comma
-
-			// Try non-parenthesized lambda first
-			var nextExpr Expression
-			if p.current.Type == TOKEN_IDENT {
-				nextExpr = p.tryParseNonParenLambda()
-				if nextExpr == nil {
-					nextExpr = p.parseExpression()
-				}
-			} else {
-				nextExpr = p.parseExpression()
-			}
-
-			if nextLambda, ok := nextExpr.(*LambdaExpr); ok {
-				lambdas = append(lambdas, nextLambda)
-			} else {
-				p.error("expected lambda expression after comma in multiple lambda dispatch")
-			}
-		}
-
-		// Wrap in MultiLambdaExpr
-		value = &MultiLambdaExpr{Lambdas: lambdas}
-	}
-
-	// Transform compound assignment: x += 5  =>  x = x + 5
-	if compoundOp != "" {
-		value = &BinaryExpr{
-			Left:     &IdentExpr{Name: name},
-			Operator: compoundOp,
-			Right:    value,
-		}
-		// Compound assignments are updates
-		isUpdate = true
-		mutable = true
-	}
-
-	// Check shadowing rules
-	// We already declared the variable above for recursion support
-	// Now validate that shadowing is correct
-	if !isUpdate {
-		// We need to check if it WOULD shadow (ignoring the declaration we just made)
-		// To do this, we temporarily remove it from current scope, check, then it's already there
-		if len(p.scopes) > 0 {
-			currentScope := p.scopes[len(p.scopes)-1]
-			delete(currentScope, name) // Temporarily remove
-
-			wouldShadowOuter := p.wouldShadow(name)
-
-			// Re-add it
-			currentScope[name] = true
-
-			if wouldShadowOuter && !hasShadow {
-				p.error(fmt.Sprintf("variable '%s' shadows an outer scope variable - use 'shadow %s = ...' to explicitly shadow", name, name))
-			}
-
-			if !wouldShadowOuter && hasShadow {
-				p.error(fmt.Sprintf("'shadow' keyword used but '%s' doesn't shadow any outer variable", name))
-			}
-		}
-	}
-
-	// Check if this is a constant definition (uppercase immutable with literal value)
-	// Store compile-time constants for substitution
-	// Only uppercase identifiers are true constants (cannot be shadowed in practice)
-	if !mutable && !isUpdate && isAllUppercase(name) {
-		// Store numbers, strings, and lists as compile-time constants
-		switch v := value.(type) {
-		case *NumberExpr:
-			p.constants[name] = v
-		case *StringExpr:
-			p.constants[name] = v
-		case *ListExpr:
-			// Only store lists that contain only literal values
-			isLiteral := true
-			for _, elem := range v.Elements {
-				switch elem.(type) {
-				case *NumberExpr, *StringExpr:
-					// These are literals, OK
-				default:
-					// Contains expressions, not a pure literal list
-					isLiteral = false
-				}
-			}
-			if isLiteral {
-				p.constants[name] = v
-			}
-		}
-	}
-
-	return &AssignStmt{
-		Name:           name,
-		Value:          value,
-		Mutable:        mutable,
-		IsUpdate:       isUpdate,
-		Precision:      precision,
-		TypeAnnotation: typeAnnotation,
-	}
-}
-
-func (p *Parser) tryParseMultipleAssignment() Statement {
-	// Try to parse: a, b, c = expr or a, b := expr
-	// Must NOT confuse with lambda params: (a, b) => ...
-	// Save lexer state in case this is not a multiple assignment
-	lexerState := p.lexer.save()
-	savedCurrent := p.current
-	savedPeek := p.peek
-
-	// Collect identifiers
-	names := []string{p.current.Value}
-	p.nextToken() // skip first identifier
-
-	for p.current.Type == TOKEN_COMMA {
-		p.nextToken() // skip ','
-		if p.current.Type != TOKEN_IDENT {
-			// Not a valid multiple assignment, restore state
-			p.lexer.restore(lexerState)
-			p.current = savedCurrent
-			p.peek = savedPeek
-			return nil
-		}
-		names = append(names, p.current.Value)
-		p.nextToken() // skip identifier
-	}
-
-	// Check if this is a lambda (=> follows the names)
-	if p.current.Type == TOKEN_FAT_ARROW || p.current.Type == TOKEN_ARROW {
-		// This is lambda params, not multiple assignment
-		p.lexer.restore(lexerState)
-		p.current = savedCurrent
-		p.peek = savedPeek
-		return nil
-	}
-
-	// Check for assignment operator
-	isUpdate := p.current.Type == TOKEN_LEFT_ARROW
-	mutable := p.current.Type == TOKEN_COLON_EQUALS || isUpdate
-	isAssign := p.current.Type == TOKEN_EQUALS || mutable
-
-	if !isAssign {
-		// Not an assignment, restore state
-		p.lexer.restore(lexerState)
-		p.current = savedCurrent
-		p.peek = savedPeek
-		return nil
-	}
-
-	p.nextToken() // skip assignment operator
-
-	// Parse the value expression
-	value := p.parseExpression()
-	if value == nil {
-		p.error("expected expression after assignment operator in multiple assignment")
-	}
-
-	return &MultipleAssignStmt{
-		Names:    names,
-		Value:    value,
-		Mutable:  mutable,
-		IsUpdate: isUpdate,
-	}
-}
-
-func (p *Parser) parseIndexedAssignment() Statement {
-	// Parse: ptr[offset] <- value as type
-	// This is syntactic sugar for: write_TYPE(ptr, offset, value)
-	// Or for reading: value = ptr[offset] as type  =>  value = read_TYPE(ptr, offset)
-
-	if VerboseMode {
-		debugf("DEBUG parseIndexedAssignment: current=%v, peek=%v\n", p.current, p.peek)
-	}
-
-	ptrName := p.current.Value
-	p.nextToken() // skip identifier
-
-	if VerboseMode {
-		debugf("DEBUG parseIndexedAssignment: after skip ident, current=%v\n", p.current)
-	}
-
-	p.nextToken() // skip '['
-
-	if VerboseMode {
-		debugf("DEBUG parseIndexedAssignment: after skip '[', current=%v\n", p.current)
-	}
-
-	// Parse the index expression
-	indexExpr := p.parseExpression()
-
-	if VerboseMode {
-		debugf("DEBUG parseIndexedAssignment: after index expr, current=%v, peek=%v\n", p.current, p.peek)
-	}
-
-	// Move to ']'
-	p.nextToken()
-
-	if VerboseMode {
-		debugf("DEBUG parseIndexedAssignment: after nextToken, current=%v\n", p.current)
-	}
-
-	if p.current.Type != TOKEN_RBRACKET {
-		p.error("expected ']' after index expression")
-	}
-	p.nextToken() // skip ']'
-
-	if p.current.Type != TOKEN_LEFT_ARROW {
-		p.error("expected '<-' for indexed assignment")
-	}
-	p.nextToken() // skip '<-'
-
-	// Parse the value expression
-	valueExpr := p.parseExpression()
-
-	// Move to the last token of the expression
-	p.nextToken()
-
-	// Check if this is an unsafe memory write (with cast) or array update (without cast)
-	castExpr, hasCast := valueExpr.(*CastExpr)
-
-	if hasCast {
-		// UNSAFE MEMORY WRITE: ptr[offset] <- value as TYPE
-		// Transform into: write_TYPE(ptr, offset as int32, value)
-
-		// Map cast type to write function name
-		typeMap := map[string]string{
-			"int8":    "i8",
-			"int16":   "i16",
-			"int32":   "i32",
-			"int64":   "i64",
-			"uint8":   "u8",
-			"uint16":  "u16",
-			"uint32":  "u32",
-			"uint64":  "u64",
-			"float32": "f32",
-			"float64": "f64",
-		}
-
-		shortType, ok := typeMap[castExpr.Type]
-		if !ok {
-			p.error(fmt.Sprintf("unsupported type for indexed write: %s", castExpr.Type))
-		}
-
-		// Create a CallExpr to write_TYPE(ptr, offset as int32, value)
-		funcName := "write_" + shortType
-
-		// Cast offset to int32 for write functions
-		offsetCast := &CastExpr{
-			Expr: indexExpr,
-			Type: "int32",
-		}
-
-		args := []Expression{
-			&IdentExpr{Name: ptrName},
-			offsetCast,
-			castExpr.Expr,
-		}
-
-		writeCall := &CallExpr{
-			Function: funcName,
-			Args:     args,
-		}
-
-		return &ExpressionStmt{Expr: writeCall}
-	}
-	// ARRAY UPDATE: arr[idx] <- value
-	// Create a direct map update statement
-	return &MapUpdateStmt{
-		MapName: ptrName,
-		Index:   indexExpr,
-		Value:   valueExpr,
-	}
-}
-
-// BlockType represents the type of block as determined by disambiguation
-type BlockType int
-
-const (
-	BlockTypeMap       BlockType = iota // {key: value, ...}
-	BlockTypeMatch                      // {pattern -> result, ...} or {| guard -> result}
-	BlockTypeStatement                  // {stmt; stmt; expr}
-	BlockTypeMixed                      // {stmt; stmt; | guard => result ~> default}
-)
-
-// parseMapLiteralBody parses the body of a map literal (assumes '{' already consumed)
-// Supports both identifier keys (hashed) and expression keys
-// Format: key: value, key2: value2, ...
-func (p *Parser) parseMapLiteralBody() *MapExpr {
-	keys := []Expression{}
-	values := []Expression{}
-
-	if p.current.Type != TOKEN_RBRACE {
-		// Parse first key
-		var key Expression
-		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_COLON {
-			// String key: hash identifier to uint64
-			hashValue := hashStringKey(p.current.Value)
-			key = &NumberExpr{Value: float64(hashValue)}
-			p.nextToken() // move past identifier
-		} else {
-			// Numeric key or expression — suppress `:`-as-cast so the key's
-			// trailing ':' stays the map separator.
-			p.inMapKey = true
-			key = p.parseExpression()
-			p.inMapKey = false
-			p.nextToken() // move past key
-		}
-
-		// Must have ':'
-		if p.current.Type != TOKEN_COLON {
-			p.error("expected ':' in map literal")
-		}
-		p.nextToken() // skip ':'
-
-		// Parse value
-		value := p.parseExpression()
-		keys = append(keys, key)
-		values = append(values, value)
-
-		// Parse additional key:value pairs
-		for p.peek.Type == TOKEN_COMMA {
-			p.nextToken() // skip current value
-			p.nextToken() // skip ','
-
-			// Parse key (string or numeric)
-			if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_COLON {
-				// String key: hash identifier to uint64
-				hashValue := hashStringKey(p.current.Value)
-				key = &NumberExpr{Value: float64(hashValue)}
-				p.nextToken() // move past identifier
-			} else {
-				// Numeric key or expression — suppress `:`-as-cast (see above).
-				p.inMapKey = true
-				key = p.parseExpression()
-				p.inMapKey = false
-				p.nextToken() // move past key
-			}
-
-			if p.current.Type != TOKEN_COLON {
-				p.error("expected ':' in map literal")
-			}
-			p.nextToken() // skip ':'
-
-			value := p.parseExpression()
-			keys = append(keys, key)
-			values = append(values, value)
-		}
-	}
-
-	// current should be on last value or on '{'
-	// peek should be '}'
-	p.nextToken() // move to '}'
-	return &MapExpr{Keys: keys, Values: values}
-}
-
-// disambiguateBlock determines block type according to GRAMMAR.md rules:
-// 1. Contains ':' before any arrows → Map literal
-// 2. Contains '->' or '~>' → Match block
-// 3. Otherwise → Statement block
-func (p *Parser) disambiguateBlock() BlockType {
-	// Quick check: if next token (after {) is }, it's an empty map
-	if p.peek.Type == TOKEN_RBRACE {
-		return BlockTypeMap
-	}
-
-	// Create temporary lexer for lookahead
-	tempLexer := &Lexer{
-		input:     p.lexer.input,
-		pos:       p.lexer.pos,
-		line:      p.lexer.line,
-		column:    p.lexer.column,
-		lineStart: p.lexer.lineStart,
-	}
-
-	braceDepth := 1 // Start at 1 because we're already inside the opening {
-	foundColon := false
-	foundArrow := false
-	foundAssign := false // an assignment (= := <-) at depth 1 before the first arrow
-	pendingTernary := 0  // unmatched `?` at depth 1: the next ':' is a ternary separator, not a map colon
-	atLineStart := true  // next depth-1 token begins a new statement line
-	sawPipeLine := false // a depth-1 line began with '|' (a guard clause)
-	sawStmtAfterPipe := false
-
-	// Scan tokens within this block
-	for range maxBlockIterations {
-		tok := tempLexer.NextToken()
-
-		if tok.Type == TOKEN_EOF {
-			break
-		}
-
-		// Track statement-line boundaries at depth 1: a guard-clause line starts
-		// with '|'; any later line that starts with something other than '|' or
-		// '~>' is a plain statement, which makes the leading clauses guard
-		// STATEMENTS in a statement block (early exits), not a guard match.
-		if braceDepth == 1 && atLineStart &&
-			tok.Type != TOKEN_NEWLINE && tok.Type != TOKEN_SEMICOLON {
-			if tok.Type == TOKEN_PIPE {
-				sawPipeLine = true
-			} else if sawPipeLine && tok.Type != TOKEN_DEFAULT_ARROW && tok.Type != TOKEN_RBRACE {
-				sawStmtAfterPipe = true
-			}
-		}
-		atLineStart = tok.Type == TOKEN_NEWLINE || tok.Type == TOKEN_SEMICOLON
-
-		if tok.Type == TOKEN_LBRACE {
-			braceDepth++
-		} else if tok.Type == TOKEN_RBRACE {
-			braceDepth--
-			if braceDepth == 0 {
-				// Exited the block
-				break
-			}
-		} else if braceDepth == 1 {
-			// At top level of this block
-			if tok.Type == TOKEN_QUESTION {
-				// A ternary `cond ? a : b`: remember it so its ':' isn't read as a
-				// map-key separator below.
-				pendingTernary++
-			} else if tok.Type == TOKEN_COLON && pendingTernary > 0 {
-				pendingTernary--
-			} else if tok.Type == TOKEN_COLON && !foundArrow {
-				// Check if this is a type annotation (x: num = ...) vs map literal (x: value)
-				// Type annotations have a type keyword (as identifier) after the colon
-				nextTok := tempLexer.NextToken()
-				isTypeAnnotation := false
-				// Type keywords are contextual - they come as TOKEN_IDENT or TOKEN_BOOL with specific values
-				if nextTok.Type == TOKEN_IDENT {
-					switch nextTok.Value {
-					case "num", "str", "list", "map", "bool",
-						"cstring", "cptr", "cint", "clong",
-						"cfloat", "cdouble", "cbool", "cvoid":
-						isTypeAnnotation = true
-					}
-					// Also accept a cstruct name or any cast type after `:` (the
-					// `:`-as-`as` shorthand, e.g. `{ b = g_balls[i] : Ball }`), so
-					// such a block isn't misread as a map literal.
-					if !isTypeAnnotation && p.isCastTypeName(nextTok.Value) {
-						isTypeAnnotation = true
-					}
-				} else if nextTok.Type == TOKEN_BOOL {
-					// bool is a keyword token
-					isTypeAnnotation = true
-				}
-				if !isTypeAnnotation {
-					// Found ':' before any arrows and not a type annotation → map literal
-					foundColon = true
-				}
-				// The lookahead consumed a token; keep line tracking in sync.
-				atLineStart = nextTok.Type == TOKEN_NEWLINE || nextTok.Type == TOKEN_SEMICOLON
-			} else if tok.Type == TOKEN_EQUALS || tok.Type == TOKEN_COLON_EQUALS || tok.Type == TOKEN_LEFT_ARROW {
-				// An assignment before any arrow signals a mixed block: leading
-				// statements followed by a guard match (spec: statements execute
-				// first, then the guard match is evaluated and returned).
-				foundAssign = true
-			} else if tok.Type == TOKEN_FAT_ARROW || tok.Type == TOKEN_DEFAULT_ARROW {
-				// Found arrow → match block (=> or ~>). When the arrow belongs to a
-				// '|' guard-clause line, keep scanning: trailing statement lines
-				// would make those clauses guard statements instead (see below).
-				foundArrow = true
-				if !sawPipeLine {
-					break
-				}
-			} else if tok.Type == TOKEN_UNDERSCORE {
-				// Check if next token is =>
-				nextTok := tempLexer.NextToken()
-				if nextTok.Type == TOKEN_FAT_ARROW {
-					// Found _ => → match block
-					foundArrow = true
-					if !sawPipeLine {
-						break
-					}
-				}
-				atLineStart = nextTok.Type == TOKEN_NEWLINE || nextTok.Type == TOKEN_SEMICOLON
-			}
-		}
-	}
-
-	// Apply disambiguation rules in order
-	if foundColon && !foundArrow {
-		return BlockTypeMap
-	}
-	// Guard clauses followed by plain statements: the '|' lines are guard
-	// STATEMENTS (early exits) inside a statement block, e.g.
-	// `{ | b == 0 => err "dv0"  ret a / b }` — not a guard-match expression.
-	if sawPipeLine && sawStmtAfterPipe {
-		return BlockTypeStatement
-	}
-	if foundArrow {
-		if foundAssign {
-			return BlockTypeMixed
-		}
-		return BlockTypeMatch
-	}
-	return BlockTypeStatement
-}
-
-// blockContainsMatchArrows scans ahead to check if the block contains => or ~> arrows
-// Returns true if any match arrows are found, false otherwise
-func (p *Parser) blockContainsMatchArrows() bool {
-	// Create a new lexer from the same source at the current position
-	// to scan ahead without modifying the parser state
-	tempLexer := &Lexer{
-		input:     p.lexer.input,
-		pos:       p.lexer.pos,
-		line:      p.lexer.line,
-		column:    p.lexer.column,
-		lineStart: p.lexer.lineStart,
-	}
-
-	tempParser := &Parser{
-		lexer:    tempLexer,
-		current:  p.current,
-		peek:     p.peek,
-		filename: p.filename,
-		source:   p.source,
-	}
-
-	braceDepth := 0
-	foundArrow := false
-
-	// Scan through tokens until we exit the block
-	for range maxASTIterations {
-		if tempParser.current.Type == TOKEN_EOF {
-			break
-		}
-
-		if tempParser.current.Type == TOKEN_LBRACE {
-			braceDepth++
-		} else if tempParser.current.Type == TOKEN_RBRACE {
-			braceDepth--
-			if braceDepth < 0 {
-				// We've exited the block
-				break
-			}
-		} else if braceDepth == 0 && (tempParser.current.Type == TOKEN_FAT_ARROW || tempParser.current.Type == TOKEN_ARROW || tempParser.current.Type == TOKEN_DEFAULT_ARROW ||
-			(tempParser.current.Type == TOKEN_UNDERSCORE && tempParser.peek.Type == TOKEN_FAT_ARROW)) {
-			// Found an arrow at the top level of the block (=>, ->, ~>, or _ =>)
-			foundArrow = true
-			break
-		}
-
-		tempParser.nextToken()
-	}
-
-	return foundArrow
-}
-
-// parseMatchBlock parses a match block according to GRAMMAR.md:
-//
-// TWO FORMS:
-//
-//  1. Value Match (with expression before {):
-//     Evaluates expression once, matches result against patterns
-//     Example: x { 0 -> "zero"  5 -> "five"  ~> "other" }
-//     The condition parameter contains the evaluated expression
-//
-//  2. Guard Match (no expression, uses | at line start):
-//     Each | branch evaluates independently (short-circuits)
-//     Example: { | x == 0 -> "zero"  | x > 0 -> "positive"  ~> "negative" }
-//     The condition parameter is typically nil or a boolean true
-//
-// Both forms support:
-// - Match clauses: pattern -> result  or  | guard -> result
-// - Default clause: ~> result
-//
-// The | is only a guard marker when at the start of a line.
-// Otherwise | is the pipe operator.
-func (p *Parser) parseMatchBlock(condition Expression) *MatchExpr {
-	// Set flag to prevent nested match block parsing
-	oldInMatchBlock := p.inMatchBlock
-	p.inMatchBlock = true
-	defer func() { p.inMatchBlock = oldInMatchBlock }()
-
-	clauses := []*MatchClause{}
-	defaultExpr := Expression(&NumberExpr{Value: 0})
-	defaultExplicit := false
-
-	p.skipNewlines()
-
-	// Check if the block contains any match arrows (-> or ~>) to decide parsing mode
-	hasMatchArrows := p.blockContainsMatchArrows()
-	if debugParser {
-		debugf("DEBUG: parseMatchBlock hasMatchArrows=%v current=%v\n", hasMatchArrows, p.current.Type)
-	}
-
-	// Simple conditional mode: if the block doesn't contain match arrows,
-	// treat it as a simple conditional that should execute all statements as one block
-	isDefaultMatch := p.current.Type == TOKEN_DEFAULT_ARROW || (p.current.Type == TOKEN_UNDERSCORE && p.peek.Type == TOKEN_FAT_ARROW)
-	if !hasMatchArrows && p.current.Type != TOKEN_ARROW && !isDefaultMatch && p.current.Type != TOKEN_RBRACE {
-		// Try parsing as simple conditional first
-		var statements []Statement
-		foundDefaultArrow := false
-
-		for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			// Check if we encounter default arrow at top level (~> or _ =>)
-			if p.current.Type == TOKEN_DEFAULT_ARROW || (p.current.Type == TOKEN_UNDERSCORE && p.peek.Type == TOKEN_FAT_ARROW) {
-				foundDefaultArrow = true
-				break
-			}
-
-			// Check for explicit arrow (not allowed in simple mode)
-			if p.current.Type == TOKEN_FAT_ARROW {
-				p.error("mix of simple statements and pattern matching not supported - use explicit '=>' syntax")
-			}
-
-			// Parse as statement/expression
-			// Try parseStatement first, which handles assignments and other statements
-			startType := p.current.Type
-			stmt := p.parseStatement()
-
-			// Check if parseStatement actually consumed anything
-			if stmt != nil {
-				statements = append(statements, stmt)
-				// Advance past the statement, but not past block/separator tokens.
-				// Some statement parsers (break/continue/ret) leave current AFTER the
-				// last consumed token, so blindly advancing would skip the closing '}'.
-				if p.current.Type != TOKEN_RBRACE &&
-					p.current.Type != TOKEN_NEWLINE &&
-					p.current.Type != TOKEN_SEMICOLON &&
-					p.current.Type != TOKEN_DEFAULT_ARROW &&
-					p.current.Type != TOKEN_EOF {
-					p.nextToken()
-				}
-			} else if startType == p.current.Type {
-				// parseStatement didn't consume anything, might be an expression
-				// that should be treated as a statement (like a function call)
-				expr := p.parseExpression()
-				if expr != nil {
-					statements = append(statements, &ExpressionStmt{Expr: expr})
-				}
-				if p.current.Type != TOKEN_RBRACE &&
-					p.current.Type != TOKEN_NEWLINE &&
-					p.current.Type != TOKEN_SEMICOLON &&
-					p.current.Type != TOKEN_DEFAULT_ARROW &&
-					p.current.Type != TOKEN_EOF {
-					p.nextToken()
-				}
-			}
-
-			// Skip separators between statements
-			p.skipNewlines()
-			if p.current.Type == TOKEN_SEMICOLON {
-				p.nextToken()
-				p.skipNewlines()
-			}
-		}
-
-		// If we found a default arrow after statements, treat the statements as guardless clause
-		if foundDefaultArrow && len(statements) > 0 {
-			// Create a guardless clause with all statements before ~>
-			clauses = append(clauses, &MatchClause{
-				Result: &BlockExpr{Statements: statements},
-			})
-			// Fall through to continue parsing default clause and other clauses
-		} else if !foundDefaultArrow && len(statements) > 0 {
-			// If we didn't find any arrows and have statements, this is a simple conditional
-			clauses = append(clauses, &MatchClause{
-				Result: &BlockExpr{Statements: statements},
-			})
-
-			if p.current.Type != TOKEN_RBRACE {
-				p.error("expected '}' after conditional block")
-			}
-
-			return &MatchExpr{
-				Condition:       condition,
-				Clauses:         clauses,
-				DefaultExpr:     defaultExpr,
-				DefaultExplicit: defaultExplicit,
-			}
-		}
-	}
-
-	// Pattern matching mode: parse clauses with guards/arrows
-	loopCount := 0
-	for {
-		loopCount++
-		if loopCount > 10 {
-			p.error(fmt.Sprintf("infinite loop in parseMatchBlock: stuck at token type=%v value='%v' line=%d", p.current.Type, p.current.Value, p.current.Line))
-		}
-
-		if debugParser {
-			debugf("DEBUG parseMatchBlock loop %d: current=%v peek=%v\n", loopCount, p.current, p.peek)
-		}
-		p.skipNewlines()
-
-		if p.current.Type == TOKEN_RBRACE {
-			if debugParser {
-				debugf("DEBUG parseMatchBlock: breaking at RBRACE\n")
-			}
-			break
-		}
-
-		// Check for default match: ~> or _ =>
-		if p.current.Type == TOKEN_DEFAULT_ARROW || (p.current.Type == TOKEN_UNDERSCORE && p.peek.Type == TOKEN_FAT_ARROW) {
-			if defaultExplicit {
-				p.error("duplicate default clause in match block")
-			}
-			defaultExplicit = true
-			if p.current.Type == TOKEN_UNDERSCORE {
-				p.nextToken() // skip '_'
-				p.nextToken() // skip '=>'
-			} else {
-				p.nextToken() // skip '~>'
-			}
-			p.skipNewlines()
-			defaultExpr = p.parseMatchTarget()
-			p.skipNewlines()
-			continue
-		}
-
-		clause, _ := p.parseMatchClause()
-
-		// Convert value matches to equality checks
-		if clause.IsValueMatch && clause.Guard != nil {
-			// Transform: 0 -> "zero" into: condition == 0 -> "zero"
-			clause.Guard = &BinaryExpr{
-				Left:     condition,
-				Operator: "==",
-				Right:    clause.Guard,
-			}
-			clause.IsValueMatch = false
-		}
-
-		clauses = append(clauses, clause)
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' after match block")
-	}
-
-	if len(clauses) == 0 && !defaultExplicit {
-		p.error("match block must contain a clause or default")
-	}
-
-	return &MatchExpr{
-		Condition:       condition,
-		Clauses:         clauses,
-		DefaultExpr:     defaultExpr,
-		DefaultExplicit: defaultExplicit,
-	}
-}
-
-// parseMatchClause parses a single match clause:
-//
-// Forms:
-// 1. Guardless: => result
-// 2. Value pattern: value => result
-// 3. Guard: | condition => result   (| only when at line start)
-//
-// Returns (clause, isBareExpression)
-// where isBareExpression means no explicit arrow was used
-func (p *Parser) parseMatchClause() (*MatchClause, bool) {
-	// Guardless clause starting with '=>' (explicit)
-	if p.current.Type == TOKEN_FAT_ARROW {
-		p.nextToken() // skip '=>'
-		p.skipNewlines()
-		result := p.parseMatchTarget()
-		p.skipNewlines()
-		return &MatchClause{Result: result}, false
-	}
-
-	// Guardless clause without '->' (implicit): check for statement-only tokens
-	// These tokens can only appear in match targets, not as guard expressions:
-	// - ret, err (return statements)
-	// - @++, @N (jump statements)
-	// - { (block statements)
-	// - identifier <- or identifier = (assignment statements)
-	isStatementToken := p.current.Type == TOKEN_RET ||
-		p.current.Type == TOKEN_ERR ||
-		p.current.Type == TOKEN_AT_PLUSPLUS ||
-		p.current.Type == TOKEN_LBRACE ||
-		(p.current.Type == TOKEN_AT && p.peek.Type == TOKEN_NUMBER) ||
-		(p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS))
-
-	if isStatementToken {
-		// Treat as guardless clause (implicit '=>'), not a bare clause
-		result := p.parseMatchTarget()
-		p.skipNewlines()
-		return &MatchClause{Result: result}, false
-	}
-
-	// Check for guard prefix | (only at line start in match blocks)
-	// Important: | is guard marker ONLY at line start in match context
-	// Otherwise | is the pipe operator
-	isGuard := false
-	if p.current.Type == TOKEN_PIPE {
-		isGuard = true
-		p.nextToken() // skip '|'
-		p.skipNewlines()
-	}
-
-	// Parse the pattern or guard expression
-	if debugParser {
-		debugf("DEBUG parseMatchClause: before parseExpression, current=%v peek=%v\n", p.current, p.peek)
-	}
-	expr := p.parseExpression()
-	if debugParser {
-		debugf("DEBUG parseMatchClause: after parseExpression, current=%v peek=%v\n", p.current, p.peek)
-	}
-
-	p.nextToken()
-	if debugParser {
-		debugf("DEBUG parseMatchClause: after nextToken, current=%v peek=%v\n", p.current, p.peek)
-	}
-	p.skipNewlines()
-
-	if p.current.Type == TOKEN_FAT_ARROW || p.current.Type == TOKEN_ARROW {
-		p.nextToken() // skip '=>' or '->'
-		p.skipNewlines()
-		result := p.parseMatchTarget()
-		p.skipNewlines()
-
-		// If it's a guard, use the expression as-is
-		// Otherwise, it's a value match - we'll need the condition from parseMatchBlock
-		if isGuard {
-			return &MatchClause{Guard: expr, Result: result}, false
-		}
-		// Store the value pattern in Guard for now - parseMatchBlock will convert it
-		return &MatchClause{Guard: expr, Result: result, IsValueMatch: true}, false
-	}
-
-	// Bare expression clause (sugar for '=> expr')
-	return &MatchClause{Result: expr}, true
-}
-
-func (p *Parser) parseMatchTarget() Expression {
-	switch p.current.Type {
-	case TOKEN_LBRACE:
-		// Parse a block of statements as the match target
-		// This allows multi-statement match arms like:
-		//   condition {
-		//       { stmt1; stmt2; stmt3 }
-		//   }
-		p.nextToken() // skip '{'
-		p.skipNewlines()
-
-		var statements []Statement
-		loopCount := 0
-		for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			loopCount++
-			if loopCount > maxASTIterations {
-				p.error(fmt.Sprintf("infinite loop in parseMatchTarget block: stuck at token %v", p.current))
-			}
-
-			stmt := p.parseStatement()
-			if stmt != nil {
-				statements = append(statements, stmt)
-			}
-
-			// Skip separators between statements
-			if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-				p.nextToken()
-				p.skipNewlines()
-			} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
-				p.nextToken() // move to '}'
-				break
-			} else {
-				p.nextToken()
-				p.skipNewlines()
-			}
-		}
-
-		if p.current.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of match block")
-		}
-
-		// Consume the closing '}'
-		p.nextToken()
-
-		return &BlockExpr{Statements: statements}
-
-	case TOKEN_RET, TOKEN_ERR:
-		// ret/err or ret @N or ret value or ret @N value
-		isErr := p.current.Type == TOKEN_ERR
-		p.nextToken() // skip 'ret'/'err'
-
-		label := 0 // 0 means return from function
-		var value Expression
-
-		// Check for optional @N
-		if p.current.Type == TOKEN_AT {
-			p.nextToken() // skip '@'
-			if p.current.Type != TOKEN_NUMBER {
-				p.error("expected number after @ in ret statement")
-			}
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
-			p.nextToken() // skip number
-		}
-
-		// Check for optional value (stop at ~> or _ =>)
-		isDefaultMatch := p.current.Type == TOKEN_DEFAULT_ARROW || (p.current.Type == TOKEN_UNDERSCORE && p.peek.Type == TOKEN_FAT_ARROW)
-		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && !isDefaultMatch {
-			value = p.parseExpression()
-			p.nextToken()
-		}
-
-		// `err msg` returns an error value: desugar to `ret error(msg)` so the
-		// caller's or!/err? sees a NaN-boxed error, not the message itself
-		// (same lowering as parseJumpStatement).
-		if isErr {
-			if value == nil {
-				value = &StringExpr{Value: "err"}
-			}
-			value = &CallExpr{Function: "error", Args: []Expression{value}}
-		}
-
-		// Return a JumpExpr with IsBreak semantics (ret exits loop)
-		return &JumpExpr{Label: label, Value: value, IsBreak: true}
-	case TOKEN_AT_PLUSPLUS:
-		if p.loopDepth < 1 {
-			p.error("@++ requires at least 1 loop")
-		}
-		p.nextToken() // skip '@++'
-		// Check for optional return value: @++ value
-		var value Expression
-		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			value = p.parseExpression()
-			p.nextToken()
-		}
-		return &JumpExpr{Label: p.loopDepth, Value: value, IsBreak: false}
-	case TOKEN_AT:
-		p.nextToken() // skip '@'
-		if p.current.Type != TOKEN_NUMBER {
-			p.error("expected number after @ in match block")
-		}
-		labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-		if err != nil {
-			p.error("invalid label number")
-		}
-		label := int(labelNum)
-		p.nextToken() // skip label number
-		// Check for optional return value: @N value
-		var value Expression
-		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			value = p.parseExpression()
-			p.nextToken()
-		}
-		// @N is continue (jump to top of loop N), not break
-		return &JumpExpr{Label: label, Value: value, IsBreak: false}
-	case TOKEN_IDENT:
-		// Check if this is an assignment statement (x <- value or x = value)
-		if p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS {
-			// Parse as an assignment statement wrapped in a block
-			stmt := p.parseStatement()
-			// After parseStatement, p.current is at the last token of the statement
-			// We need to advance past it for the caller
-			p.nextToken()
-			return &BlockExpr{Statements: []Statement{stmt}}
-		}
-		// Otherwise parse as expression
-		fallthrough
-	default:
-		p.matchResultDepth++
-		expr := p.parseExpression()
-		p.matchResultDepth--
-
-		// Check if this expression has a match block attached
-		if p.peek.Type == TOKEN_LBRACE {
-			p.nextToken() // move to expr
-			p.nextToken() // move to '{'
-			p.nextToken() // skip '{'
-			p.skipNewlines()
-			matchExpr := p.parseMatchBlock(expr)
-			// parseMatchBlock leaves p.current on '}', we need to consume it
-			if p.current.Type == TOKEN_RBRACE {
-				p.nextToken() // consume '}'
-			}
-			return matchExpr
-		}
-
-		p.nextToken()
-		return expr
-	}
-}
-
-func (p *Parser) parseLoopStatement() Statement {
-	// Handle @++ token (continue current loop)
-	if p.current.Type == TOKEN_AT_PLUSPLUS {
-		// @++ means continue current loop (jump to @N where N is current loop depth)
-		if p.loopDepth < 1 {
-			p.error("@++ requires at least 1 loop")
-		}
-		// @++ is continue semantics (not break)
-		return &JumpStmt{IsBreak: false, Label: p.loopDepth, Value: nil}
-	}
-
-	// Parse parallel loop prefix: @@ or N @
-	numThreads := 0 // 0 = sequential, -1 = all cores, N = specific count
-	label := p.loopDepth + 1
-
-	// Handle @@ token (parallel loop with all cores)
-	if p.current.Type == TOKEN_AT_AT {
-		numThreads = -1
-		p.nextToken() // skip '@@'
-
-		// Skip newlines after '@@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// After @@, fall through to identifier parsing below
-		// (we'll add the parsing code after the TOKEN_AT block)
-	} else if p.current.Type == TOKEN_NUMBER {
-		// Handle N @ syntax (parallel loop with N threads)
-		threadCount, err := strconv.Atoi(p.current.Value)
-		if err != nil || threadCount < 1 {
-			p.error("thread count must be a positive integer")
-		}
-		numThreads = threadCount
-		p.nextToken() // skip number
-
-		// Expect @ token after the number
-		if p.current.Type != TOKEN_AT {
-			p.error("expected @ after thread count")
-		}
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// After N @, fall through to identifier parsing below
-	} else if p.current.Type == TOKEN_AT {
-		// Handle @ token (start loop at @(N+1))
-		// @ means start a loop at @(N+1) where N is current loop depth
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Check if this is @N (numbered loop) or @ ident (simple loop)
-		// But also check for condition loop: @ NUMBER max N { }
-		if p.current.Type == TOKEN_NUMBER {
-			// Check if this is a condition loop: @ NUMBER ...
-			// If peek is 'max', it's a condition loop.
-			// If peek is an operator, it's likely a condition expression starting with a number.
-			isOp := p.peek.Type == TOKEN_GT || p.peek.Type == TOKEN_LT ||
-				p.peek.Type == TOKEN_GE || p.peek.Type == TOKEN_LE ||
-				p.peek.Type == TOKEN_EQ || p.peek.Type == TOKEN_NE ||
-				p.peek.Type == TOKEN_PLUS || p.peek.Type == TOKEN_MINUS ||
-				p.peek.Type == TOKEN_STAR || p.peek.Type == TOKEN_SLASH ||
-				p.peek.Type == TOKEN_MOD || p.peek.Type == TOKEN_AND ||
-				p.peek.Type == TOKEN_OR || p.peek.Type == TOKEN_XOR ||
-				p.peek.Type == TOKEN_AMP_B || p.peek.Type == TOKEN_PIPE_B ||
-				p.peek.Type == TOKEN_CARET_B || p.peek.Type == TOKEN_LTLT_B ||
-				p.peek.Type == TOKEN_GTGT_B
-
-			if p.peek.Type != TOKEN_BANG && !isOp {
-				// This is @N jump syntax, handle it in the jump statement section
-				p.current.Type = TOKEN_AT // restore token type
-				goto handleJump
-			}
-			// Otherwise, fall through to condition loop parsing below
-		}
-
-		// Check for infinite loop syntax: @ { ... }
-		if p.current.Type == TOKEN_LBRACE {
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			// Check for optional '!' bound clause after the loop body
-			var maxIterations int64 = math.MaxInt64
-			needsMaxCheck := true
-
-			if p.peek.Type == TOKEN_BANG {
-				p.nextToken() // advance to '!'
-				p.nextToken() // skip '!'
-
-				// Parse iteration bound: either a number or 'inf'
-				if p.current.Type == TOKEN_INF {
-					maxIterations = math.MaxInt64
-					p.nextToken()
-				} else if p.current.Type == TOKEN_NUMBER {
-					maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-					if err != nil || maxInt < 1 {
-						p.error("iteration bound must be a positive integer or 'inf'")
-					}
-					maxIterations = maxInt
-					p.nextToken()
-				} else {
-					p.error("expected number or 'inf' after '!' bound")
-				}
-			}
-
-			// Create synthetic range 0..<limit with max for infinite loop
-			return &LoopStmt{
-				Iterator:      "_",
-				Iterable:      &RangeExpr{Start: &NumberExpr{Value: 0}, End: &NumberExpr{Value: 1000000}},
-				Body:          body,
-				MaxIterations: maxIterations,
-				NeedsMaxCheck: needsMaxCheck,
-				NumThreads:    numThreads,
-			}
-		}
-
-		// At this point, we need to determine the loop type:
-		// 1. @ ident in expr { } - for-each loop
-		// 2. @ ident, ident in expr { } - receive loop
-		// 3. @ expr max N { } - condition loop
-
-		// Check for condition loop: if we don't have an identifier followed by 'in' or ','
-		// then it's a condition expression
-		isConditionLoop := false
-		if p.current.Type != TOKEN_IDENT {
-			// Not an identifier, must be start of condition expression (or error)
-			isConditionLoop = true
-		} else {
-			// Have identifier - check what comes after. `in` (for-each), `,`
-			// (receive loop), or a type annotation `as`/`:` (typed iterator,
-			// `@ b as Ball in ...` / `@ b: Ball in ...`) all mean a for-each/receive
-			// loop; anything else is a condition loop.
-			if p.peek.Type != TOKEN_IN && p.peek.Type != TOKEN_COMMA && p.peek.Type != TOKEN_AS && p.peek.Type != TOKEN_COLON {
-				// Not followed by 'in', ',', 'as', or ':' - must be condition loop
-				isConditionLoop = true
-			}
-		}
-
-		if isConditionLoop {
-			// Condition loop: @ expr ! N { ... }
-			// Set flag to prevent parsePrimary from consuming the '!' bound as a
-			// recursion limit, and to let parsePostfix leave the '!' unconsumed.
-			oldInConditionLoop := p.inConditionLoop
-			p.inConditionLoop = true
-			defer func() { p.inConditionLoop = oldInConditionLoop }()
-
-			// Parse the condition expression using parseComparison
-			// This handles comparisons (i < 5), function calls (check()), etc.
-			// but avoids match block parsing that would consume the { token
-			condition := p.parseComparison()
-
-			// After parsing postfix expression, peek should be on '!'
-			if p.peek.Type != TOKEN_BANG {
-				p.error("condition loop requires '!' bound clause (e.g., @ n < 5 ! 10 { ... })")
-			}
-
-			p.nextToken() // move to '!'
-			p.nextToken() // skip '!', now current is on the number/inf
-
-			// Parse iteration bound: either a number or 'inf'
-			var maxIterations int64
-			if p.current.Type == TOKEN_INF {
-				maxIterations = math.MaxInt64
-				p.nextToken() // skip 'inf'
-			} else if p.current.Type == TOKEN_NUMBER {
-				maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-				if err != nil || maxInt < 1 {
-					p.error("iteration bound must be a positive integer or 'inf'")
-				}
-				maxIterations = maxInt
-				p.nextToken() // skip number
-			} else {
-				p.error("expected number or 'inf' after '!' bound")
-			}
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start loop body")
-			}
-
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			// Return a WhileStmt for condition-based loops
-			return &WhileStmt{
-				Condition:     condition,
-				Body:          body,
-				MaxIterations: maxIterations,
-				NumThreads:    numThreads,
-			}
-		}
-
-		// For-each or receive loop - we have an identifier
-		firstIdent := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Optional type annotation on the loop variable: `@ b as Ball in ...` or
-		// the `:` shorthand `@ b: Ball in ...`. The runtime value is still a
-		// float64; for a cstruct type this lets the body access `b.field` directly.
-		iteratorType := ""
-		if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
-			p.nextToken() // skip 'as' / ':'
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected type name after type annotation in loop variable")
-			}
-			iteratorType = p.current.Value
-			p.nextToken() // skip type name
-		}
-
-		// Check if this is a receive loop: @ msg, from in ":5000"
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip comma
-
-			// Skip newlines after comma
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect second identifier
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected identifier after comma in receive loop")
-			}
-			secondIdent := p.current.Value
-			p.nextToken() // skip second identifier
-
-			// Expect 'in' keyword
-			if p.current.Type != TOKEN_IN {
-				p.error("expected 'in' in receive loop")
-			}
-			p.nextToken() // skip 'in'
-
-			// Parse address expression
-			address := p.parseExpression()
-
-			// Expect opening brace for body
-			if p.peek.Type != TOKEN_LBRACE {
-				p.error("expected '{' after receive loop address")
-			}
-			p.nextToken() // move to '{'
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Consume closing brace
-			if p.peek.Type == TOKEN_RBRACE {
-				p.nextToken() // move to '}'
-			}
-
-			return &ReceiveLoopStmt{
-				MessageVar: firstIdent,
-				SenderVar:  secondIdent,
-				Address:    address,
-				Body:       body,
-			}
-		}
-
-		// Check if this is a for-each loop (@ i in list) or a condition loop (@ i < 5)
-		if p.current.Type == TOKEN_IN {
-			// For-each loop: @ identifier in expression
-			iterator := firstIdent
-			p.nextToken() // skip 'in'
-
-			// Parse iterable expression. Set inConditionLoop so a trailing '!'
-			// bound is left unconsumed by parsePostfix and not eaten as a
-			// recursion limit on a call iterable (e.g. "@ msg in read_channel() ! inf").
-			oldILH := p.inConditionLoop
-			p.inConditionLoop = true
-			iterable := p.parseExpression()
-			p.inConditionLoop = oldILH
-
-			// Determine max iterations and whether runtime checking is needed
-			var maxIterations int64
-			needsRuntimeCheck := false
-
-			// Check if '!' bound is present
-			if p.peek.Type == TOKEN_BANG {
-				p.nextToken() // advance to '!'
-				p.nextToken() // skip '!'
-
-				// Explicit bound always requires runtime checking
-				needsRuntimeCheck = true
-
-				// Parse iteration bound: either a number or 'inf'
-				if p.current.Type == TOKEN_INF {
-					maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-					p.nextToken()                 // skip 'inf'
-				} else if p.current.Type == TOKEN_NUMBER {
-					// Parse the number
-					maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-					if err != nil || maxInt < 1 {
-						p.error("iteration bound must be a positive integer or 'inf'")
-					}
-					maxIterations = maxInt
-					p.nextToken() // skip number
-				} else {
-					p.error("expected number or 'inf' after '!' bound")
-				}
-			} else {
-				// No explicit bound - check if we can determine iteration count at compile time
-				if rangeExpr, ok := iterable.(*RangeExpr); ok {
-					// Try to calculate max from range: end - start
-					startVal, startOk := rangeExpr.Start.(*NumberExpr)
-					endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-					if startOk && endOk {
-						// Literal range - known at compile time, no runtime check needed
-						start := int64(startVal.Value)
-						end := int64(endVal.Value)
-						maxIterations = max(end-start, 0)
-						needsRuntimeCheck = false
-					} else {
-						// Non-literal range bound (`0..<n`): the loop compares the
-						// iterator against the runtime end each step, so it always
-						// terminates — no separate safety cap needed.
-						maxIterations = math.MaxInt64
-						needsRuntimeCheck = false
-					}
-				} else if listExpr, ok := iterable.(*ListExpr); ok {
-					// List literal - known at compile time, no runtime check needed
-					maxIterations = int64(len(listExpr.Elements))
-					needsRuntimeCheck = false
-				} else if _, ok := iterable.(*IdentExpr); ok {
-					// Variable (could be a list or map) - use runtime length check
-					maxIterations = math.MaxInt64 // Use max value, will check length at runtime
-					needsRuntimeCheck = true
-				} else if _, ok := iterable.(*IndexExpr); ok {
-					// Indexed expression (e.g., lists[0]) - use runtime length check
-					maxIterations = math.MaxInt64
-					needsRuntimeCheck = true
-				} else {
-					// Not a range expression or list literal, require explicit max
-					p.error("loop requires 'max' clause (or use range expression like 0..<10 or list literal)")
-				}
-				// Advance to next token after iterable expression
-				p.nextToken()
-			}
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start loop body")
-			}
-
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			return &LoopStmt{
-				Iterator:      iterator,
-				IteratorType:  iteratorType,
-				Iterable:      iterable,
-				Body:          body,
-				MaxIterations: maxIterations,
-				NeedsMaxCheck: needsRuntimeCheck,
-				NumThreads:    numThreads,
-			}
-		}
-	}
-
-	// Common identifier and loop body parsing for @@ and N @
-	// Only execute this if we have parallel loop prefix
-	if numThreads != 0 {
-		// Expect identifier for loop variable
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier after parallel loop prefix")
-		}
-		iterator := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Check for receive loop syntax - not supported for parallel loops
-		if p.current.Type == TOKEN_COMMA {
-			p.error("receive loops (@ msg, from in ...) cannot be parallel")
-		}
-
-		// Expect 'in' keyword
-		if p.current.Type != TOKEN_IN {
-			p.error("expected 'in' in loop statement")
-		}
-		p.nextToken() // skip 'in'
-
-		// Parse iterable expression. Set inConditionLoop so a trailing '!'
-		// bound is left unconsumed by parsePostfix.
-		oldILH := p.inConditionLoop
-		p.inConditionLoop = true
-		iterable := p.parseExpression()
-		p.inConditionLoop = oldILH
-
-		// Determine max iterations and whether runtime checking is needed
-		var maxIterations int64
-		needsRuntimeCheck := false
-
-		// Check if '!' bound is present
-		if p.peek.Type == TOKEN_BANG {
-			p.nextToken() // advance to '!'
-			p.nextToken() // skip '!'
-
-			// Explicit bound always requires runtime checking
-			needsRuntimeCheck = true
-
-			// Parse iteration bound: either a number or 'inf'
-			if p.current.Type == TOKEN_INF {
-				maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-				p.nextToken()                 // skip 'inf'
-			} else if p.current.Type == TOKEN_NUMBER {
-				// Parse the number
-				maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-				if err != nil || maxInt < 1 {
-					p.error("iteration bound must be a positive integer or 'inf'")
-				}
-				maxIterations = maxInt
-				p.nextToken() // skip number
-			} else {
-				p.error("expected number or 'inf' after '!' bound")
-			}
-		} else {
-			// No explicit bound - check if we can determine iteration count at compile time
-			if rangeExpr, ok := iterable.(*RangeExpr); ok {
-				// Try to calculate max from range: end - start
-				startVal, startOk := rangeExpr.Start.(*NumberExpr)
-				endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-				if startOk && endOk {
-					// Literal range - known at compile time, no runtime check needed
-					start := int64(startVal.Value)
-					end := int64(endVal.Value)
-					maxIterations = max(end-start, 0)
-					needsRuntimeCheck = false
-				} else {
-					// Range bounds are not literals, require explicit max
-					p.error("loop over non-literal range requires explicit 'max' clause")
-				}
-			} else if listExpr, ok := iterable.(*ListExpr); ok {
-				// List literal - known at compile time, no runtime check needed
-				maxIterations = int64(len(listExpr.Elements))
-				needsRuntimeCheck = false
-			} else if _, ok := iterable.(*IdentExpr); ok {
-				// Variable (could be a list or map) - use runtime length check
-				maxIterations = math.MaxInt64 // Use max value, will check length at runtime
-				needsRuntimeCheck = true
-			} else if _, ok := iterable.(*IndexExpr); ok {
-				// Indexed expression (e.g., lists[0]) - use runtime length check
-				maxIterations = math.MaxInt64
-				needsRuntimeCheck = true
-			} else {
-				// Not a range expression or list literal, require explicit max
-				p.error("loop requires 'max' clause (or use range expression like 0..<10 or list literal)")
-			}
-			// Advance to next token after iterable expression
-			p.nextToken()
-		}
-
-		// Skip newlines before '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Expect '{'
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected '{' to start loop body")
-		}
-
-		// Skip newlines after '{'
-		for p.peek.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Track loop depth for nested loops
-		oldDepth := p.loopDepth
-		p.loopDepth = label
-		defer func() { p.loopDepth = oldDepth }()
-
-		// Parse loop body
-		var body []Statement
-		for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-			p.nextToken()
-			if p.current.Type == TOKEN_NEWLINE {
+			if p.at(TOKEN_PIPE) || p.at(TOKEN_DEFAULT) {
+				stmts = append(stmts, p.guardLines()...)
 				continue
 			}
-			stmt := p.parseStatement()
-			if stmt != nil {
-				body = append(body, stmt)
+			if s := p.statement(); s != nil {
+				stmts = append(stmts, s)
 			}
+			p.endStatement()
 		}
-
-		// Expect and consume '}'
-		if p.peek.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of loop body")
-		}
-		p.nextToken() // consume the '}'
-
-		// Check for optional reducer: | a,b | { a + b }
-		var reducer *LambdaExpr
-		if p.peek.Type == TOKEN_PIPE {
-			// Only allow reducers for parallel loops
-			if numThreads == 0 {
-				p.error("reducer syntax '| a,b | { expr }' only allowed for parallel loops (@@ or N @)")
-			}
-
-			p.nextToken() // advance to '|'
-			p.nextToken() // consume '|', advance to first parameter
-
-			// Parse parameter list
-			var params []string
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected parameter name after '|'")
-			}
-			params = append(params, p.current.Value)
-			p.nextToken()
-
-			// Expect comma
-			if p.current.Type != TOKEN_COMMA {
-				p.error("reducer requires exactly two parameters (e.g., | a,b | ...)")
-			}
-			p.nextToken() // skip comma
-
-			// Skip newlines after comma
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Parse second parameter
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected second parameter name after comma")
-			}
-			params = append(params, p.current.Value)
-			p.nextToken()
-
-			// Expect second '|'
-			if p.current.Type != TOKEN_PIPE {
-				p.error("expected '|' after reducer parameters")
-			}
-			p.nextToken() // skip second '|'
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start reducer body")
-			}
-			p.nextToken() // skip '{'
-
-			// Skip newlines after '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Parse reducer body (single expression)
-			reducerBody := p.parseExpression()
-
-			// Expect '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of reducer body")
-			}
-			p.nextToken() // advance to '}'
-
-			// Create lambda expression for reducer
-			reducer = &LambdaExpr{
-				Params:        params,
-				VariadicParam: "",
-				Body:          reducerBody,
-			}
-		}
-
-		return &LoopStmt{
-			Iterator:      iterator,
-			Iterable:      iterable,
-			Body:          body,
-			MaxIterations: maxIterations,
-			NeedsMaxCheck: needsRuntimeCheck,
-			NumThreads:    numThreads,
-			Reducer:       reducer,
-		}
-	}
-
-handleJump:
-	// If we reach here, must be @N for a jump statement
-	p.nextToken() // skip '@'
-
-	// Expect number for jump label
-	if p.current.Type != TOKEN_NUMBER {
-		p.error("expected number after @ (e.g., @0, @1, @2)")
-	}
-
-	labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-	if err != nil {
-		p.error("invalid jump label number")
-	}
-	label = int(labelNum)
-
-	p.nextToken() // skip label number
-
-	// It's a jump statement: @N or @N value
-	if label < 0 {
-		p.error("jump label must be >= 0 (use @0, @1, @2, etc.)")
-	}
-	// Check for optional return value: @0 value
-	var value Expression
-	if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		value = p.parseExpression()
-	}
-	return &JumpStmt{IsBreak: true, Label: label, Value: value}
+		p.advance()
+		return stmts
+	})
 }
 
-// parseGuardStatement parses a statement-level guard clause:
-//
-//	| cond => stmt
-//
-// It reuses the guard-match clause shape as an early-exit statement — sugar
-// for `if cond { stmt }` — so preconditions read as guards:
-//
-//	| b == 0 => err "division by zero"
-//	| a < 0  => ret 0
-//
-// current must be on '|'; on exit it is left on the statement's last token
-// (the same convention as every other statement parser).
-func (p *Parser) parseGuardStatement() Statement {
-	p.nextToken() // skip '|', move onto the condition
-	cond := p.parseExpression()
-	if p.peek.Type != TOKEN_FAT_ARROW {
-		p.error("expected '=>' after guard condition")
+// guardLines parses `| cond => result` lines inside a block. When they end the
+// block they form a guard match that is the block's value; otherwise each one
+// is `if cond { result }`.
+func (p *Parser) guardLines() []Statement {
+	m := &MatchExpr{Condition: &NumberExpr{Value: 1}, DefaultExpr: &NumberExpr{}}
+	for p.at(TOKEN_PIPE) {
+		p.advance()
+		guard := nested(p, p.expr)
+		p.expect(TOKEN_FAT_ARROW, "'=>' after the guard")
+		m.Clauses = append(m.Clauses, &MatchClause{Guard: guard, Result: p.armResult()})
+		p.skipEnds()
 	}
-	p.nextToken() // move onto '=>'
-	p.nextToken() // move onto the guarded statement
-	body := p.parseStatement()
-	return &IfStmt{Branches: []IfBranch{{Condition: cond, Body: []Statement{body}}}}
+	if p.accept(TOKEN_DEFAULT) {
+		m.DefaultExplicit = true
+		m.DefaultExpr = p.armResult()
+		p.skipEnds()
+		if !p.at(TOKEN_RBRACE) {
+			p.fail("'~>' must be the last line of the block")
+		}
+	}
+	if p.at(TOKEN_RBRACE) {
+		return []Statement{&ExpressionStmt{Expr: m}}
+	}
+	var stmts []Statement
+	for _, c := range m.Clauses {
+		body := []Statement{&ExpressionStmt{Expr: c.Result}}
+		if b, ok := c.Result.(*BlockExpr); ok {
+			body = b.Statements
+		}
+		stmts = append(stmts, &IfStmt{Branches: []IfBranch{{Condition: c.Guard, Body: body}}})
+	}
+	return stmts
 }
 
-// parseJumpStatement parses ret statements
-// ret - return from function
-// ret value - return value from function
-// ret @N - exit loop N and all inner loops
-// ret @N value - exit loop N and return value
-func (p *Parser) parseJumpStatement() Statement {
-	// current is on 'ret'. Like every other statement parser, leave current on the
-	// LAST token of the statement so block parsers (which advance past it) stay in
-	// sync — otherwise `if c { ret @ }` over-consumes the brace and corrupts the
-	// scope stack. Peek-based lookahead keeps the cursor in place.
-	isErr := p.current.Type == TOKEN_ERR
-	label := 0 // 0 means return from function
-	var value Expression
+// Expressions, from lowest to highest precedence.
 
-	// Optional @ or @N label (loop exit).
-	if p.peek.Type == TOKEN_AT {
-		p.nextToken() // move onto '@'
-		if p.peek.Type == TOKEN_NUMBER {
-			// ret @N - exit specific loop N
-			p.nextToken() // move onto the number
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
-		} else {
-			// ret @ - exit current loop (label -1 means "current loop")
-			label = -1
-		}
+func (p *Parser) expr() Expression {
+	if l := p.lambda(); l != nil {
+		return l
 	}
-
-	// Optional return/break value: present when the next token starts an
-	// expression (not a statement terminator).
-	if p.peek.Type != TOKEN_NEWLINE && p.peek.Type != TOKEN_RBRACE &&
-		p.peek.Type != TOKEN_EOF && p.peek.Type != TOKEN_SEMICOLON {
-		p.nextToken() // move onto the first token of the value
-		value = p.parseExpression()
+	e := p.pipe()
+	for p.at(TOKEN_LBRACE) && p.noMatch == 0 {
+		e = p.matchBlock(e)
 	}
-
-	// `err msg` returns an error value: desugar to `ret error(msg)` so the
-	// caller's or!/err? sees a NaN-boxed error, not the message itself.
-	// A bare `err` returns the generic "err" code.
-	if isErr {
-		if value == nil {
-			value = &StringExpr{Value: "err"}
-		}
-		value = &CallExpr{Function: "error", Args: []Expression{value}}
-	}
-
-	// ret is always a break/return (IsBreak=true)
-	// label=0 means return from function
-	// label=-1 means exit current loop
-	// label>0 means exit loop N
-	return &JumpStmt{IsBreak: true, Label: label, Value: value}
+	return e
 }
 
-func (p *Parser) parseBreakStatement() Statement {
-	// Like other statement parsers, leave p.current on the LAST token of the
-	// statement so block parsers (which advance past it) stay in sync. With no
-	// label that last token is `break` itself; with a label it's the number.
-	label := p.parseOptionalLoopLabel()
-	// break is translated to: ret @ (exit loop without value)
-	return &JumpStmt{IsBreak: true, Label: label, Value: nil}
-}
-
-func (p *Parser) parseContinueStatement() Statement {
-	label := p.parseOptionalLoopLabel()
-	// continue is translated to: @N (continue loop N)
-	return &JumpStmt{IsBreak: false, Label: label, Value: nil}
-}
-
-// parseOptionalLoopLabel reads an optional `@N` label that may follow a `break`
-// or `continue` keyword. current must be on the keyword on entry; on exit it is
-// left on the last consumed token (the keyword, or the label number). Returns
-// -1 when there is no explicit label (meaning the innermost loop).
-func (p *Parser) parseOptionalLoopLabel() int {
-	label := -1 // -1 means current (innermost) loop
-	if p.peek.Type == TOKEN_AT {
-		p.nextToken() // move onto '@'
-		if p.peek.Type == TOKEN_NUMBER {
-			p.nextToken() // move onto the number
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
-		}
-	}
-	return label
-}
-
-func (p *Parser) parseForeachStatement() Statement {
-	p.nextToken() // skip 'foreach'
-
-	// foreach is just syntax sugar for @ ... in
-	// Parse as: @ ident in expr block
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after 'foreach'")
-		return nil
-	}
-
-	iterator := p.current.Value
-	p.nextToken() // skip identifier
-
-	if p.current.Type != TOKEN_IN {
-		p.error("expected 'in' after foreach iterator")
-		return nil
-	}
-	p.nextToken() // skip 'in'
-
-	// Parse iterable expression. Set inConditionLoop so a trailing '!' bound
-	// is left unconsumed by parsePostfix.
-	oldILH := p.inConditionLoop
-	p.inConditionLoop = true
-	iterable := p.parseExpression()
-	p.inConditionLoop = oldILH
-
-	// Check for '!' bound clause (check peek not current!)
-	var maxIterations int64 = math.MaxInt64
-	needsMaxCheck := false
-	if p.peek.Type == TOKEN_BANG {
-		p.nextToken() // move to '!'
-		p.nextToken() // skip '!'
-		if p.current.Type == TOKEN_NUMBER {
-			maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-			if err != nil || maxInt < 1 {
-				p.error("iteration bound must be a positive integer")
-			}
-			maxIterations = maxInt
-			needsMaxCheck = true
-			p.nextToken() // skip number
-		} else if p.current.Type == TOKEN_INF {
-			maxIterations = math.MaxInt64
-			needsMaxCheck = true
-			p.nextToken() // skip 'inf'
-		} else {
-			p.error("expected number or 'inf' after '!' bound")
-		}
-	}
-
-	// Skip newlines before '{'
-	for p.peek.Type == TOKEN_NEWLINE {
-		p.nextToken()
-	}
-
-	if p.peek.Type != TOKEN_LBRACE {
-		p.error("expected '{' after foreach expression")
-		return nil
-	}
-	p.nextToken() // move to '{'
-
-	// Track loop depth for nested loops
-	label := p.loopDepth + 1
-	oldDepth := p.loopDepth
-	p.loopDepth = label
-	defer func() { p.loopDepth = oldDepth }()
-
-	// Parse loop body
-	var body []Statement
-	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-		p.nextToken()
-		if p.current.Type == TOKEN_NEWLINE {
-			continue
-		}
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-	}
-
-	// Consume closing brace
-	if p.peek.Type == TOKEN_RBRACE {
-		p.nextToken() // move to '}'
-	}
-
-	return &LoopStmt{
-		Iterator:      iterator,
-		Iterable:      iterable,
-		MaxIterations: maxIterations,
-		NeedsMaxCheck: needsMaxCheck,
-		Body:          body,
-	}
-}
-
-// parseWhileStatement parses `while cond { body }`: a condition loop with no
-// explicit iteration bound. It desugars to a WhileStmt with MaxIterations set
-// to "unbounded" (the loop terminates when the condition becomes false).
-func (p *Parser) parseWhileStatement() Statement {
-	p.nextToken() // skip 'while'
-
-	// Parse the condition with parseComparison (not parseExpression) so a match
-	// block's '{' isn't consumed as part of the condition. Set inConditionLoop
-	// so a stray '!' isn't read as a recursion bound.
-	oldInConditionLoop := p.inConditionLoop
-	p.inConditionLoop = true
-	condition := p.parseComparison()
-	p.inConditionLoop = oldInConditionLoop
-
-	// Skip newlines before '{'
-	for p.peek.Type == TOKEN_NEWLINE {
-		p.nextToken()
-	}
-
-	if p.peek.Type != TOKEN_LBRACE {
-		p.error("expected '{' after while condition")
-		return nil
-	}
-	p.nextToken() // move to '{'
-
-	// Track loop depth for nested loops / break / continue.
-	label := p.loopDepth + 1
-	oldDepth := p.loopDepth
-	p.loopDepth = label
-	defer func() { p.loopDepth = oldDepth }()
-
-	// Parse loop body
-	var body []Statement
-	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-		p.nextToken()
-		if p.current.Type == TOKEN_NEWLINE {
-			continue
-		}
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-	}
-
-	// Consume closing brace
-	if p.peek.Type == TOKEN_RBRACE {
-		p.nextToken() // move to '}'
-	}
-
-	return &WhileStmt{
-		Condition:     condition,
-		Body:          body,
-		MaxIterations: math.MaxInt64,
-	}
-}
-
-// parsePattern parses a single pattern (literal, variable, or wildcard)
-func (p *Parser) parsePattern() Pattern {
-	switch p.current.Type {
-	case TOKEN_NUMBER:
-		value := p.current.Value
-		p.nextToken()
-		// Convert string to float64
-		numVal, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			p.error("invalid number in pattern: " + value)
+// lambda parses `x -> body` and `(params) -> body`.
+func (p *Parser) lambda() Expression {
+	lambdaPos := p.pos()
+	var lambda *LambdaExpr
+	switch {
+	case p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_ARROW:
+		lambda = &LambdaExpr{Params: []string{p.advance().Value}}
+	case p.at(TOKEN_LPAREN):
+		close := p.matching(p.i)
+		if close < 0 || p.toks[close+1].Type != TOKEN_ARROW {
 			return nil
 		}
-		return &LiteralPattern{Value: &NumberExpr{Value: numVal}}
-	case TOKEN_STRING:
-		value := p.current.Value
-		p.nextToken()
-		return &LiteralPattern{Value: &StringExpr{Value: value}}
-	case TOKEN_IDENT:
-		if p.current.Value == "_" {
-			p.nextToken()
-			return &WildcardPattern{}
-		}
-		name := p.current.Value
-		p.nextToken()
-		return &VarPattern{Name: name}
+		lambda = p.paramList()
 	default:
-		p.error("expected pattern (literal, variable, or _)")
 		return nil
 	}
-}
-
-// tryParsePatternLambda attempts to parse a pattern lambda starting from current position
-// Returns nil if this is not a pattern lambda
-func (p *Parser) tryParsePatternLambda() *PatternLambdaExpr {
-	// Pattern lambda syntax: (pattern) => body, (pattern) => body, ...
-	// We're at TOKEN_LPAREN
-
-	// Enable speculative mode to suppress errors
-	p.speculative = true
-	defer func() {
-		p.speculative = false
-		// Recover from speculative errors (they indicate "not a pattern lambda")
-		if r := recover(); r != nil {
-			if _, ok := r.(speculativeError); !ok {
-				// Re-panic if it's not a speculative error
-				panic(r)
-			}
-			if VerboseMode {
-				debugf("DEBUG: Pattern lambda parse failed with speculative error\n")
-			}
-		}
-	}()
-
-	// Parse first clause
-	clause := p.parseOnePatternClause()
-	if clause == nil {
-		if VerboseMode {
-			debugf("DEBUG: parseOnePatternClause returned nil\n")
-		}
-		return nil
-	}
-
-	// Check if there's a comma for additional clauses
-	if VerboseMode {
-		debugf("DEBUG: After first clause, current token: %v\n", p.current.Type)
-	}
-	if p.current.Type != TOKEN_COMMA {
-		// Not a pattern lambda, just a single clause (which could be regular lambda)
-		if VerboseMode {
-			debugf("DEBUG: No comma after first clause, not a pattern lambda\n")
-		}
-		return nil
-	}
-
-	// It's a pattern lambda! Disable speculative mode now that we know
-	p.speculative = false
-
-	// Collect all clauses
-	clauses := []*PatternClause{clause}
-
-	for p.current.Type == TOKEN_COMMA {
-		p.nextToken() // skip ','
-		clause := p.parseOnePatternClause()
-		if clause == nil {
-			p.error("expected pattern clause after ','")
-			break
-		}
-		clauses = append(clauses, clause)
-	}
-
-	return &PatternLambdaExpr{Clauses: clauses}
-}
-
-// parseOnePatternClause parses one pattern clause: (pattern, ...) => body
-func (p *Parser) parseOnePatternClause() *PatternClause {
-	if p.current.Type != TOKEN_LPAREN {
-		return nil
-	}
-	p.nextToken() // skip '('
-
-	var patterns []Pattern
-	if p.current.Type == TOKEN_RPAREN {
-		// Empty pattern list
-	} else {
-		patterns = append(patterns, p.parsePattern())
-		for p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip ','
-			patterns = append(patterns, p.parsePattern())
-		}
-	}
-
-	if p.current.Type != TOKEN_RPAREN {
-		p.error("expected ')' after patterns")
-		return nil
-	}
-	p.nextToken() // skip ')'
-
-	if p.current.Type != TOKEN_ARROW {
-		// Not a pattern clause
-		return nil
-	}
-	p.nextToken() // skip '->'
-
-	body := p.parseLambdaBody()
-
-	// parseLambdaBody leaves current on the last token of the body
-	// We need to advance to get to the token after the body (likely '|' or EOF)
-	// For blocks, this advances past '}'; for expressions, past the expression
-	if VerboseMode {
-		debugf("DEBUG parseOnePatternClause: before advancing, current=%v ('%s') peek=%v ('%s')\n", p.current.Type, p.current.Value, p.peek.Type, p.peek.Value)
-	}
-	p.nextToken()
-	if VerboseMode {
-		debugf("DEBUG parseOnePatternClause: after advancing, current=%v ('%s')\n", p.current.Type, p.current.Value)
-	}
-
-	return &PatternClause{Patterns: patterns, Body: body}
-}
-
-// Confidence that this function is working: 100%
-func (p *Parser) parseExpression() Expression {
-	// Track nesting DEPTH (increment on entry, decrement on exit) so the guard
-	// catches genuinely runaway recursion without capping total program size — a
-	// cumulative counter falsely trips "infinite recursion" on large programs.
-	globalParseCallCount++
-	if globalParseCallCount > maxParseRecursion {
-		// Print stack trace
-		debug.PrintStack()
-		p.error(fmt.Sprintf("infinite recursion in parseExpression: depth=%d, token type=%v value='%v' line=%d", globalParseCallCount, p.current.Type, p.current.Value, p.current.Line))
-	}
-	result := p.parseTernary()
-	globalParseCallCount--
-	return result
-}
-
-// parseTernary handles the C-style conditional `cond ? then : else` (lowest
-// precedence, right-associative so `a ? b : c ? d : e` nests on the right). It
-// lowers to the same MatchExpr an `if`-expression produces, so it shares all the
-// if-expression codegen and type inference.
-func (p *Parser) parseTernary() Expression {
-	cond := p.parsePipe()
-	if p.peek.Type != TOKEN_QUESTION {
-		return cond
-	}
-	p.nextToken() // move onto '?'
-	p.nextToken() // move to first token of the then-branch
-	// Suppress the `:`-as-`as` cast shorthand inside the then-branch so the colon
-	// is recognized as the ternary separator (`a ? b : c`, not `a ? (b as c)`).
-	savedTernary := p.inTernaryThen
-	p.inTernaryThen = true
-	thenExpr := p.parsePipe()
-	p.inTernaryThen = savedTernary
-	if p.peek.Type != TOKEN_COLON {
-		p.error("expected ':' in ternary conditional (cond ? a : b)")
-		return cond
-	}
-	p.nextToken() // move onto ':'
-	p.nextToken() // move to first token of the else-branch
-	elseExpr := p.parseTernary()
-	return &MatchExpr{
-		Condition:   &NumberExpr{Value: 1.0},
-		Clauses:     []*MatchClause{{Guard: cond, Result: thenExpr}},
-		DefaultExpr: elseExpr,
-	}
-}
-
-// parsePipe handles | and || operators (lowest precedence)
-// Grammar: pipe_expr = reduce_expr { ("|" | "||") reduce_expr }
-func (p *Parser) parsePipe() Expression {
-	left := p.parseReduce()
-
-	for p.peek.Type == TOKEN_PIPE || p.peek.Type == TOKEN_PIPEPIPE {
-		// Inside a match-clause result, a top-level '|' is the next guard clause's
-		// marker, not the pipe operator — stop so the clause result ends here.
-		if p.peek.Type == TOKEN_PIPE && p.matchResultDepth > 0 {
-			break
-		}
-		op := p.peek.Type
-		p.nextToken() // skip current
-		p.nextToken() // skip '|' or '||'
-		right := p.parseReduce()
-
-		if op == TOKEN_PIPE {
-			left = &PipeExpr{Left: left, Right: right}
-		} else {
-			// TOKEN_PIPEPIPE - parallel map
-			left = &ParallelExpr{List: left, Operation: right}
-		}
-	}
-
-	return left
-}
-
-// parseReduce handles reduce expressions (passthrough for now)
-// Grammar: reduce_expr = receive_expr
-func (p *Parser) parseReduce() Expression {
-	return p.parseReceive()
-}
-
-// parseReceive handles the <= prefix operator for receiving from channels
-// Grammar: receive_expr = "<=" pipe_expr | or_bang_expr
-func (p *Parser) parseReceive() Expression {
-	// Check for <= prefix (receive operator)
-	// Only treat <= as receive if it appears at the beginning of an expression
-	// (i.e., current token is not something that could be part of a binary expression)
-	// This prevents "x <= y" from being parsed as "x" followed by "<= y"
-
-	isExpressionStart := p.current.Type == TOKEN_NEWLINE ||
-		p.current.Type == TOKEN_SEMICOLON ||
-		p.current.Type == TOKEN_LPAREN ||
-		p.current.Type == TOKEN_LBRACE ||
-		p.current.Type == TOKEN_COMMA ||
-		p.current.Type == TOKEN_EQUALS ||
-		p.current.Type == TOKEN_COLON_EQUALS ||
-		p.current.Type == TOKEN_LEFT_ARROW ||
-		p.current.Type == TOKEN_PIPE ||
-		p.current.Type == TOKEN_PIPEPIPE ||
-		p.current.Type == TOKEN_FAT_ARROW ||
-		p.current.Type == TOKEN_DEFAULT_ARROW
-
-	if isExpressionStart && p.peek.Type == TOKEN_LE {
-		p.nextToken()           // move to current (TOKEN_LE)
-		p.nextToken()           // skip '<=', move to next
-		source := p.parsePipe() // Note: recursive to allow nested receives
-		return &ReceiveExpr{Source: source}
-	}
-
-	return p.parseOrBang()
-}
-
-// parseOrBang handles the or! operator
-// Grammar: or_bang_expr = send_expr { "or!" send_expr }
-func (p *Parser) parseOrBang() Expression {
-	left := p.parseSend()
-
-	// or! is right-associative
-	if p.peek.Type == TOKEN_OR_BANG {
-		p.nextToken() // move to left
-		p.nextToken() // skip 'or!'
-
-		var right Expression
-		if p.peek.Type == TOKEN_LBRACE {
-			// or! followed by a block: parse the block as a lambda
-			right = p.parsePrimary()
-		} else {
-			// or! followed by an expression
-			right = p.parseOrBang() // right-associative recursion
-		}
-		return &BinaryExpr{Left: left, Operator: "or!", Right: right}
-	}
-
-	return left
-}
-
-// parseSend handles the <- infix operator for sending to channels
-// Grammar: send_expr = or_expr { "<-" or_expr }
-func (p *Parser) parseSend() Expression {
-	left := p.parseCompose()
-
-	// Check for send operator: expr <- expr
-	// Left side should be an address literal (e.g., &8080)
-	for p.peek.Type == TOKEN_LEFT_ARROW {
-		p.nextToken() // move to left
-		p.nextToken() // skip '<-'
-		right := p.parseCompose()
-		left = &SendExpr{Target: left, Message: right}
-	}
-
-	return left
-}
-
-// parseCompose handles the <> (function composition) operator
-// Right-associative: f <> g <> h means f <> (g <> h)
-func (p *Parser) parseCompose() Expression {
-	left := p.parseLogicalOr()
-
-	if p.peek.Type != TOKEN_LTGT {
-		return left
-	}
-
-	// Collect the full chain `f <> g <> h ...` as a flat list so it can be
-	// desugared into a single lambda `arg -> f(g(h(arg)))` rather than nested
-	// lambdas (which the closure codegen does not handle well).
-	funcs := []Expression{left}
-	for p.peek.Type == TOKEN_LTGT {
-		p.nextToken() // move onto '<>'
-		p.nextToken() // skip '<>' to the next operand
-		funcs = append(funcs, p.parseLogicalOr())
-	}
-	return p.desugarComposeChain(funcs)
-}
-
-// desugarComposeChain rewrites `f <> g <> h` into the lambda
-// `arg -> f(g(h(arg)))`, reusing the normal lambda/closure machinery instead of
-// a dedicated codegen path. Each function may be a named function or a lambda;
-// lambda operands are hoisted to top-level temporaries so they compile through
-// the named-call path.
-func (p *Parser) desugarComposeChain(funcs []Expression) Expression {
-	param := fmt.Sprintf("_compose_arg_%d", composeGensymCounter)
-	composeGensymCounter++
-
-	var body Expression = &IdentExpr{Name: param}
-	for i := len(funcs) - 1; i >= 0; i-- {
-		name := p.composeOperandName(funcs[i])
-		body = &CallExpr{Function: name, Args: []Expression{body}}
-	}
-	return &LambdaExpr{Params: []string{param}, VariadicParam: "", Body: body}
-}
-
-// composeOperandName returns the name to call for a composition operand. Plain
-// identifiers are returned as-is; any other callable expression is hoisted to a
-// synthesized top-level definition and its generated name is returned.
-func (p *Parser) composeOperandName(fn Expression) string {
-	if ident, ok := fn.(*IdentExpr); ok {
-		return ident.Name
-	}
-	name := fmt.Sprintf("_compose_fn_%d", composeGensymCounter)
-	composeGensymCounter++
-	p.pendingHoists = append(p.pendingHoists, &AssignStmt{Name: name, Value: fn})
-	return name
-}
-
-// parseLogicalOr handles the 'or' and 'xor' keywords
-// Grammar: or_expr = and_expr { "or" and_expr }
-//
-//	xor_expr = and_expr { "xor" and_expr }
-func (p *Parser) parseLogicalOr() Expression {
-	left := p.parseLogicalAnd()
-
-	for p.peek.Type == TOKEN_OR || p.peek.Type == TOKEN_XOR {
-		p.nextToken() // skip current
-		op := p.current.Value
-		p.nextToken() // skip operator
-		p.skipExprNewlines()
-		right := p.parseLogicalAnd()
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
-	}
-
-	return left
-}
-
-func (p *Parser) parseLogicalAnd() Expression {
-	left := p.parseComparison()
-
-	for p.peek.Type == TOKEN_AND {
-		p.nextToken() // skip current
-		op := p.current.Value
-		p.nextToken() // skip 'and'
-		p.skipExprNewlines()
-		right := p.parseComparison()
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
-	}
-
-	return left
-}
-
-// requireOperand reports a clear error when an infix operator is missing its
-// right-hand operand (e.g. `x = 1 +` at end of line). Operand parsers return
-// nil at expression delimiters, which is valid at statement level but never
-// directly after an operator; without this check the nil silently propagated
-// into a BinaryExpr and surfaced as a confusing "expected '}'" later.
-func (p *Parser) requireOperand(right Expression, op string) Expression {
-	if right == nil {
-		p.error(fmt.Sprintf("expected expression after '%s'", op))
-	}
-	return right
-}
-
-func (p *Parser) parseComparison() Expression {
-	left := p.parseCons()
-
-	// Check for 'in' operator (membership testing)
-	if p.peek.Type == TOKEN_IN {
-		p.nextToken() // move to left expr
-		p.nextToken() // skip 'in'
-		right := p.parseCons()
-		return &InExpr{Value: left, Container: right}
-	}
-
-	for p.peek.Type == TOKEN_LT || p.peek.Type == TOKEN_GT ||
-		p.peek.Type == TOKEN_LE || p.peek.Type == TOKEN_GE ||
-		p.peek.Type == TOKEN_EQ || p.peek.Type == TOKEN_NE {
-		p.nextToken()
-		op := p.current.Value
-		p.nextToken()
-		p.skipExprNewlines()
-		right := p.requireOperand(p.parseCons(), op)
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
-	}
-
-	return left
-}
-
-// parseCons handles the right-associative list cons operator:
-//
-//	elem :: list
-//
-// prepends elem to list, so `1 :: 2 :: xs` is `1 :: (2 :: xs)`. Binds tighter
-// than comparison and looser than ranges/arithmetic (like Haskell's `:`), so
-// `a + 1 :: xs` conses `a + 1` and `x :: xs == ys` compares the cons result.
-func (p *Parser) parseCons() Expression {
-	left := p.parseRange()
-
-	if p.peek.Type == TOKEN_COLONCOLON {
-		p.nextToken() // move onto '::'
-		p.nextToken() // move onto the right operand
-		p.skipExprNewlines()
-		right := p.requireOperand(p.parseCons(), "::") // right-associative
-		return &BinaryExpr{Left: left, Operator: "::", Right: right}
-	}
-
-	return left
-}
-
-// parseRange handles range expressions (0..<10 or 0..=10)
-func (p *Parser) parseRange() Expression {
-	left := p.parseAdditive()
-
-	// Check for range operators
-	if p.peek.Type == TOKEN_DOTDOTLT || p.peek.Type == TOKEN_DOTDOT {
-		p.nextToken() // move to left expr
-		inclusive := p.current.Type == TOKEN_DOTDOT
-		p.nextToken() // skip range operator
-		right := p.parseAdditive()
-		return &RangeExpr{Start: left, End: right, Inclusive: inclusive}
-	}
-
-	return left
-}
-
-// parseLambdaBody parses the body of a lambda expression according to GRAMMAR.md:
-//
-// Lambda body can be:
-// 1. A block: { ... } (map, match, or statement block)
-// 2. An expression followed by optional match block: expr { ... }
-//
-// For blocks, we use block disambiguation to determine type:
-// - Contains ':' before arrows → map literal
-// - Contains '->' or '~>' → match block (guard match if no expr before {)
-// - Otherwise → statement block
-func (p *Parser) parseLambdaBody() Expression {
-	// Increment function depth and push scope when entering lambda body
-	p.functionDepth++
-	p.pushScope()
-	defer func() {
-		p.functionDepth--
-		p.popScope()
-	}()
-
-	// Declare lambda parameters in the new scope
-	for _, param := range p.lambdaParams {
-		p.declareVariable(param)
-	}
-
-	// Allow the body to begin on the next line (`f = (x) ->` / `= ` then newline).
+	p.expect(TOKEN_ARROW, "'->'")
 	p.skipNewlines()
+	lambda.Pos = lambdaPos
+	lambda.Body = p.functionBody(lambda)
+	return lambda
+}
 
-	// Check if lambda body is a block { ... }
-	if p.current.Type == TOKEN_LBRACE {
-		// Disambiguate block type
-		blockType := p.disambiguateBlock()
-
-		p.nextToken() // skip '{'
+func (p *Parser) pipe() Expression {
+	left := p.orBang()
+	for p.at(TOKEN_PIPE_FWD) {
+		pipePos := p.pos()
+		p.advance()
 		p.skipNewlines()
-
-		switch blockType {
-		case BlockTypeMap:
-			// Parse as map literal
-			return p.parseMapLiteralBody()
-
-		case BlockTypeMatch:
-			// Parse as guard match block (no expression before {)
-			// Create a dummy true condition for guard matches
-			trueExpr := &NumberExpr{Value: 1.0}
-			return p.parseMatchBlock(trueExpr)
-
-		case BlockTypeStatement:
-			// Parse statements until we hit '}'
-			var statements []Statement
-			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-				stmt := p.parseStatement()
-				if stmt != nil {
-					statements = append(statements, stmt)
-				}
-
-				// Need to advance to the next statement
-				// Skip newlines and semicolons between statements
-				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-					p.nextToken() // move to separator
-					p.skipNewlines()
-				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
-					// At end of block
-					p.nextToken() // move to '}'
-					break
-				} else {
-					// No separator found - might be at end
-					p.nextToken()
-					p.skipNewlines()
-				}
-			}
-
-			if p.current.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of lambda block")
-			}
-			// Don't skip the '}' - let the caller handle it
-
-			// Return a BlockExpr containing the statements
-			return &BlockExpr{Statements: statements}
-
-		case BlockTypeMixed:
-			// Leading statements, then a trailing guard match that is evaluated
-			// and returned (spec: "Statements execute first, then the guard match
-			// is evaluated and returned").
-			var statements []Statement
-			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_PIPE {
-				stmt := p.parseStatement()
-				if stmt != nil {
-					statements = append(statements, stmt)
-				}
-				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-					p.nextToken()
-					p.skipNewlines()
-				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
-					p.nextToken()
-					break
-				} else {
-					p.nextToken()
-					p.skipNewlines()
-				}
-			}
-			// current is now at the guard match's leading '|'. Parse it against a
-			// constant-true condition and make it the block's return value.
-			matchExpr := p.parseMatchBlock(&NumberExpr{Value: 1.0})
-			statements = append(statements, &ExpressionStmt{Expr: matchExpr})
-			return &BlockExpr{Statements: statements}
+		switch right := p.orBang().(type) {
+		case *CallExpr:
+			right.Args = append([]Expression{left}, right.Args...)
+			left = right
+		case *DirectCallExpr:
+			right.Args = append([]Expression{left}, right.Args...)
+			left = right
+		case *IdentExpr:
+			left = &CallExpr{Pos: right.Pos, Function: right.Name, Args: []Expression{left}}
+		default:
+			left = &DirectCallExpr{Pos: pipePos, Callee: right, Args: []Expression{left}}
 		}
 	}
+	return left
+}
 
-	// Otherwise, parse the body expression
-	expr := p.parseExpression()
-
-	// Check for value match: expr { pattern -> result }
-	if p.peek.Type == TOKEN_LBRACE {
-		p.nextToken() // move to '{'
-		p.nextToken() // skip '{'
+func (p *Parser) orBang() Expression {
+	left := p.or()
+	for p.at(TOKEN_OR_BANG) {
+		opPos := p.pos()
+		p.advance()
 		p.skipNewlines()
-		return p.parseMatchBlock(expr)
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "or!", Right: p.or()}
 	}
-
-	return expr
-}
-
-func (p *Parser) parseAdditive() Expression {
-	left := p.parseBitwise()
-
-	for p.peek.Type == TOKEN_PLUS || p.peek.Type == TOKEN_MINUS {
-		p.nextToken()
-		op := p.current.Value
-		p.nextToken()
-		p.skipExprNewlines()
-		right := p.requireOperand(p.parseBitwise(), op)
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
-	}
-
 	return left
 }
 
-func (p *Parser) parseBitwise() Expression {
-	left := p.parseMultiplicative()
-
-	for p.peek.Type == TOKEN_PIPE_B || p.peek.Type == TOKEN_AMP_B ||
-		p.peek.Type == TOKEN_CARET_B || p.peek.Type == TOKEN_LTLT_B ||
-		p.peek.Type == TOKEN_GTGT_B || p.peek.Type == TOKEN_LTLTLT_B ||
-		p.peek.Type == TOKEN_GTGTGT_B || p.peek.Type == TOKEN_QUESTION_B {
-		p.nextToken()
-		op := p.current.Value
-		p.nextToken()
-		p.skipExprNewlines()
-		right := p.requireOperand(p.parseMultiplicative(), op)
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
+func (p *Parser) or() Expression {
+	left := p.and()
+	for p.at(TOKEN_OR) {
+		opPos := p.pos()
+		p.advance()
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "or", Right: p.and()}
 	}
-
 	return left
 }
 
-func (p *Parser) parseMultiplicative() Expression {
-	left := p.parsePower()
-
-	for p.peek.Type == TOKEN_STAR || p.peek.Type == TOKEN_SLASH || p.peek.Type == TOKEN_MOD || p.peek.Type == TOKEN_FMA {
-		p.nextToken()
-		op := p.current.Value
-		p.nextToken()
-		p.skipExprNewlines()
-		right := p.requireOperand(p.parsePower(), op)
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
+func (p *Parser) and() Expression {
+	left := p.not()
+	for p.at(TOKEN_AND) {
+		opPos := p.pos()
+		p.advance()
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "and", Right: p.not()}
 	}
-
 	return left
 }
 
-// parsePower handles the ** (power/exponentiation) operator
-// Power is right-associative: 2 ** 3 ** 2 = 2 ** (3 ** 2) = 512
-func (p *Parser) parsePower() Expression {
-	left := p.parseUnary()
-
-	if p.peek.Type == TOKEN_POWER || p.peek.Type == TOKEN_CARET {
-		p.nextToken() // move to ** or ^
-		op := p.current.Value
-		// Normalize ^ to ** for backend processing
-		if op == "^" {
-			op = "**"
-		}
-		p.nextToken() // move past ** or ^
-		// Right-associative: recursively parse the right side
-		right := p.requireOperand(p.parsePower(), op)
-		return &BinaryExpr{Left: left, Operator: op, Right: right}
+func (p *Parser) not() Expression {
+	if p.at(TOKEN_NOT) {
+		opPos := p.pos()
+		p.advance()
+		return &UnaryExpr{Pos: opPos, Operator: "not", Operand: p.not()}
 	}
-
-	return left
+	return p.compare()
 }
 
-func (p *Parser) parseUnary() Expression {
-	// Handle unary operators (not, ++, --, ~b, ^, &)
-	if p.current.Type == TOKEN_NOT {
-		p.nextToken() // skip 'not'
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: "not", Operand: operand}
-	}
-
-	// Handle prefix increment/decrement: ++x, --x
-	if p.current.Type == TOKEN_INCREMENT || p.current.Type == TOKEN_DECREMENT {
-		op := p.current.Value
-		p.nextToken() // skip ++ or --
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: op, Operand: operand}
-	}
-
-	// Handle bitwise NOT: ~b or !
-	if p.current.Type == TOKEN_TILDE_B || p.current.Type == TOKEN_BANG {
-		p.nextToken() // skip '~b' or '!'
-		operand := p.parseUnary()
-		// Normalize both to "~b" internally
-		return &UnaryExpr{Operator: "~b", Operand: operand}
-	}
-
-	// Handle prefix length operator: #xs
-	if p.current.Type == TOKEN_HASH {
-		p.nextToken() // skip '#'
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: "#", Operand: operand}
-	}
-
-	// Unary minus handled in parsePrimary for simplicity
-	return p.parsePostfix()
+var compareOps = map[TokenType]string{
+	TOKEN_EQ: "==", TOKEN_NE: "!=", TOKEN_LT: "<", TOKEN_LE: "<=", TOKEN_GT: ">", TOKEN_GE: ">=",
 }
 
-func (p *Parser) parsePostfix() Expression {
-	expr := p.parsePrimary()
-
-	// Handle postfix operations like indexing and function calls
+// compare parses comparison chains: a < b <= c is (a < b) and (b <= c).
+func (p *Parser) compare() Expression {
+	left := p.rangeExpr()
+	var result Expression
 	for {
-		if p.peek.Type == TOKEN_LBRACKET {
-			p.nextToken() // skip current expr
-			p.nextToken() // skip '['
-
-			// Check for empty indexing (syntax error)
-			if p.current.Type == TOKEN_RBRACKET {
-				p.error("empty indexing [] is not allowed")
+		var cmp Expression
+		opPos := p.pos()
+		switch t := p.cur().Type; {
+		case compareOps[t] != "":
+			p.advance()
+			right := p.rangeExpr()
+			cmp = &BinaryExpr{Pos: opPos, Left: left, Operator: compareOps[t], Right: right}
+			left = right
+		case t == TOKEN_IN:
+			p.advance()
+			right := p.rangeExpr()
+			cmp = &InExpr{Pos: opPos, Value: left, Container: right}
+			left = right
+		case t == TOKEN_NOT && p.peekAt(1).Type == TOKEN_IN:
+			p.i += 2
+			right := p.rangeExpr()
+			cmp = &UnaryExpr{Pos: opPos, Operator: "not", Operand: &InExpr{Pos: opPos, Value: left, Container: right}}
+			left = right
+		default:
+			if result == nil {
+				return left
 			}
+			return result
+		}
+		if result == nil {
+			result = cmp
+		} else {
+			result = &BinaryExpr{Pos: opPos, Left: result, Operator: "and", Right: cmp}
+		}
+	}
+}
 
-			// Check for slice syntax: [start:end], [:end], [start:], [:]
-			// Parse the first expression (could be start or index)
-			var firstExpr Expression
-			var isSlice bool
-			if p.current.Type == TOKEN_COLON {
-				// Case: [:end] or [::step]
-				firstExpr = nil
-				isSlice = true
-				p.nextToken() // skip ':'
-			} else {
-				firstExpr = p.parseExpression()
-				// Check if this is a slice (has colon)
-				isSlice = p.peek.Type == TOKEN_COLON
-				if isSlice {
-					p.nextToken() // move to colon
-					p.nextToken() // skip ':'
-				}
+func (p *Parser) rangeExpr() Expression {
+	start := p.bitOr()
+	if p.at(TOKEN_RANGE_EX) || p.at(TOKEN_RANGE_IN) {
+		opPos := p.pos()
+		inclusive := p.advance().Type == TOKEN_RANGE_IN
+		return &RangeExpr{Pos: opPos, Start: start, End: p.bitOr(), Inclusive: inclusive}
+	}
+	return start
+}
+
+func (p *Parser) binary(next func() Expression, ops map[TokenType]string) Expression {
+	left := next()
+	for {
+		op, ok := ops[p.cur().Type]
+		if !ok || op == "|b" && p.noPipe > 0 {
+			return left
+		}
+		opPos := p.pos()
+		p.advance()
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: op, Right: next()}
+	}
+}
+
+func (p *Parser) bitOr() Expression {
+	return p.binary(p.bitXor, map[TokenType]string{TOKEN_PIPE: "|b"})
+}
+func (p *Parser) bitXor() Expression {
+	return p.binary(p.bitAnd, map[TokenType]string{TOKEN_CARET: "^b"})
+}
+func (p *Parser) bitAnd() Expression {
+	return p.binary(p.shift, map[TokenType]string{TOKEN_AMP: "&b"})
+}
+func (p *Parser) shift() Expression {
+	return p.binary(p.sum, map[TokenType]string{TOKEN_SHL: "<<b", TOKEN_SHR: ">>b"})
+}
+func (p *Parser) sum() Expression {
+	return p.binary(p.product, map[TokenType]string{TOKEN_PLUS: "+", TOKEN_MINUS: "-"})
+}
+func (p *Parser) product() Expression {
+	return p.binary(p.cast, map[TokenType]string{TOKEN_STAR: "*", TOKEN_SLASH: "/", TOKEN_PERCENT: "%"})
+}
+
+var castTypes = map[string]bool{
+	"int8": true, "int16": true, "int32": true, "int64": true,
+	"uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"float32": true, "float64": true, "cstr": true, "cstring": true, "cptr": true, "ptr": true,
+	"num": true, "str": true, "list": true, "map": true, "bool": true, "cbool": true,
+	"cint": true, "clong": true, "cfloat": true, "cdouble": true,
+}
+
+func (p *Parser) cast() Expression {
+	e := p.unary()
+	for p.at(TOKEN_AS) {
+		castPos := p.pos()
+		p.advance()
+		t := p.expect(TOKEN_IDENT, "a type after 'as'").Value
+		if canon, ok := cTypeAliases[t]; ok {
+			t = canon
+		}
+		e = &CastExpr{Pos: castPos, Expr: e, Type: t}
+	}
+	return e
+}
+
+func (p *Parser) unary() Expression {
+	opPos := p.pos()
+	switch p.cur().Type {
+	case TOKEN_MINUS:
+		p.advance()
+		operand := p.unary()
+		if n, ok := operand.(*NumberExpr); ok {
+			if r, exact := n.Rat(); exact {
+				return newExactNumber(new(big.Rat).Neg(r))
 			}
+			return &NumberExpr{Value: -n.Value}
+		}
+		return &UnaryExpr{Pos: opPos, Operator: "-", Operand: operand}
+	case TOKEN_TILDE:
+		p.advance()
+		return &UnaryExpr{Pos: opPos, Operator: "~b", Operand: p.unary()}
+	case TOKEN_HASH:
+		p.advance()
+		return &UnaryExpr{Pos: opPos, Operator: "#", Operand: p.unary()}
+	}
+	return p.power()
+}
 
-			if isSlice {
-				var endExpr Expression
-				if p.current.Type == TOKEN_RBRACKET {
-					// Case: [start:] or [:]
-					endExpr = nil
-				} else if p.current.Type == TOKEN_COLON {
-					// Case: [start::step] or [::step]
-					endExpr = nil
-					// Don't skip the colon yet - let step handling do it
-				} else {
-					endExpr = p.parseExpression()
-				}
+func (p *Parser) power() Expression {
+	base := p.postfix()
+	if p.at(TOKEN_POWER) {
+		opPos := p.pos()
+		p.advance()
+		return &BinaryExpr{Pos: opPos, Left: base, Operator: "**", Right: p.unary()}
+	}
+	return base
+}
 
-				// Check for step parameter (second colon)
-				var stepExpr Expression
-				if p.peek.Type == TOKEN_COLON || p.current.Type == TOKEN_COLON {
-					if p.current.Type != TOKEN_COLON {
-						p.nextToken() // move to second colon
-					}
-					p.nextToken() // skip ':'
-
-					if p.current.Type == TOKEN_RBRACKET {
-						// Case: [start:end:] - step is nil
-						stepExpr = nil
-					} else {
-						stepExpr = p.parseExpression()
-						p.nextToken() // move to ']'
-					}
-				} else if endExpr != nil {
-					// We parsed an end expression, need to move to ']'
-					p.nextToken()
-				}
-
-				expr = &SliceExpr{List: expr, Start: firstExpr, End: endExpr, Step: stepExpr}
-			} else {
-				// Regular indexing
-				p.nextToken() // move to ']'
-				expr = &IndexExpr{List: expr, Index: firstExpr}
-			}
-		} else if p.peek.Type == TOKEN_LPAREN {
-			// Handle direct lambda calls: ((x) -> x * 2)(5)
-			// or chained calls: f(1)(2)
-			p.nextToken() // skip current expr
-			p.nextToken() // skip '('
-			p.skipNewlines()
-			args := []Expression{}
-
-			if p.current.Type != TOKEN_RPAREN {
-				args = append(args, p.parseExpression())
-				for p.peek.Type == TOKEN_COMMA {
-					p.nextToken() // skip current
-					p.nextToken() // skip ','
-					p.skipNewlines()
-					args = append(args, p.parseExpression())
-				}
-				// current should be on last arg, peek should be ')'
-				p.skipNewlines()
-				p.nextToken() // move to ')'
-			}
-			// current is now on ')', whether we had args or not
-
-			// TODO: Blocks-as-arguments disabled (conflicts with match expressions)
-
-			// Wrap the expression in a CallExpr
-			// If expr is a LambdaExpr, it will be compiled and called
-			// If expr is an IdentExpr, it will be looked up and called
-			if ident, ok := expr.(*IdentExpr); ok {
-				// Special handling for vector constructors
-				if ident.Name == "vec2" {
-					if len(args) != 2 {
-						p.error("vec2 requires exactly 2 arguments")
-					}
-					expr = &VectorExpr{Components: args, Size: 2}
-				} else if ident.Name == "vec4" {
-					if len(args) != 4 {
-						p.error("vec4 requires exactly 4 arguments")
-					}
-					expr = &VectorExpr{Components: args, Size: 4}
-				} else {
-					expr = &CallExpr{Function: ident.Name, Args: args}
-				}
-			} else {
-				// For lambda expressions or other callable expressions,
-				// create a special call expression that compiles the lambda inline
-				expr = &DirectCallExpr{Callee: expr, Args: args}
-			}
-		} else if p.peek.Type == TOKEN_INCREMENT || p.peek.Type == TOKEN_DECREMENT {
-			// Handle postfix increment/decrement: x++, x--
-			p.nextToken() // skip current expr
-			op := p.current.Value
-			expr = &PostfixExpr{Operator: op, Operand: expr}
-		} else if p.peek.Type == TOKEN_BANG {
-			// A '!' immediately followed by a number or 'inf' inside a loop
-			// header is the loop iteration bound (e.g. "@ x < 10 ! 100"), not a
-			// move/raw-bitcast. Leave it unconsumed so the loop parser handles it.
-			if p.inConditionLoop && p.bangIsBound() {
+func (p *Parser) args() []Expression {
+	p.expect(TOKEN_LPAREN, "'('")
+	args := nested(p, func() []Expression {
+		var args []Expression
+		for !p.at(TOKEN_RPAREN) {
+			args = append(args, p.expr())
+			if !p.accept(TOKEN_COMMA) {
 				break
 			}
-			// Handle different meanings of ! based on context:
-			// - After function call: raw bitcast return value (call()!)
-			// - After other expr: move operator (x!)
-			p.nextToken() // skip to !
-			if callExpr, ok := expr.(*CallExpr); ok {
-				// Set raw bitcast flag on the call expression
-				callExpr.RawBitcast = true
-			} else if directCall, ok := expr.(*DirectCallExpr); ok {
-				// For direct calls (lambdas), wrap in a move since we don't support raw bitcast for them
-				expr = &MoveExpr{Expr: directCall}
-			} else {
-				// For other expressions, use move operator
-				expr = &MoveExpr{Expr: expr}
-			}
-		} else if p.peek.Type == TOKEN_HASH {
-			// Handle postfix length operator: xs#
-			p.nextToken() // skip to #
-			expr = &UnaryExpr{Operator: "#", Operand: expr}
-		} else if p.peek.Type == TOKEN_AS || (p.peek.Type == TOKEN_COLON && !p.inMapKey && !p.inTernaryThen) {
-			// Handle type cast: `expr as Type` or the `:` shorthand `expr : Type`.
-			// The `:` form is suppressed while parsing a map key (`{5: 10}`) so the
-			// colon there stays the key separator. (Block-level disambiguation
-			// recognizes `: <TypeName>` as an annotation, not a map, separately.)
-			isRawBitcast := false
-			p.nextToken() // skip current expr
-			p.nextToken() // skip 'as' / ':'
-
-			// Parse the cast type
-			var castType string
-			if p.current.Type == TOKEN_IDENT {
-				typeName := p.current.Value
-				// Check if it's a cstruct name
-				if _, exists := p.cstructs[typeName]; exists {
-					// It's a cstruct type - store the full type name
-					castType = typeName
-				} else {
-					// Check if it's a built-in type
-					validTypes := map[string]bool{
-						// C integer types
-						"int8": true, "int16": true, "int32": true, "int64": true,
-						"uint8": true, "uint16": true, "uint32": true, "uint64": true,
-						"char": true, "short": true, "int": true, "long": true,
-						"uchar": true, "ushort": true, "uint": true, "ulong": true,
-						"size_t": true, "ssize_t": true, "ptrdiff_t": true,
-						// C floating point types
-						"float": true, "float32": true, "float64": true, "double": true,
-						// C string/pointer types
-						"cstr": true, "cptr": true, "cstring": true,
-						"ptr": true, "pointer": true,
-						// Tim types (canonical short names match `:` annotations)
-						"num": true, "str": true,
-						"number": true, "string": true,
-						"list": true, "map": true, "addr": true,
-						"bool": true, "boolean": true, "cbool": true,
-						// Type aliases
-						"void": true,
-					}
-					if validTypes[p.current.Value] {
-						castType = p.current.Value
-					} else {
-						p.error("expected valid type or cstruct name after 'as' (e.g., string, int, SDL_Event)")
-					}
-				}
-			} else {
-				p.error("expected type after 'as'")
-			}
-
-			expr = &CastExpr{Expr: expr, Type: castType, RawBitcast: isRawBitcast}
-		} else if p.peek.Type == TOKEN_DOT {
-			// Handle dot notation: obj.field, namespace.func(), namespace.CONSTANT, Type.size, Type.field.offset
-			p.nextToken() // skip current expr
-			p.nextToken() // skip '.'
-
-			// Allow keywords like 'malloc' and 'free' as field names for C FFI (c.malloc, c.free)
-			var fieldName string
-			if p.current.Type == TOKEN_IDENT {
-				fieldName = p.current.Value
-			} else if p.current.Type == TOKEN_MALLOC {
-				fieldName = "malloc"
-			} else if p.current.Type == TOKEN_FREE {
-				fieldName = "free"
-			} else {
-				p.error("expected field name after '.'")
-			}
-
-			// Check if this is a namespaced function call or constant: namespace.func() or namespace.CONSTANT
-			// This requires expr to be an IdentExpr
-			if ident, ok := expr.(*IdentExpr); ok {
-				// Check if this is metadata access: Type.size or Type.field.offset
-				if cstruct, exists := p.cstructs[ident.Name]; exists {
-					if fieldName == "size" {
-						// Type.size - return struct size as constant
-						expr = &NumberExpr{Value: float64(cstruct.Size)}
-					} else {
-						// Check if this is Type.field.offset
-						fieldFound := false
-						for _, field := range cstruct.Fields {
-							if field.Name == fieldName {
-								fieldFound = true
-								// Check if next token is .offset
-								if p.peek.Type == TOKEN_DOT {
-									p.nextToken() // skip field name
-									p.nextToken() // skip '.'
-									if p.current.Type == TOKEN_IDENT && p.current.Value == "offset" {
-										// Type.field.offset - return field offset as constant
-										expr = &NumberExpr{Value: float64(field.Offset)}
-									} else {
-										p.error("expected 'offset' after '" + cstruct.Name + "." + fieldName + ".'")
-									}
-								} else {
-									p.error("expected '.offset' after '" + cstruct.Name + "." + fieldName + "'")
-								}
-								break
-							}
-						}
-						if !fieldFound {
-							p.error("cstruct '" + cstruct.Name + "' has no field '" + fieldName + "'")
-						}
-					}
-				} else if p.peek.Type == TOKEN_LPAREN {
-					// Check if this is a C import namespace (e.g., sdl, c) or a method call (e.g., xs.append).
-					// A declared variable shadows the namespace, so `c.foo(...)` on a local `c` is a method call.
-					if p.cImports[ident.Name] && !p.isDeclaredVariable(ident.Name) {
-						// Namespaced function call - combine identifiers
-						namespacedName := ident.Name + "." + fieldName
-						p.nextToken() // skip second identifier
-						p.nextToken() // skip '('
-						args := []Expression{}
-
-						if p.current.Type != TOKEN_RPAREN {
-							args = append(args, p.parseExpression())
-							for p.peek.Type == TOKEN_COMMA {
-								p.nextToken() // skip current
-								p.nextToken() // skip ','
-								args = append(args, p.parseExpression())
-							}
-							p.nextToken() // move to ')'
-						}
-						// Check if this is a C FFI call (c.malloc, C.printf, etc.)
-						isCFFI := ident.Name == "c" || ident.Name == "C"
-						if isCFFI {
-							// For C FFI calls, use just the function name without the "c." prefix
-							expr = &CallExpr{Function: fieldName, Args: args, IsCFFI: true}
-						} else {
-							// Regular C library namespace call (e.g., sdl.SDL_Init)
-							expr = &CallExpr{Function: namespacedName, Args: args}
-						}
-					} else {
-						// Ambiguous: could be method call (xs.append) or Tim namespace (lib.hello)
-						// Parse as namespaced call and let compiler resolve
-						namespacedName := ident.Name + "." + fieldName
-						p.nextToken() // skip second identifier
-						p.nextToken() // skip '('
-						args := []Expression{}
-
-						if p.current.Type != TOKEN_RPAREN {
-							args = append(args, p.parseExpression())
-							for p.peek.Type == TOKEN_COMMA {
-								p.nextToken() // skip current
-								p.nextToken() // skip ','
-								args = append(args, p.parseExpression())
-							}
-							p.nextToken() // move to ')'
-						}
-						// Store as namespace.function, compiler will handle both cases
-						expr = &CallExpr{Function: namespacedName, Args: args}
-					}
-				} else {
-					// Not a function call - could be field access or constant access
-					// Check if this is a C import namespace (namespace.CONSTANT).
-					// A declared variable shadows the namespace, so `c.x` on a local `c` is field access.
-					if p.cImports[ident.Name] && !p.isDeclaredVariable(ident.Name) {
-						// C import constant access (e.g., sdl.SDL_INIT_VIDEO)
-						if fieldName == "error" {
-							// .error property - extract error code from Result type
-							expr = &CallExpr{
-								Function: "_error_code_extract",
-								Args:     []Expression{expr},
-							}
-						} else {
-							// C constant access - create NamespacedIdentExpr
-							expr = &NamespacedIdentExpr{Namespace: ident.Name, Name: fieldName}
-						}
-					} else {
-						// Regular field access on a Tim variable
-						if fieldName == "error" {
-							// .error property - extract error code from Result type
-							expr = &CallExpr{
-								Function: "_error_code_extract",
-								Args:     []Expression{expr},
-							}
-						} else {
-							// Regular field access - use FieldAccessExpr
-							expr = &FieldAccessExpr{
-								Object:    expr,
-								FieldName: fieldName,
-								Offset:    -1,
-							}
-						}
-					}
-				}
-			} else {
-				// Check if this is a method call: obj.method(args)
-				if p.peek.Type == TOKEN_LPAREN {
-					// Method call syntax sugar: obj.method(args) -> method(obj, args)
-					p.nextToken()              // skip field name
-					p.nextToken()              // skip '('
-					args := []Expression{expr} // receiver becomes first argument
-
-					if p.current.Type != TOKEN_RPAREN {
-						args = append(args, p.parseExpression())
-						for p.peek.Type == TOKEN_COMMA {
-							p.nextToken() // skip current
-							p.nextToken() // skip ','
-							args = append(args, p.parseExpression())
-						}
-						p.nextToken() // move to ')'
-					}
-					// Desugar to function call with receiver as first arg
-					expr = &CallExpr{Function: fieldName, Args: args}
-				} else if fieldName == "error" {
-					// .error property - extract error code from Result type
-					// This will be handled specially in codegen
-					expr = &CallExpr{
-						Function: "_error_code_extract",
-						Args:     []Expression{expr},
-					}
-				} else {
-					// Regular field access - use FieldAccessExpr
-					// Codegen will decide if it's C struct access or Tim map access
-					expr = &FieldAccessExpr{
-						Object:    expr,
-						FieldName: fieldName,
-						Offset:    -1, // Unknown offset, will be determined at codegen
-					}
-				}
-			}
-		} else {
-			break
 		}
+		return args
+	})
+	p.expect(TOKEN_RPAREN, "')' after arguments")
+	if args == nil {
+		args = []Expression{}
 	}
-
-	return expr
+	return args
 }
 
-func (p *Parser) parsePrimary() Expression {
-	switch p.current.Type {
-	case TOKEN_ARROW:
-		// Explicit no-argument lambda: -> expr or -> { ... }
-		p.nextToken()               // skip '->'
-		p.lambdaParams = []string{} // No parameters
-		body := p.parseLambdaBody()
-		p.lambdaParams = nil
-		return &LambdaExpr{Params: []string{}, VariadicParam: "", Body: body}
+func (p *Parser) postfix() Expression {
+	e := p.primary()
+	for {
+		switch p.cur().Type {
+		case TOKEN_LPAREN:
+			callPos := p.pos()
+			args := p.args()
+			if id, ok := e.(*IdentExpr); ok {
+				callPos = id.Pos
+				op, isBitOp := bitBuiltins[id.Name]
+				switch {
+				case p.isDeclared(id.Name):
+					e = &CallExpr{Pos: callPos, Function: id.Name, Args: args}
+				case id.Name == "vec2" && len(args) == 2, id.Name == "vec4" && len(args) == 4:
+					e = &VectorExpr{Components: args, Size: len(args)}
+				case isBitOp && len(args) == 2:
+					e = &BinaryExpr{Pos: callPos, Left: args[0], Operator: op, Right: args[1]}
+				case id.Name == "random" && len(args) == 0:
+					e = &RandomExpr{}
+				default:
+					e = &CallExpr{Pos: callPos, Function: id.Name, Args: args}
+				}
+			} else {
+				e = &DirectCallExpr{Pos: callPos, Callee: e, Args: args}
+			}
+		case TOKEN_LBRACKET:
+			e = p.indexOrSlice(e)
+		case TOKEN_DOT:
+			e = p.member(e)
+		default:
+			return e
+		}
+	}
+}
 
-	case TOKEN_MINUS:
-		// Unary minus: -expr
-		p.nextToken() // skip '-'
-		expr := p.parsePrimary()
-		return &UnaryExpr{Operator: "-", Operand: expr}
+func (p *Parser) indexOrSlice(list Expression) Expression {
+	at := p.pos()
+	p.advance()
+	return nested(p, func() Expression {
+		if p.at(TOKEN_RBRACKET) {
+			p.fail("empty index")
+		}
+		var start Expression
+		if !p.at(TOKEN_COLON) {
+			start = p.expr()
+		}
+		if p.accept(TOKEN_RBRACKET) {
+			if start == nil {
+				p.fail("empty index")
+			}
+			return &IndexExpr{Pos: at, List: list, Index: start}
+		}
+		p.expect(TOKEN_COLON, "']' or ':'")
+		var end Expression
+		if !p.at(TOKEN_RBRACKET) {
+			end = p.expr()
+		}
+		p.expect(TOKEN_RBRACKET, "']'")
+		return &SliceExpr{Pos: at, List: list, Start: start, End: end}
+	})
+}
 
-	case TOKEN_HASH:
-		// Length operator: #list
-		p.nextToken() // skip '#'
-		expr := p.parsePrimary()
-		return &LengthExpr{Operand: expr}
+// member parses `.name` after an expression: C namespaces, cstruct
+// metadata, method calls, `.error` and field access.
+func (p *Parser) member(obj Expression) Expression {
+	at := p.pos()
+	p.advance()
+	field := p.expect(TOKEN_IDENT, "a field or method name after '.'").Value
+	id, isIdent := obj.(*IdentExpr)
+	if isIdent {
+		if decl, ok := p.cstructs[id.Name]; ok {
+			if field == "size" {
+				return &NumberExpr{Value: float64(decl.Size)}
+			}
+			for _, f := range decl.Fields {
+				if f.Name == field {
+					p.expect(TOKEN_DOT, "'.offset'")
+					if p.expect(TOKEN_IDENT, "'offset'").Value != "offset" {
+						p.i--
+						p.fail("expected 'offset' after %s.%s.", decl.Name, field)
+					}
+					return &NumberExpr{Value: float64(f.Offset)}
+				}
+			}
+			p.i--
+			p.fail("cstruct %s has no field '%s'", decl.Name, field)
+		}
+		if p.isNamespace(id.Name) {
+			if p.at(TOKEN_LPAREN) {
+				args := p.args()
+				if id.Name == "c" || id.Name == "C" {
+					return &CallExpr{Pos: id.Pos, Function: field, Args: args, IsCFFI: true}
+				}
+				return &CallExpr{Pos: id.Pos, Function: id.Name + "." + field, Args: args}
+			}
+			return &NamespacedIdentExpr{Namespace: id.Name, Name: field}
+		}
+	}
+	if p.at(TOKEN_LPAREN) {
+		args := p.args()
+		if isIdent {
+			return &CallExpr{Pos: at, Function: id.Name + "." + field, Args: args}
+		}
+		return &CallExpr{Pos: at, Function: field, Args: append([]Expression{obj}, args...)}
+	}
+	if field == "error" {
+		return &CallExpr{Pos: at, Function: "_error_code_extract", Args: []Expression{obj}}
+	}
+	return &FieldAccessExpr{Pos: at, Object: obj, FieldName: field, Offset: -1}
+}
 
+func (p *Parser) primary() Expression {
+	t := p.cur()
+	switch t.Type {
 	case TOKEN_NUMBER:
-		n, err := parseNumber(p.current.Value)
+		p.advance()
+		n, err := parseNumber(t.Value)
 		if err != nil {
-			p.error(err.Error())
-			return &NumberExpr{}
+			p.i--
+			p.fail("%v", err)
 		}
+		n.Pos = tokPos(t)
 		return n
-
-	case TOKEN_INF:
-		return &NumberExpr{Value: math.Inf(1)}
-
-	case TOKEN_RANDOM:
-		return &RandomExpr{}
-
-	case TOKEN_YES:
-		return &BooleanExpr{Value: true}
-
-	case TOKEN_NO:
-		return &BooleanExpr{Value: false}
-
 	case TOKEN_STRING:
-		return &StringExpr{Value: p.current.Value}
-
-	case TOKEN_ADDRESS_LITERAL:
-		// ENet address literal like &8080 or &localhost:8080
-		return &AddressLiteralExpr{Value: p.current.Value}
-
-	case TOKEN_DOLLAR:
-		// Address value operator: $expr
-		p.nextToken() // skip '$'
-		expr := p.parsePrimary()
-		return &UnaryExpr{Operator: "$", Operand: expr}
-
-	case TOKEN_MALLOC:
-		// malloc(size) - C malloc built-in
-		name := "malloc"
-		p.nextToken() // skip 'malloc'
-		if p.current.Type != TOKEN_LPAREN {
-			p.error("expected '(' after malloc")
-		}
-		p.nextToken() // skip '('
-		args := []Expression{}
-		if p.current.Type != TOKEN_RPAREN {
-			args = append(args, p.parseExpression())
-			for p.peek.Type == TOKEN_COMMA {
-				p.nextToken() // skip current
-				p.nextToken() // skip ','
-				args = append(args, p.parseExpression())
-			}
-			p.nextToken() // move to ')'
-		}
-		return &CallExpr{Function: name, Args: args}
-
-	case TOKEN_FREE:
-		// free(ptr) - C free built-in
-		name := "free"
-		p.nextToken() // skip 'free'
-		if p.current.Type != TOKEN_LPAREN {
-			p.error("expected '(' after free")
-		}
-		p.nextToken() // skip '('
-		args := []Expression{}
-		if p.current.Type != TOKEN_RPAREN {
-			args = append(args, p.parseExpression())
-			for p.peek.Type == TOKEN_COMMA {
-				p.nextToken() // skip current
-				p.nextToken() // skip ','
-				args = append(args, p.parseExpression())
-			}
-			p.nextToken() // move to ')'
-		}
-		return &CallExpr{Function: name, Args: args}
-
+		p.advance()
+		return &StringExpr{Pos: tokPos(t), Value: t.Value}
 	case TOKEN_FSTRING:
-		return p.parseFString()
-
+		p.advance()
+		return p.fstring(t)
+	case TOKEN_YES, TOKEN_NO:
+		p.advance()
+		return &BooleanExpr{Value: t.Type == TOKEN_YES}
+	case TOKEN_INF:
+		p.advance()
+		return &NumberExpr{Value: math.Inf(1)}
 	case TOKEN_IDENT:
-		name := p.current.Value
-
-		// Check if this is a constant reference (substitute with value)
-		if expr, isConst := p.constants[name]; isConst {
-			// Return a copy of the stored expression to avoid mutation issues
-			switch e := expr.(type) {
-			case *NumberExpr:
-				return &NumberExpr{Value: e.Value, Exact: e.Exact}
-			case *StringExpr:
-				return &StringExpr{Value: e.Value}
-			case *ListExpr:
-				// Deep copy the list
-				elements := make([]Expression, len(e.Elements))
-				for i, elem := range e.Elements {
-					switch el := elem.(type) {
-					case *NumberExpr:
-						elements[i] = &NumberExpr{Value: el.Value, Exact: el.Exact}
-					case *StringExpr:
-						elements[i] = &StringExpr{Value: el.Value}
-					default:
-						elements[i] = elem
-					}
-				}
-				return &ListExpr{Elements: elements}
-			}
-			return expr
-		}
-
-		// TODO: Struct literal syntax conflicts with lambda match
-		// Need to redesign syntax or add explicit keyword (e.g., new StructName { ... })
-		// Temporarily disabled to fix lambda match expressions
-		// if p.peek.Type == TOKEN_LBRACE {
-		// 	return p.parseStructLiteral(name)
-		// }
-
-		// Check for lambda: x -> expr or x, y -> expr
-		if p.peek.Type == TOKEN_ARROW {
-			// Try to parse as non-parenthesized lambda
-			if lambda := p.tryParseNonParenLambda(); lambda != nil {
-				return lambda
-			}
-		}
-
-		// If we see => it's not a lambda error (it's a match arrow), continue parsing
-		// The => will be handled correctly in match clause parsing
-
-		// Dot notation is now handled entirely in parsePostfix
-		// This includes both field access (obj.field) and namespaced calls (namespace.func())
-
-		// Check for function call
-		if p.peek.Type == TOKEN_LPAREN {
-			p.nextToken() // skip identifier
-			p.nextToken() // skip '('
-			p.skipNewlines()
-			args := []Expression{}
-
-			if p.current.Type != TOKEN_RPAREN {
-				args = append(args, p.parseExpression())
-				for p.peek.Type == TOKEN_COMMA {
-					p.nextToken()    // skip current
-					p.nextToken()    // skip ','
-					p.skipNewlines() // allow arguments to span lines
-					args = append(args, p.parseExpression())
-				}
-				// Advance past the last arg; allow newlines before ')'.
-				p.nextToken()
-				p.skipNewlines()
-			}
-			// current is now on ')', whether we had args or not
-
-			// TODO: Blocks-as-arguments feature disabled for now
-			// It conflicts with match expressions like: func() { -> val }
-			// Need to redesign to only apply when block doesn't start with -> or ~>
-
-			// Special handling for vector constructors
-			if name == "vec2" {
-				if len(args) != 2 {
-					p.error("vec2 requires exactly 2 arguments")
-				}
-				return &VectorExpr{Components: args, Size: 2}
-			} else if name == "vec4" {
-				if len(args) != 4 {
-					p.error("vec4 requires exactly 4 arguments")
-				}
-				return &VectorExpr{Components: args, Size: 4}
-			}
-
-			// Check for optional '!' iteration/recursion bound after a function call,
-			// e.g. "factorial(n-1, n*acc) ! 100". This will be validated during
-			// compilation to ensure it's present for recursive calls.
-			// Skip this if we're parsing a loop header expression (to avoid
-			// consuming the loop's own '!' bound clause).
-			var maxRecursion int64
-			needsCheck := false
-			if p.peek.Type == TOKEN_BANG && !p.inConditionLoop && p.bangIsBound() {
-				p.nextToken() // advance to '!'
-				p.nextToken() // skip '!', now on the value
-
-				needsCheck = true
-				if p.current.Type == TOKEN_INF {
-					maxRecursion = math.MaxInt64
-					// Don't advance - leave p.current on 'inf' for caller
-				} else if p.current.Type == TOKEN_NUMBER {
-					maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-					if err != nil || maxInt < 1 {
-						p.error("recursion depth bound must be a positive integer or 'inf'")
-					}
-					maxRecursion = maxInt
-					// Don't advance - leave p.current on the number for caller
-				} else {
-					p.error("expected number or 'inf' after '!' bound in function call")
-				}
-			}
-
-			return &CallExpr{
-				Function:            name,
-				Args:                args,
-				MaxRecursionDepth:   maxRecursion,
-				NeedsRecursionCheck: needsCheck,
-			}
-		}
-		return &IdentExpr{Name: name}
-
-	// TOKEN_ME and TOKEN_CME removed - recursive calls now use function name with mandatory max
-
-	case TOKEN_AT_FIRST:
-		// @first is true on the first iteration of a loop
-		return &LoopStateExpr{Type: "first"}
-
-	case TOKEN_AT_LAST:
-		// @last is true on the last iteration of a loop
-		return &LoopStateExpr{Type: "last"}
-
-	case TOKEN_AT_COUNTER:
-		// @counter is the loop iteration counter
-		return &LoopStateExpr{Type: "counter"}
-
-	case TOKEN_AT_I:
-		// @i is the current loop, @i1 is outermost loop, @i2 is second loop, etc.
-		value := p.current.Value
-		level := 0
-		if len(value) > 2 { // @iN where N is a number
-			// Parse the number after @i
-			numStr := value[2:] // Skip "@i"
-			if num, err := strconv.Atoi(numStr); err == nil {
-				level = num
-			}
-		}
-		return &LoopStateExpr{Type: "i", LoopLevel: level}
-
+		p.advance()
+		return &IdentExpr{Pos: tokPos(t), Name: t.Value}
 	case TOKEN_LPAREN:
-		// Could be:
-		// 1. Pattern lambda: (0) => 1, (n) => n * fact(n-1)
-		// 2. Regular lambda: (x) => x * 2
-		// 3. Parenthesized expression: (x + y)
-
-		// Try pattern lambda first with backtracking
-		state := p.saveState()
-		patternLambda := p.tryParsePatternLambda()
-		if patternLambda != nil {
-			return patternLambda
-		}
-		p.restoreState(state)
-
-		p.nextToken() // skip '('
-
-		// Check for empty parameter list: () -> or () {
-		if p.current.Type == TOKEN_RPAREN {
-			if p.peek.Type == TOKEN_ARROW || p.peek.Type == TOKEN_LBRACE {
-				p.nextToken() // skip ')'
-				if p.current.Type == TOKEN_ARROW {
-					p.nextToken() // skip '->'
-				}
-				p.lambdaParams = []string{} // No parameters
-				body := p.parseLambdaBody()
-				p.lambdaParams = nil
-				return &LambdaExpr{Params: []string{}, VariadicParam: "", Body: body}
-			}
-			// Empty parens without arrow or block is an error, but skip for now
-			p.nextToken()
-			return nil
-		}
-
-		// Try to parse as parameter list (identifiers separated by commas)
-		// or as an expression. Use backtracking to handle type annotations.
-		if p.current.Type == TOKEN_IDENT {
-			// Save state in case this is not a lambda
-			lambdaState := p.saveState()
-
-			// Try to parse as lambda parameter list
-			params := []string{p.current.Value}
-			paramTypes := make(map[string]string) // param name -> `as Type` annotation
-			variadicParam := ""
-			firstParamName := p.current.Value
-			p.nextToken() // skip first ident
-
-			// Check for variadic marker on first parameter
-			if p.current.Type == TOKEN_ELLIPSIS {
-				// First parameter is variadic (e.g., (args...) -> ...)
-				variadicParam = params[0]
-				params = []string{} // No regular params, only variadic
-				p.nextToken()       // skip '...'
-			}
-
-			// Optional type annotation: `as Type` (if not variadic). Captured so a
-			// cstruct-typed param's fields resolve in the body without manual casts.
-			if variadicParam == "" && (p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON) {
-				p.nextToken() // skip 'as' / ':'
-				if p.current.Type != TOKEN_IDENT {
-					// Not a valid lambda, restore and parse as expression
-					p.restoreState(lambdaState)
-					expr := p.parseExpression()
-					p.nextToken() // skip ')'
-					return expr
-				}
-				paramTypes[firstParamName] = p.current.Value
-				p.nextToken() // skip type name
-			}
-
-			// Check if we have more parameters (only if first param wasn't variadic)
-			if variadicParam == "" {
-				for p.current.Type == TOKEN_COMMA {
-					p.nextToken() // skip ','
-					if p.current.Type != TOKEN_IDENT {
-						// Not a valid lambda, restore and parse as expression
-						p.restoreState(lambdaState)
-						expr := p.parseExpression()
-						p.nextToken() // skip ')'
-						return expr
-					}
-					paramName := p.current.Value
-					p.nextToken() // skip param
-
-					// Check for variadic marker on this parameter
-					if p.current.Type == TOKEN_ELLIPSIS {
-						// This parameter is variadic (must be last)
-						variadicParam = paramName
-						p.nextToken() // skip '...'
-						// No more parameters allowed after variadic
-						break
-					}
-
-					params = append(params, paramName)
-
-					// Optional type annotation (captured for cstruct field access).
-					if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
-						p.nextToken() // skip 'as' / ':'
-						if p.current.Type != TOKEN_IDENT {
-							// Not a valid lambda, restore and parse as expression
-							p.restoreState(lambdaState)
-							expr := p.parseExpression()
-							p.nextToken() // skip ')'
-							return expr
-						}
-						paramTypes[paramName] = p.current.Value
-						p.nextToken() // skip type name
-					}
-				}
-			}
-
-			// current should be ')'
-			if p.current.Type != TOKEN_RPAREN {
-				// Not a lambda, restore and parse as expression
-				p.restoreState(lambdaState)
-				expr := p.parseExpression()
-				p.nextToken() // skip ')'
-				return expr
-			}
-
-			// peek should be '->' or '{'
-			if p.peek.Type == TOKEN_ARROW || p.peek.Type == TOKEN_LBRACE {
-				// It's a lambda!
-				p.nextToken() // skip ')'
-				if p.current.Type == TOKEN_ARROW {
-					p.nextToken() // skip '->'
-				}
-				p.lambdaParams = params // Store params for parseLambdaBody
-				body := p.parseLambdaBody()
-				p.lambdaParams = nil
-				return &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, Body: body}
-			}
-
-			// Not a lambda after all, restore and parse as expression
-			p.restoreState(lambdaState)
-			expr := p.parseExpression()
-			p.nextToken() // skip ')'
-			return expr
-		}
-
-		// Not a lambda, parse as parenthesized expression
-		expr := p.parseExpression()
-		p.nextToken() // skip ')'
-		return expr
-
+		p.advance()
+		e := nested(p, func() Expression {
+			p.skipNewlines()
+			return p.expr()
+		})
+		p.expect(TOKEN_RPAREN, "')'")
+		return e
 	case TOKEN_LBRACKET:
-		p.nextToken() // skip '['
-		p.skipNewlines()
-		elements := []Expression{}
-
-		if p.current.Type != TOKEN_RBRACKET {
-			elements = append(elements, p.parseExpression())
-			for p.peek.Type == TOKEN_COMMA {
-				p.nextToken() // skip current
-				p.nextToken() // skip ','
-				p.skipNewlines()
-				// Allow a trailing comma before ']' (common in multi-line lists).
-				if p.current.Type == TOKEN_RBRACKET {
-					return &ListExpr{Elements: elements}
-				}
-				elements = append(elements, p.parseExpression())
-			}
-			// current should be on last element
-			// peek should be ']'
-			p.nextToken() // move to ']'
-		}
-		// For empty list, current is already on ']' after first nextToken()
-		return &ListExpr{Elements: elements}
-
-	case TOKEN_IF:
-		// `if c { A } elif c2 { B } else { C }` in expression position — desugars
-		// to a guard match, which already evaluates only the taken branch.
-		return p.parseIfExpression()
-
+		return p.list()
 	case TOKEN_LBRACE:
-		// Disambiguate block type: map, match, or statement block
-		blockType := p.disambiguateBlock()
-
-		p.nextToken() // skip '{'
-		p.skipNewlines()
-
-		switch blockType {
-		case BlockTypeMap:
-			// Parse as map literal
-			return p.parseMapLiteralBody()
-
-		case BlockTypeMatch:
-			// Parse as guard match block (no expression before {)
-			// Create a dummy true condition for guard matches
-			trueExpr := &NumberExpr{Value: 1.0}
-			return p.parseMatchBlock(trueExpr)
-
-		case BlockTypeStatement:
-			// Parse as statement block
-			// Statement blocks in expression position will be wrapped in lambdas, so increment depth and push scope
-			p.functionDepth++
-			p.pushScope()
-			defer func() {
-				p.functionDepth--
-				p.popScope()
-			}()
-
-			var statements []Statement
-			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-				stmt := p.parseStatement()
-				if stmt != nil {
-					statements = append(statements, stmt)
-				}
-
-				// Need to advance to the next statement
-				// Skip newlines and semicolons between statements
-				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-					p.nextToken() // move to separator
-					p.skipNewlines()
-				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
-					// At end of block
-					p.nextToken() // move to '}'
-					break
-				} else {
-					// No separator found - might be at end
-					p.nextToken()
-					p.skipNewlines()
-				}
-			}
-
-			if p.current.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of block")
-			}
-			// Don't skip the '}' - let the caller handle it
-
-			// Return a BlockExpr containing the statements
-			return &BlockExpr{Statements: statements}
-
-		case BlockTypeMixed:
-			// Leading statements followed by a trailing guard match (the value).
-			p.functionDepth++
-			p.pushScope()
-			defer func() {
-				p.functionDepth--
-				p.popScope()
-			}()
-
-			var statements []Statement
-			for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF && p.current.Type != TOKEN_PIPE {
-				stmt := p.parseStatement()
-				if stmt != nil {
-					statements = append(statements, stmt)
-				}
-				if p.peek.Type == TOKEN_NEWLINE || p.peek.Type == TOKEN_SEMICOLON {
-					p.nextToken()
-					p.skipNewlines()
-				} else if p.peek.Type == TOKEN_RBRACE || p.peek.Type == TOKEN_EOF {
-					p.nextToken()
-					break
-				} else {
-					p.nextToken()
-					p.skipNewlines()
-				}
-			}
-			matchExpr := p.parseMatchBlock(&NumberExpr{Value: 1.0})
-			statements = append(statements, &ExpressionStmt{Expr: matchExpr})
-			return &BlockExpr{Statements: statements}
-		}
-
-	case TOKEN_AT_AT:
-		// Parallel loop expression: @@ i in ... { ... } | a,b | { ... }
-		return p.parseLoopExpr()
-
-	case TOKEN_AT:
-		// Could be loop expression (@ i in...) or jump expression (@N)
-		// Look ahead to decide
-		if p.peek.Type == TOKEN_NUMBER {
-			// Jump expression: @N [value]
-			// Returns JumpExpr for continuing loops (IsBreak=false)
-			p.nextToken() // skip '@'
-			if p.current.Type != TOKEN_NUMBER {
-				p.error("expected number after @")
-			}
-			labelNum, _ := strconv.ParseFloat(p.current.Value, 64)
-			label := int(labelNum)
-			p.nextToken() // skip number
-			var value Expression
-			if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-				value = p.parseExpression()
-				p.nextToken()
-			}
-			return &JumpExpr{Label: label, Value: value, IsBreak: false}
-		}
-		// Must be loop expression: @ ident in...
-		return p.parseLoopExpr()
-
+		return p.brace()
+	case TOKEN_IF:
+		return p.ifExpr()
 	case TOKEN_UNSAFE:
-		// unsafe { x86_64 } { arm64 } { riscv64 }
-		return p.parseUnsafeExpr()
-
+		return p.unsafe()
 	case TOKEN_ARENA:
-		// arena { ... }
-		return p.parseArenaExpr()
-
-	case TOKEN_DOT:
-		// Dot notation for "this":
-		// - `.field` means `this.field`
-		// - `. ` (dot followed by space/newline) means `this`
-		p.nextToken() // skip '.'
-
-		// Check if followed by identifier
-		if p.current.Type == TOKEN_IDENT {
-			fieldName := p.current.Value
-			// Return field access on "this"
-			return &BinaryExpr{
-				Operator: ".",
-				Left:     &IdentExpr{Name: "this"},
-				Right:    &IdentExpr{Name: fieldName},
-			}
-		}
-
-		// Otherwise, just return "this"
-		// Move back one token since we consumed the dot but there's no field
-		p.current = Token{Type: TOKEN_DOT, Value: ".", Line: p.current.Line, Column: p.current.Column}
-		return &IdentExpr{Name: "this"}
+		p.advance()
+		return &ArenaExpr{Body: p.scopedBlockStmts()}
+	case TOKEN_ARROW:
+		p.fail("a lambda needs parameters: write () -> ... for none")
 	}
-
-	// Check if this is a structural/delimiter token that should just end the expression
-	// These are valid tokens that signal the end of an expression, not syntax errors
-	if p.current.Type == TOKEN_RBRACE || p.current.Type == TOKEN_RPAREN ||
-		p.current.Type == TOKEN_RBRACKET || p.current.Type == TOKEN_COMMA ||
-		p.current.Type == TOKEN_SEMICOLON || p.current.Type == TOKEN_NEWLINE ||
-		p.current.Type == TOKEN_EOF {
-		return nil // Valid delimiter, expression ends here
+	if p.i > 0 && continues[p.toks[p.i-1].Type] && p.toks[p.i-1].Type != TOKEN_LPAREN && p.toks[p.i-1].Type != TOKEN_LBRACKET {
+		p.fail("expected an expression after '%s', found %s", p.toks[p.i-1].Value, t)
 	}
-
-	// Unrecognized token in expression position - this is a syntax error
-	p.error(fmt.Sprintf("unexpected '%s' in expression", p.current.Value))
+	p.fail("expected an expression, found %s", t)
 	return nil
 }
 
-func (p *Parser) parseArenaExpr() Expression {
-	p.nextToken() // skip 'arena'
-
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' after 'arena'")
-	}
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	var body []Statement
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
+func (p *Parser) list() Expression {
+	at := p.pos()
+	p.advance()
+	return nested(p, func() Expression {
+		var elems []Expression
+		for !p.at(TOKEN_RBRACKET) {
+			elems = append(elems, p.expr())
+			if len(elems) == 1 && p.at(TOKEN_AT) {
+				return p.comprehension(elems[0])
+			}
+			if !p.accept(TOKEN_COMMA) {
+				break
+			}
 		}
-		p.nextToken()
+		p.expect(TOKEN_RBRACKET, "']' or ','")
+		if elems == nil {
+			elems = []Expression{}
+		}
+		return &ListExpr{Pos: at, Elements: elems}
+	})
+}
+
+// comprehension parses the rest of [e @ x in xs if cond] into a block that
+// builds the list with a loop.
+func (p *Parser) comprehension(elem Expression) Expression {
+	p.advance()
+	iterator := p.expect(TOKEN_IDENT, "a loop variable").Value
+	p.expect(TOKEN_IN, "'in'")
+	iterable := p.expr()
+	var cond Expression
+	if p.accept(TOKEN_IF) {
+		cond = p.expr()
+	}
+	p.expect(TOKEN_RBRACKET, "']'")
+	acc := p.tempName()
+	var add Statement = &AssignStmt{Name: acc, Mutable: true, IsUpdate: true,
+		Value: &BinaryExpr{Left: &IdentExpr{Name: acc}, Operator: "+", Right: &ListExpr{Elements: []Expression{elem}}}}
+	if cond != nil {
+		add = &IfStmt{Branches: []IfBranch{{Condition: cond, Body: []Statement{add}}}}
+	}
+	return &BlockExpr{Statements: []Statement{
+		&AssignStmt{Name: acc, Mutable: true, Value: &ListExpr{Elements: []Expression{}}},
+		&LoopStmt{Iterator: iterator, Iterable: iterable, Body: []Statement{add}, MaxIterations: math.MaxInt64},
+		&ExpressionStmt{Expr: &IdentExpr{Name: acc}},
+	}}
+}
+
+// brace parses a `{` in expression position: a map, a guard match or a block.
+func (p *Parser) brace() Expression {
+	k := p.i + 1
+	for p.toks[k].Type == TOKEN_NEWLINE {
+		k++
+	}
+	first, second := p.toks[k], p.toks[k+1]
+	switch {
+	case first.Type == TOKEN_RBRACE:
+		p.i = k + 1
+		return &MapExpr{}
+	case (first.Type == TOKEN_IDENT || first.Type == TOKEN_STRING || first.Type == TOKEN_NUMBER) && second.Type == TOKEN_COLON &&
+		!(first.Type == TOKEN_IDENT && p.toks[k+2].Type == TOKEN_IDENT && (p.toks[k+3].Type == TOKEN_ASSIGN || p.toks[k+3].Type == TOKEN_DEFINE)):
+		return p.mapLiteral()
+	}
+	stmts := p.scopedBlockStmts()
+	if first.Type == TOKEN_PIPE && len(stmts) == 1 {
+		if es, ok := stmts[0].(*ExpressionStmt); ok {
+			if m, ok := es.Expr.(*MatchExpr); ok {
+				return m
+			}
+		}
+	}
+	return &BlockExpr{Statements: stmts}
+}
+
+func (p *Parser) mapLiteral() Expression {
+	m := &MapExpr{Pos: p.pos()}
+	p.advance()
+	nested(p, func() Expression {
 		p.skipNewlines()
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of arena block")
-	}
-
-	return &ArenaExpr{Body: body}
+		for !p.at(TOKEN_RBRACE) {
+			var key Expression
+			switch t := p.advance(); t.Type {
+			case TOKEN_IDENT:
+				key = &NumberExpr{Value: float64(hashStringKey(t.Value))}
+				m.Names = append(m.Names, make([]string, len(m.Keys)+1-len(m.Names))...)
+				m.Names[len(m.Keys)] = t.Value
+			case TOKEN_STRING:
+				key = &StringExpr{Value: t.Value}
+			case TOKEN_NUMBER:
+				n, err := parseNumber(t.Value)
+				if err != nil {
+					p.fail("%v", err)
+				}
+				key = n
+			default:
+				p.i--
+				p.fail("expected a map key (a name, string or number), found %s", t)
+			}
+			p.expect(TOKEN_COLON, "':' after the map key")
+			p.skipNewlines()
+			m.Keys = append(m.Keys, key)
+			m.Values = append(m.Values, p.expr())
+			p.skipNewlines()
+			if !p.accept(TOKEN_COMMA) {
+				break
+			}
+			p.skipNewlines()
+		}
+		return nil
+	})
+	p.expect(TOKEN_RBRACE, "'}' or ',' in map literal")
+	return m
 }
 
-// isLoopExpr checks if current position looks like a loop expression
-// Pattern: @ ident in
-func (p *Parser) isLoopExpr() bool {
-	// Loop expressions start with @
-	return p.current.Type == TOKEN_AT
+// matchBlock parses `subject { ... }`: arms, or statements run when the
+// subject is truthy.
+func (p *Parser) matchBlock(subject Expression) Expression {
+	open := p.i
+	close := p.matching(open)
+	hasArms := false
+	depth := 0
+	for k := open + 1; close > 0 && k < close; k++ {
+		switch p.toks[k].Type {
+		case TOKEN_LPAREN, TOKEN_LBRACKET, TOKEN_LBRACE:
+			depth++
+		case TOKEN_RPAREN, TOKEN_RBRACKET, TOKEN_RBRACE:
+			depth--
+		case TOKEN_FAT_ARROW, TOKEN_DEFAULT:
+			if depth == 0 {
+				hasArms = true
+			}
+		}
+	}
+	if !hasArms {
+		body := &BlockExpr{Statements: p.scopedBlockStmts()}
+		return &MatchExpr{Pos: tokPos(p.toks[open]), Condition: subject, Clauses: []*MatchClause{{Result: body}}, DefaultExpr: &NumberExpr{}}
+	}
+	p.advance()
+	if !hasCall(subject) {
+		return p.arms(subject, false)
+	}
+	tmp := p.tempName()
+	m := p.arms(&IdentExpr{Name: tmp}, false)
+	return &BlockExpr{Statements: []Statement{
+		&AssignStmt{Name: tmp, Value: subject},
+		&ExpressionStmt{Expr: m},
+	}}
 }
 
-// parseLoopExpr parses a loop expression: @ i in iterable { body } or @@ i in iterable { body } | a,b | { a+b }
-func (p *Parser) parseLoopExpr() Expression {
-	// Parse parallel loop prefix: @@ or N @ or just @
-	numThreads := 0 // 0 = sequential, -1 = all cores, N = specific count
-	label := p.loopDepth + 1
-
-	// Handle @@ token (parallel loop with all cores)
-	if p.current.Type == TOKEN_AT_AT {
-		numThreads = -1
-		p.nextToken() // skip '@@'
-
-		// Skip newlines after '@@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else if p.current.Type == TOKEN_NUMBER {
-		// Handle N @ syntax (parallel loop with N threads)
-		threadCount, err := strconv.Atoi(p.current.Value)
-		if err != nil || threadCount < 1 {
-			p.error("thread count must be a positive integer")
-		}
-		numThreads = threadCount
-		p.nextToken() // skip number
-
-		// Expect @ token after the number
-		if p.current.Type != TOKEN_AT {
-			p.error("expected @ after thread count")
-		}
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else if p.current.Type == TOKEN_AT {
-		// Regular loop: @
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else {
-		p.error("expected @ or @@ to start loop expression")
-	}
-
-	// Expect identifier for loop variable
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after loop prefix")
-	}
-	iterator := p.current.Value
-	p.nextToken() // skip iterator
-
-	// Expect 'in' keyword
-	if p.current.Type != TOKEN_IN {
-		p.error("expected 'in' keyword in loop expression")
-	}
-	p.nextToken() // skip 'in'
-
-	// Parse iterable expression. Set inConditionLoop so a trailing '!' bound
-	// is left unconsumed by parsePostfix.
-	oldILH := p.inConditionLoop
-	p.inConditionLoop = true
-	iterable := p.parseExpression()
-	p.inConditionLoop = oldILH
-	p.nextToken() // move past iterable
-
-	// Determine max iterations and whether runtime checking is needed
-	var maxIterations int64
-	needsRuntimeCheck := false
-
-	// Check if '!' bound is present
-	if p.current.Type == TOKEN_BANG {
-		p.nextToken() // skip '!'
-
-		// Explicit bound always requires runtime checking
-		needsRuntimeCheck = true
-
-		// Parse iteration bound: either a number or 'inf'
-		if p.current.Type == TOKEN_INF {
-			maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-			p.nextToken()                 // skip 'inf'
-		} else if p.current.Type == TOKEN_NUMBER {
-			// Parse the number
-			maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-			if err != nil || maxInt < 1 {
-				p.error("iteration bound must be a positive integer or 'inf'")
+// arms parses match arms after the opening brace.
+func (p *Parser) arms(subject Expression, guards bool) *MatchExpr {
+	m := &MatchExpr{Pos: tokPos(p.toks[p.i-1]), Condition: subject, DefaultExpr: &NumberExpr{}}
+	nested(p, func() Expression {
+		p.skipEnds()
+		for !p.at(TOKEN_RBRACE) {
+			switch {
+			case p.accept(TOKEN_DEFAULT):
+				if m.DefaultExplicit {
+					p.i--
+					p.fail("a match has only one '~>' arm")
+				}
+				m.DefaultExplicit = true
+				m.DefaultExpr = p.armResult()
+			case p.accept(TOKEN_FAT_ARROW):
+				m.Clauses = append(m.Clauses, &MatchClause{Result: p.armResult()})
+			case p.accept(TOKEN_PIPE):
+				guard := p.expr()
+				p.expect(TOKEN_FAT_ARROW, "'=>' after the guard")
+				m.Clauses = append(m.Clauses, &MatchClause{Guard: guard, Result: p.armResult()})
+			default:
+				if guards {
+					p.fail("expected '| condition =>' or '~>' in a guard match, found %s", p.cur())
+				}
+				pattern := p.expr()
+				p.expect(TOKEN_FAT_ARROW, "'=>' after the pattern")
+				m.Clauses = append(m.Clauses, &MatchClause{Guard: matchesPattern(subject, pattern), Result: p.armResult()})
 			}
-			maxIterations = maxInt
-			p.nextToken() // skip number
-		} else {
-			p.error("expected number or 'inf' after '!' bound in loop expression")
+			p.skipEnds()
 		}
-	} else {
-		// No explicit bound - check if we can determine iteration count at compile time
-		if rangeExpr, ok := iterable.(*RangeExpr); ok {
-			// Try to calculate max from range: end - start
-			startVal, startOk := rangeExpr.Start.(*NumberExpr)
-			endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-			if startOk && endOk {
-				// Literal range - known at compile time, no runtime check needed
-				start := int64(startVal.Value)
-				end := int64(endVal.Value)
-				maxIterations = max(end-start, 0)
-				needsRuntimeCheck = false
-			} else {
-				// Non-literal range bound: the iterator-vs-end check terminates it.
-				maxIterations = math.MaxInt64
-				needsRuntimeCheck = false
-			}
-		} else if listExpr, ok := iterable.(*ListExpr); ok {
-			// List literal - known at compile time, no runtime check needed
-			maxIterations = int64(len(listExpr.Elements))
-			needsRuntimeCheck = false
-		} else {
-			// Not a range expression or list literal, require explicit max
-			p.error("loop expression requires 'max' clause (or use range expression like 0..<10 or list literal)")
-		}
-	}
-
-	// Expect '{'
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' to start loop body")
-	}
-	p.nextToken() // skip '{'
-
-	// Parse loop body
-	oldDepth := p.loopDepth
-	p.loopDepth = label
-	defer func() { p.loopDepth = oldDepth }()
-
-	var body []Statement
-	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-		p.nextToken()
-		if p.current.Type == TOKEN_NEWLINE {
-			continue
-		}
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-	}
-
-	// Expect and consume '}'
-	if p.peek.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of loop body")
-	}
-	p.nextToken() // consume the '}'
-
-	// Check for optional reducer: | a,b | { a + b }
-	var reducer *LambdaExpr
-	if p.peek.Type == TOKEN_PIPE {
-		// Only allow reducers for parallel loops
-		if numThreads == 0 {
-			p.error("reducer syntax '| a,b | { expr }' only allowed for parallel loops (@@ or N @)")
-		}
-
-		p.nextToken() // advance to '|'
-		p.nextToken() // consume '|', advance to first parameter
-
-		// Parse parameter list
-		var params []string
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected parameter name after '|'")
-		}
-		params = append(params, p.current.Value)
-		p.nextToken()
-
-		// Expect comma
-		if p.current.Type != TOKEN_COMMA {
-			p.error("reducer requires exactly two parameters (e.g., | a,b | ...)")
-		}
-		p.nextToken() // skip comma
-
-		// Skip newlines after comma
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Parse second parameter
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected second parameter name after comma")
-		}
-		params = append(params, p.current.Value)
-		p.nextToken()
-
-		// Expect second '|'
-		if p.current.Type != TOKEN_PIPE {
-			p.error("expected '|' after reducer parameters")
-		}
-		p.nextToken() // skip second '|'
-
-		// Skip newlines before '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Expect '{'
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected '{' to start reducer body")
-		}
-		p.nextToken() // skip '{'
-
-		// Skip newlines after '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Parse reducer body (single expression)
-		reducerBody := p.parseExpression()
-
-		// Expect '}'
-		if p.peek.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of reducer body")
-		}
-		p.nextToken() // advance to '}'
-
-		// Create lambda expression for reducer
-		reducer = &LambdaExpr{
-			Params:        params,
-			VariadicParam: "",
-			Body:          reducerBody,
-		}
-	}
-
-	return &LoopExpr{
-		Iterator:      iterator,
-		Iterable:      iterable,
-		Body:          body,
-		MaxIterations: maxIterations,
-		NeedsMaxCheck: needsRuntimeCheck,
-		NumThreads:    numThreads,
-		Reducer:       reducer,
-	}
+		return nil
+	})
+	p.expect(TOKEN_RBRACE, "'}'")
+	return m
 }
 
-// parseUnsafeExpr parses: unsafe [type] { x86_64 block } { arm64 block } { riscv64 block } [as type]
-// Example: unsafe { rax <- 42 } { x0 <- 42 } { a0 <- 42 } as int64
-// Legacy: unsafe int64 { rax <- 42 } { x0 <- 42 } { a0 <- 42 }
-// Default: unsafe { rax <- 42 } { x0 <- 42 } { a0 <- 42 } returns uint64
-func (p *Parser) parseUnsafeExpr() Expression {
-	p.nextToken() // skip 'unsafe'
+func matchesPattern(subject, pattern Expression) Expression {
+	if r, ok := pattern.(*RangeExpr); ok {
+		op := "<"
+		if r.Inclusive {
+			op = "<="
+		}
+		return &BinaryExpr{Operator: "and",
+			Left:  &BinaryExpr{Left: subject, Operator: ">=", Right: r.Start},
+			Right: &BinaryExpr{Left: subject, Operator: op, Right: r.End}}
+	}
+	return &BinaryExpr{Left: subject, Operator: "==", Right: pattern}
+}
 
-	// Parse return type before blocks (legacy, optional, defaults to uint64)
-	returnType := "uint64" // default
-	if p.current.Type == TOKEN_IDENT {
-		// Check if this is a type name or if it's a block
-		// Type names we support: int8, int16, int32, int64, uint8, uint16, uint32, uint64, float64, ptr, pointer, cstr
-		possibleType := p.current.Value
-		if possibleType == "int8" || possibleType == "int16" || possibleType == "int32" || possibleType == "int64" ||
-			possibleType == "uint8" || possibleType == "uint16" || possibleType == "uint32" || possibleType == "uint64" ||
-			possibleType == "float64" || possibleType == "float32" ||
-			possibleType == "ptr" || possibleType == "pointer" || possibleType == "cstr" {
-			returnType = possibleType
-			p.nextToken() // skip type
+// armResult parses what follows => or ~>: an expression, a block, or a
+// ret/err/break/continue statement.
+func (p *Parser) armResult() Expression {
+	p.skipNewlines()
+	switch p.cur().Type {
+	case TOKEN_RET, TOKEN_ERR, TOKEN_BREAK, TOKEN_CONTINUE:
+		p.noPipe++
+		defer func() { p.noPipe-- }()
+		return &BlockExpr{Statements: []Statement{p.statement()}}
+	}
+	p.noPipe++
+	defer func() { p.noPipe-- }()
+	return p.expr()
+}
+
+func (p *Parser) ifExpr() Expression {
+	m := &MatchExpr{Condition: &NumberExpr{Value: 1}, DefaultExpr: &NumberExpr{}}
+	for p.at(TOKEN_IF) || p.at(TOKEN_ELIF) && len(m.Clauses) > 0 {
+		p.advance()
+		p.noMatch++
+		cond := p.expr()
+		p.noMatch--
+		m.Clauses = append(m.Clauses, &MatchClause{Guard: cond, Result: &BlockExpr{Statements: p.scopedBlockStmts()}})
+		if !p.continuesIf() {
+			return m
+		}
+		if p.accept(TOKEN_ELSE) {
+			m.DefaultExpr = &BlockExpr{Statements: p.scopedBlockStmts()}
+			m.DefaultExplicit = true
+			return m
 		}
 	}
+	return m
+}
 
-	// Parse x86_64 block
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' for x86_64 block in unsafe expression")
+// fstring splits an f-string body into literal text and parsed expressions.
+func (p *Parser) fstring(t Token) Expression {
+	raw := t.Value
+	var parts []Expression
+	var text strings.Builder
+	flush := func() {
+		if text.Len() > 0 {
+			parts = append(parts, &StringExpr{Value: text.String()})
+			text.Reset()
+		}
 	}
-	x86_64Stmts := p.parseUnsafeBlock()
-
-	// Parse arm64 block
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' for arm64 block in unsafe expression")
-	}
-	arm64Stmts := p.parseUnsafeBlock()
-
-	// Parse riscv64 block
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' for riscv64 block in unsafe expression")
-	}
-	riscv64Stmts := p.parseUnsafeBlock()
-
-	// Check for 'as type' suffix (new syntax)
-	if p.current.Type == TOKEN_IDENT && p.current.Value == "as" {
-		p.nextToken() // skip 'as'
-		if p.current.Type == TOKEN_IDENT {
-			possibleType := p.current.Value
-			if possibleType == "int8" || possibleType == "int16" || possibleType == "int32" || possibleType == "int64" ||
-				possibleType == "uint8" || possibleType == "uint16" || possibleType == "uint32" || possibleType == "uint64" ||
-				possibleType == "float64" || possibleType == "float32" ||
-				possibleType == "ptr" || possibleType == "pointer" || possibleType == "cstr" {
-				returnType = possibleType
-				p.nextToken() // skip type
-			} else {
-				p.error("expected type name after 'as' in unsafe expression")
+	for i := 0; i < len(raw); {
+		switch c := raw[i]; {
+		case c == '\\':
+			s, n, msg := unescape(raw[i:])
+			if msg != "" {
+				p.i--
+				p.fail("%s", msg)
 			}
-		} else {
-			p.error("expected type name after 'as' in unsafe expression")
+			text.WriteString(s)
+			i += n
+		case strings.HasPrefix(raw[i:], "{{"), strings.HasPrefix(raw[i:], "}}"):
+			text.WriteByte(c)
+			i += 2
+		case c == '{':
+			end := i + 1
+			for depth := 1; end < len(raw); end++ {
+				if raw[end] == '"' {
+					for end++; end < len(raw) && raw[end] != '"'; end++ {
+						if raw[end] == '\\' {
+							end++
+						}
+					}
+					continue
+				}
+				if raw[end] == '{' {
+					depth++
+				} else if raw[end] == '}' {
+					if depth--; depth == 0 {
+						break
+					}
+				}
+			}
+			flush()
+			parts = append(parts, p.subExpression(raw[i+1:end], t))
+			i = end + 1
+		case c == '}':
+			p.i--
+			p.fail("unmatched '}' in f-string (write '}}' for a brace)")
+		default:
+			text.WriteByte(c)
+			i++
 		}
 	}
+	flush()
+	if len(parts) == 0 {
+		return &StringExpr{}
+	}
+	if s, ok := parts[0].(*StringExpr); ok && len(parts) == 1 {
+		return s
+	}
+	return &FStringExpr{Pos: tokPos(t), Parts: parts}
+}
 
-	// Create return statements with the specified type
-	x86_64Ret := &UnsafeReturnStmt{Register: "rax", AsType: returnType}
-	arm64Ret := &UnsafeReturnStmt{Register: "x0", AsType: returnType}
-	riscv64Ret := &UnsafeReturnStmt{Register: "a0", AsType: returnType}
+// subExpression parses the source of an f-string interpolation.
+func (p *Parser) subExpression(src string, at Token) Expression {
+	toks, lexErr := Lex(src)
+	if lexErr != nil || strings.TrimSpace(src) == "" {
+		p.i--
+		if lexErr != nil {
+			p.fail("in f-string: %s", lexErr.Msg)
+		}
+		p.fail("empty '{}' in f-string")
+	}
+	for i := range toks {
+		toks[i].Line, toks[i].Column = at.Line, at.Column
+	}
+	sub := *p
+	sub.toks, sub.i = toks, 0
+	e := sub.expr()
+	sub.skipNewlines()
+	if !sub.at(TOKEN_EOF) {
+		p.i--
+		p.fail("unexpected %s in f-string expression", sub.cur())
+	}
+	p.tmp = sub.tmp
+	return e
+}
 
+// unsafe parses `unsafe [T] {x86_64} {arm64} {riscv64} [as T]`.
+func (p *Parser) unsafe() Expression {
+	p.advance()
+	ret := "uint64"
+	if p.at(TOKEN_IDENT) && castTypes[p.cur().Value] {
+		ret = p.advance().Value
+	}
+	var blocks [3][]Statement
+	for i := range blocks {
+		blocks[i] = p.unsafeBlock()
+	}
+	if p.accept(TOKEN_AS) {
+		ret = p.expect(TOKEN_IDENT, "a type").Value
+	}
 	return &UnsafeExpr{
-		X86_64Block:   x86_64Stmts,
-		ARM64Block:    arm64Stmts,
-		RISCV64Block:  riscv64Stmts,
-		X86_64Return:  x86_64Ret,
-		ARM64Return:   arm64Ret,
-		RISCV64Return: riscv64Ret,
+		X86_64Block: blocks[0], ARM64Block: blocks[1], RISCV64Block: blocks[2],
+		X86_64Return:  &UnsafeReturnStmt{Register: "rax", AsType: ret},
+		ARM64Return:   &UnsafeReturnStmt{Register: "x0", AsType: ret},
+		RISCV64Return: &UnsafeReturnStmt{Register: "a0", AsType: ret},
 	}
 }
 
-// parseUnsafeBlock parses a single architecture block with extended syntax
-// Returns: statements
-func (p *Parser) parseUnsafeBlock() []Statement {
-	p.nextToken() // skip '{'
-	p.skipNewlines()
+var unsafeOps = map[TokenType]string{
+	TOKEN_PLUS: "+", TOKEN_MINUS: "-", TOKEN_STAR: "*", TOKEN_SLASH: "/", TOKEN_PERCENT: "%",
+	TOKEN_AMP: "&", TOKEN_PIPE: "|", TOKEN_CARET: "^b", TOKEN_SHL: "<<", TOKEN_SHR: ">>",
+}
 
-	statements := []Statement{}
-
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		// Check for syscall
-		if p.current.Type == TOKEN_SYSCALL {
-			statements = append(statements, &SyscallStmt{})
-			p.nextToken() // skip 'syscall'
-			p.skipNewlines()
-			continue
-		}
-
-		// Check for memory store: [rax] <- value or [rax] <- value as uint8
-		if p.current.Type == TOKEN_LBRACKET {
-			// Parse: [rax + offset] <- value as type
-			p.nextToken() // skip '['
-
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected register name in memory address")
-			}
-			storeAddr := p.current.Value
-			p.nextToken() // skip register name
-
-			// Check for offset: [rax + 16]
-			var storeOffset int64
-			if p.current.Type == TOKEN_PLUS {
-				p.nextToken() // skip '+'
-				if p.current.Type != TOKEN_NUMBER {
-					p.error("expected number after '+' in memory address")
-				}
-				storeOffset = int64(p.parseNumberLiteral(p.current.Value))
-				p.nextToken() // skip number
-			}
-
-			if p.current.Type != TOKEN_RBRACKET {
-				p.error("expected ']' after memory address")
-			}
-			p.nextToken() // skip ']'
-
-			if p.current.Type != TOKEN_LEFT_ARROW {
-				p.error("expected '<-' after memory address")
-			}
-			p.nextToken() // skip '<-'
-
-			// Parse value
+func (p *Parser) unsafeBlock() []Statement {
+	p.expect(TOKEN_LBRACE, "'{' for an architecture block")
+	var stmts []Statement
+	p.skipEnds()
+	for !p.accept(TOKEN_RBRACE) {
+		switch {
+		case p.at(TOKEN_IDENT) && p.cur().Value == "syscall":
+			p.advance()
+			stmts = append(stmts, &SyscallStmt{})
+		case p.at(TOKEN_LBRACKET):
+			reg, off := p.unsafeAddress()
+			p.expect(TOKEN_UPDATE, "'<-'")
 			var value any
-			if p.current.Type == TOKEN_NUMBER {
-				val := p.parseNumberLiteral(p.current.Value)
-				value = &NumberExpr{Value: val}
-				p.nextToken()
-			} else if p.current.Type == TOKEN_IDENT {
-				value = p.current.Value
-				p.nextToken()
+			if p.at(TOKEN_NUMBER) {
+				value = p.unsafeNumber()
 			} else {
-				p.error("expected number or register after '<-' in memory store")
+				value = p.expect(TOKEN_IDENT, "a register or number").Value
 			}
-
-			// Check for size cast: [rax] <- value as uint8
-			storeSize := "uint64" // default to 64-bit
-			if p.current.Type == TOKEN_AS {
-				p.nextToken() // skip 'as'
-				if p.current.Type != TOKEN_IDENT {
-					p.error("expected type name after 'as'")
-				}
-				storeSize = p.current.Value
-				p.nextToken() // skip type name
+			size := "uint64"
+			if p.accept(TOKEN_AS) {
+				size = p.expect(TOKEN_IDENT, "a type").Value
 			}
-
-			statements = append(statements, &MemoryStore{
-				Size:    storeSize,
-				Address: storeAddr,
-				Offset:  storeOffset,
-				Value:   value,
-			})
-			p.skipNewlines()
-			continue
+			stmts = append(stmts, &MemoryStore{Size: size, Address: reg, Offset: off, Value: value})
+		default:
+			reg := p.expect(TOKEN_IDENT, "a register, memory address or 'syscall'").Value
+			p.expect(TOKEN_UPDATE, "'<-'")
+			stmts = append(stmts, &RegisterAssignStmt{Register: reg, Value: p.unsafeValue()})
 		}
-
-		// Regular register assignment
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected register name, memory address, or syscall in unsafe block")
-		}
-
-		regName := p.current.Value
-		p.nextToken() // skip register name
-
-		if p.current.Type != TOKEN_LEFT_ARROW {
-			p.error(fmt.Sprintf("expected '<-' after register %s in unsafe block", regName))
-		}
-		p.nextToken() // skip '<-'
-
-		// Parse the right-hand side
-		value := p.parseUnsafeValue()
-
-		statements = append(statements, &RegisterAssignStmt{
-			Register: regName,
-			Value:    value,
-		})
-
-		p.skipNewlines()
+		p.endStatement()
 	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' to close unsafe block")
-	}
-	p.nextToken() // skip '}'
-
-	return statements
+	return stmts
 }
 
-// isRegisterName checks if a name refers to a register
-func isRegisterName(name string) bool {
-	// x86_64 registers
-	x86Regs := []string{
-		"rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-		"r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15",
-		"eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp",
-		"ax", "bx", "cx", "dx", "si", "di", "bp", "sp",
-		"al", "bl", "cl", "dl", "sil", "dil", "bpl", "spl",
-		"xmm0", "xmm1", "xmm2", "xmm3", "xmm4", "xmm5", "xmm6", "xmm7",
-		"xmm8", "xmm9", "xmm10", "xmm11", "xmm12", "xmm13", "xmm14", "xmm15",
-		"stack",
+func (p *Parser) unsafeNumber() *NumberExpr {
+	n, err := parseNumber(p.advance().Value)
+	if err != nil {
+		p.i--
+		p.fail("%v", err)
 	}
-
-	// ARM64 registers
-	arm64Regs := []string{
-		"x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7",
-		"x8", "x9", "x10", "x11", "x12", "x13", "x14", "x15",
-		"x16", "x17", "x18", "x19", "x20", "x21", "x22", "x23",
-		"x24", "x25", "x26", "x27", "x28", "x29", "x30",
-		"sp", "xzr", "lr",
-		"w0", "w1", "w2", "w3", "w4", "w5", "w6", "w7",
-		"v0", "v1", "v2", "v3", "v4", "v5", "v6", "v7",
-	}
-
-	// RISC-V registers
-	riscvRegs := []string{
-		"a0", "a1", "a2", "a3", "a4", "a5", "a6", "a7",
-		"t0", "t1", "t2", "t3", "t4", "t5", "t6",
-		"s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7", "s8", "s9", "s10", "s11",
-		"ra", "sp", "gp", "tp",
-		"fa0", "fa1", "fa2", "fa3", "fa4", "fa5", "fa6", "fa7",
-	}
-
-	if slices.Contains(x86Regs, name) {
-		return true
-	}
-	if slices.Contains(arm64Regs, name) {
-		return true
-	}
-	return slices.Contains(riscvRegs, name)
+	return n
 }
 
-// parseUnsafeValue parses the RHS of a register assignment in unsafe blocks
-func (p *Parser) parseUnsafeValue() any {
-	// Check for memory load: [rax] or [rax + offset]
-	// Followed optionally by: as uint8, as int16, etc.
-	if p.current.Type == TOKEN_LBRACKET {
-		// [rax] or [rax + offset]
-		p.nextToken() // skip '['
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected register name in memory load")
+func (p *Parser) unsafeAddress() (string, int64) {
+	p.expect(TOKEN_LBRACKET, "'['")
+	reg := p.expect(TOKEN_IDENT, "a register").Value
+	var off int64
+	if p.at(TOKEN_PLUS) || p.at(TOKEN_MINUS) {
+		neg := p.advance().Type == TOKEN_MINUS
+		off = int64(p.unsafeNumber().Value)
+		if neg {
+			off = -off
 		}
-		addrReg := p.current.Value
-		p.nextToken() // skip register
-
-		var offset int64
-		if p.current.Type == TOKEN_PLUS {
-			p.nextToken() // skip '+'
-			if p.current.Type != TOKEN_NUMBER {
-				p.error("expected number after '+' in memory address")
-			}
-			offset = int64(p.parseNumberLiteral(p.current.Value))
-			p.nextToken() // skip number
-		}
-
-		if p.current.Type != TOKEN_RBRACKET {
-			p.error("expected ']' after memory address")
-		}
-		p.nextToken() // skip ']'
-
-		// Check for size cast: [rbx] as uint8
-		size := "uint64" // default to 64-bit
-		if p.current.Type == TOKEN_AS {
-			p.nextToken() // skip 'as'
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected type name after 'as'")
-			}
-			size = p.current.Value
-			p.nextToken() // skip type name
-		}
-
-		return &MemoryLoad{Size: size, Address: addrReg, Offset: offset}
 	}
+	p.expect(TOKEN_RBRACKET, "']'")
+	return reg, off
+}
 
-	// Check for unary operation: ~b rax (bitwise NOT)
-	if p.current.Type == TOKEN_TILDE_B {
-		p.nextToken() // skip '~b'
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected register name after '~b'")
+func (p *Parser) unsafeValue() any {
+	if p.at(TOKEN_LBRACKET) {
+		reg, off := p.unsafeAddress()
+		size := "uint64"
+		if p.accept(TOKEN_AS) {
+			size = p.expect(TOKEN_IDENT, "a type").Value
 		}
-		reg := p.current.Value
-		p.nextToken() // skip register
-		return &RegisterOp{Left: "", Operator: "~b", Right: reg}
+		return &MemoryLoad{Size: size, Address: reg, Offset: off}
 	}
-
-	// Parse left operand (register or immediate)
+	if p.accept(TOKEN_TILDE) {
+		return &RegisterOp{Operator: "~b", Right: p.expect(TOKEN_IDENT, "a register").Value}
+	}
 	var left string
-	var leftIsImmediate bool
-	var leftValue *NumberExpr
-
-	if p.current.Type == TOKEN_NUMBER {
-		val := p.parseNumberLiteral(p.current.Value)
-		leftValue = &NumberExpr{Value: val}
-		leftIsImmediate = true
-		p.nextToken() // skip number
-
-		// Check for cast: 42 as uint8
-		if p.current.Type == TOKEN_AS {
-			p.nextToken() // skip 'as'
-			if p.current.Type == TOKEN_IDENT {
-				castType := p.current.Value
-				p.nextToken() // skip type
-				// Wrap in cast expression
-				return &CastExpr{Expr: leftValue, Type: castType}
-			}
-			p.error("expected type after 'as'")
-		}
-	} else if p.current.Type == TOKEN_IDENT {
-		left = p.current.Value
-		p.nextToken() // skip register name
-
-		// Check for cast: rax as pointer
-		if p.current.Type == TOKEN_AS {
-			p.nextToken() // skip 'as'
-			if p.current.Type == TOKEN_IDENT {
-				castType := p.current.Value
-				p.nextToken() // skip type
-				// Return cast of variable reference
-				return &CastExpr{Expr: &IdentExpr{Name: left}, Type: castType}
-			}
-			p.error("expected type after 'as'")
-		}
+	var imm *NumberExpr
+	if p.at(TOKEN_NUMBER) {
+		imm = p.unsafeNumber()
 	} else {
-		p.error("expected number, register, memory load, or unary operator")
+		left = p.expect(TOKEN_IDENT, "a register, variable or number").Value
 	}
-
-	// Check for binary operator
-	var op string
-	switch p.current.Type {
-	case TOKEN_PLUS:
-		op = "+"
-	case TOKEN_MINUS:
-		op = "-"
-	case TOKEN_STAR:
-		op = "*"
-	case TOKEN_SLASH:
-		op = "/"
-	case TOKEN_MOD:
-		op = "%"
-	case TOKEN_AMP:
-		op = "&"
-	case TOKEN_PIPE:
-		op = "|"
-	case TOKEN_CARET_B:
-		op = "^b"
-	case TOKEN_LT:
-		// Check if it's << (shift left)
-		if p.peek.Type == TOKEN_LT {
-			p.nextToken() // skip first '<'
-			op = "<<"
+	if p.accept(TOKEN_AS) {
+		t := p.expect(TOKEN_IDENT, "a type").Value
+		if imm != nil {
+			return &CastExpr{Expr: imm, Type: t}
 		}
-	case TOKEN_GT:
-		// Check if it's >> (shift right)
-		if p.peek.Type == TOKEN_GT {
-			p.nextToken() // skip first '>'
-			op = ">>"
-		}
+		return &CastExpr{Expr: &IdentExpr{Name: left}, Type: t}
 	}
-
-	if op != "" {
-		// Binary operation
-		p.nextToken() // skip operator
-
-		// Parse right operand
+	if op, ok := unsafeOps[p.cur().Type]; ok {
+		if imm != nil {
+			p.fail("the left operand of a register operation must be a register")
+		}
+		p.advance()
 		var right any
-		if p.current.Type == TOKEN_NUMBER {
-			val := p.parseNumberLiteral(p.current.Value)
-			right = &NumberExpr{Value: val}
-			p.nextToken()
-		} else if p.current.Type == TOKEN_IDENT {
-			right = p.current.Value
-			p.nextToken()
+		if p.at(TOKEN_NUMBER) {
+			right = p.unsafeNumber()
 		} else {
-			p.error("expected number or register after operator")
+			right = p.expect(TOKEN_IDENT, "a register or number").Value
 		}
-
-		if leftIsImmediate {
-			p.error("left operand of binary operation must be a register")
-		}
-
 		return &RegisterOp{Left: left, Operator: op, Right: right}
 	}
-
-	// No operator - just a simple value
-	if leftIsImmediate {
-		return leftValue
+	if imm != nil {
+		return imm
 	}
-
-	// Check if left is a register name or a variable
-	// If it's a known register, return as string
-	// Otherwise, return as IdentExpr (variable reference)
 	if isRegisterName(left) {
 		return left
 	}
 	return &IdentExpr{Name: left}
 }
 
-// parseTypeAnnotation parses a type annotation (after :)
-// Returns nil if no valid type annotation found
-func (p *Parser) parseTypeAnnotation() *TimType {
-	// Handle TOKEN_BOOL keyword
-	if p.current.Type == TOKEN_BOOL {
-		return &TimType{Kind: TypeBoolean}
-	}
+var registerNames = map[string]bool{}
 
-	// Native Tim types (coming as identifiers)
-	switch p.current.Value {
-	case "num":
-		return &TimType{Kind: TypeNumber}
-	case "str":
-		return &TimType{Kind: TypeString}
-	case "list":
-		return &TimType{Kind: TypeList}
-	case "map":
-		return &TimType{Kind: TypeMap}
-	case "bool":
-		return &TimType{Kind: TypeBoolean}
-	// Foreign C types
-	case "cstring":
-		return &TimType{Kind: TypeCString, CType: "char*"}
-	case "cptr":
-		return &TimType{Kind: TypeCPointer, CType: "void*"}
-	case "cint":
-		return &TimType{Kind: TypeCInt, CType: "int"}
-	case "clong":
-		return &TimType{Kind: TypeCLong, CType: "long"}
-	case "cfloat":
-		return &TimType{Kind: TypeCFloat, CType: "float"}
-	case "cdouble":
-		return &TimType{Kind: TypeCDouble, CType: "double"}
-	case "cbool":
-		return &TimType{Kind: TypeCBool, CType: "bool"}
-	case "cvoid":
-		return &TimType{Kind: TypeCVoid}
-	default:
-		return nil
+func init() {
+	for _, group := range []string{
+		"rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 eax ebx ecx edx esi edi ebp esp " +
+			"ax bx cx dx si di bp sp al bl cl dl sil dil bpl spl stack",
+		"xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15",
+		"x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 " +
+			"x26 x27 x28 x29 x30 xzr lr w0 w1 w2 w3 w4 w5 w6 w7 v0 v1 v2 v3 v4 v5 v6 v7",
+		"a0 a1 a2 a3 a4 a5 a6 a7 t0 t1 t2 t3 t4 t5 t6 s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 ra gp tp " +
+			"fa0 fa1 fa2 fa3 fa4 fa5 fa6 fa7",
+	} {
+		for _, r := range strings.Fields(group) {
+			registerNames[r] = true
+		}
 	}
+}
+
+func isRegisterName(name string) bool { return registerNames[name] }
+
+// hasCall reports whether evaluating e may call a function, so it must not be
+// evaluated more than once.
+func hasCall(e Expression) bool {
+	switch e := e.(type) {
+	case nil, *NumberExpr, *StringExpr, *BooleanExpr, *IdentExpr, *NamespacedIdentExpr:
+		return false
+	case *BinaryExpr:
+		return hasCall(e.Left) || hasCall(e.Right)
+	case *UnaryExpr:
+		return hasCall(e.Operand)
+	case *CastExpr:
+		return hasCall(e.Expr)
+	case *FieldAccessExpr:
+		return hasCall(e.Object)
+	case *IndexExpr:
+		return hasCall(e.List) || hasCall(e.Index)
+	case *InExpr:
+		return hasCall(e.Value) || hasCall(e.Container)
+	case *RangeExpr:
+		return hasCall(e.Start) || hasCall(e.End)
+	}
+	return true
 }
