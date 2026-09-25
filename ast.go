@@ -7,6 +7,11 @@ import (
 	"strings"
 )
 
+// Pos is a 1-based source position.
+type Pos struct{ Line, Col int }
+
+func (p Pos) String() string { return fmt.Sprintf("%d:%d", p.Line, p.Col) }
+
 // AST Nodes
 type Node interface {
 	String() string
@@ -26,6 +31,7 @@ type Statement interface {
 }
 
 type AssignStmt struct {
+	Pos            Pos
 	Name           string
 	Value          Expression
 	Mutable        bool     // true for := or <-, false for =
@@ -36,6 +42,7 @@ type AssignStmt struct {
 }
 
 type MultipleAssignStmt struct {
+	Pos      Pos
 	Names    []string   // Variable names (left side)
 	Value    Expression // Expression that should evaluate to a list (right side)
 	Mutable  bool       // true for := or <-, false for =
@@ -74,6 +81,7 @@ func (a *AssignStmt) String() string {
 func (a *AssignStmt) statementNode() {}
 
 type MapUpdateStmt struct {
+	Pos     Pos
 	MapName string     // Name of the map/list variable
 	Index   Expression // Index expression
 	Value   Expression // New value
@@ -233,6 +241,7 @@ func (e *ExpressionStmt) String() string { return e.Expr.String() }
 func (e *ExpressionStmt) statementNode() {}
 
 type LoopStmt struct {
+	Pos Pos
 	// No explicit label - determined by nesting depth when created with @
 	Iterator      string     // Variable name (e.g., "i")
 	IteratorType  string     // Optional cstruct type annotation: `@ b as Ball in ...` (empty if none)
@@ -248,6 +257,7 @@ type LoopStmt struct {
 }
 
 type WhileStmt struct {
+	Pos           Pos
 	Condition     Expression  // Condition expression (e.g., n < 5)
 	Body          []Statement // Body statements to execute while condition is true
 	MaxIterations int64       // Maximum allowed iterations (required for condition loops)
@@ -267,6 +277,7 @@ type IfBranch struct {
 }
 
 type IfStmt struct {
+	Pos      Pos
 	Branches []IfBranch
 	ElseBody []Statement
 }
@@ -309,6 +320,7 @@ func (l *LoopStmt) statementNode() {}
 // ret @N (Label=N) = exit loop N and all inner loops
 // @N (without ret) = continue loop N (IsBreak=false)
 type JumpStmt struct {
+	Pos     Pos
 	IsBreak bool       // true for ret (return/exit loop), false for continue (@N without ret)
 	Label   int        // 0 for function return, N for loop label
 	Value   Expression // Optional value to return
@@ -340,6 +352,7 @@ type Expression interface {
 }
 
 type NumberExpr struct {
+	Pos   Pos
 	Value float64
 	Exact *big.Rat // exact value when it is not a small integer (big integer or rational)
 }
@@ -372,6 +385,7 @@ func (b *BooleanExpr) String() string {
 func (b *BooleanExpr) expressionNode() {}
 
 type StringExpr struct {
+	Pos   Pos
 	Value string
 }
 
@@ -382,6 +396,7 @@ func (s *StringExpr) expressionNode() {}
 // Parts alternates between string literals and expressions
 // Example: f"Hello {name}" -> Parts = [StringExpr("Hello "), IdentExpr("name")]
 type FStringExpr struct {
+	Pos   Pos
 	Parts []Expression // Alternating string literals and expressions
 }
 
@@ -389,6 +404,7 @@ func (f *FStringExpr) String() string  { return "f\"...\"" }
 func (f *FStringExpr) expressionNode() {}
 
 type IdentExpr struct {
+	Pos  Pos
 	Name string
 }
 
@@ -424,6 +440,7 @@ func (j *JumpExpr) String() string {
 func (j *JumpExpr) expressionNode() {}
 
 type BinaryExpr struct {
+	Pos      Pos
 	Left     Expression
 	Operator string
 	Right    Expression
@@ -455,6 +472,7 @@ func (f *FMAExpr) expressionNode() {}
 
 // UnaryExpr represents a unary operation: not, -, #, ++expr, --expr
 type UnaryExpr struct {
+	Pos      Pos
 	Operator string
 	Operand  Expression
 }
@@ -465,6 +483,7 @@ func (u *UnaryExpr) String() string {
 func (u *UnaryExpr) expressionNode() {}
 
 type InExpr struct {
+	Pos       Pos
 	Value     Expression // Value to search for
 	Container Expression // List or map to search in
 }
@@ -481,6 +500,7 @@ type MatchClause struct {
 }
 
 type MatchExpr struct {
+	Pos             Pos
 	Condition       Expression
 	Clauses         []*MatchClause
 	DefaultExpr     Expression
@@ -525,6 +545,7 @@ func (b *BlockExpr) String() string {
 func (b *BlockExpr) expressionNode() {}
 
 type CallExpr struct {
+	Pos                 Pos
 	Function            string
 	Args                []Expression
 	MaxRecursionDepth   int64 // Maximum recursion depth (math.MaxInt64 for infinite)
@@ -547,6 +568,7 @@ func (c *CallExpr) String() string {
 func (c *CallExpr) expressionNode() {}
 
 type DirectCallExpr struct {
+	Pos    Pos
 	Callee Expression // The expression being called (e.g., a lambda)
 	Args   []Expression
 }
@@ -561,6 +583,7 @@ func (d *DirectCallExpr) String() string {
 func (d *DirectCallExpr) expressionNode() {}
 
 type ListExpr struct {
+	Pos      Pos
 	Elements []Expression
 }
 
@@ -574,6 +597,7 @@ func (l *ListExpr) String() string {
 func (l *ListExpr) expressionNode() {}
 
 type MapExpr struct {
+	Pos    Pos
 	Keys   []Expression
 	Values []Expression
 }
@@ -588,6 +612,7 @@ func (m *MapExpr) String() string {
 func (m *MapExpr) expressionNode() {}
 
 type IndexExpr struct {
+	Pos   Pos
 	List  Expression
 	Index Expression
 }
@@ -604,6 +629,7 @@ func (i *IndexExpr) expressionNode() {}
 // Different from IndexExpr which accesses map elements by key
 // FieldAccessExpr accesses memory at a fixed offset
 type FieldAccessExpr struct {
+	Pos        Pos
 	Object     Expression // The struct/pointer expression
 	FieldName  string     // Name of the field
 	StructName string     // Name of the C struct type (if known)
@@ -620,6 +646,7 @@ func (f *FieldAccessExpr) expressionNode() {}
 
 // SliceExpr: list[start:end:step] or string[start:end:step] (Python-style slicing)
 type SliceExpr struct {
+	Pos   Pos
 	List  Expression
 	Start Expression // nil means start from beginning
 	End   Expression // nil means go to end
@@ -646,6 +673,7 @@ func (s *SliceExpr) expressionNode() {}
 
 // RangeExpr represents a range like 0..<10 or 0..=10
 type RangeExpr struct {
+	Pos       Pos
 	Start     Expression
 	End       Expression
 	Inclusive bool // true for ..=, false for ..<
@@ -661,6 +689,7 @@ func (r *RangeExpr) String() string {
 func (r *RangeExpr) expressionNode() {}
 
 type LambdaExpr struct {
+	Pos               Pos
 	Params            []string
 	ParamCStructTypes map[string]string   // param name -> cstruct type name from `(a as V)` annotations
 	ParamTypes        map[string]*TimType // Type annotations for parameters (nil if none)
@@ -691,6 +720,7 @@ func (l *LengthExpr) String() string {
 func (l *LengthExpr) expressionNode() {}
 
 type CastExpr struct {
+	Pos        Pos
 	Expr       Expression
 	Type       string // "i8", "i32", "u64", "f32", "f64", "cstr", "ptr", "number", "string", "list"
 	RawBitcast bool   // true for as!, false for as (numeric conversion)
@@ -889,6 +919,7 @@ func (v *VectorExpr) expressionNode() {}
 // DeferStmt represents a deferred expression: defer expr
 // Executed at the end of the current scope in LIFO order
 type DeferStmt struct {
+	Pos  Pos
 	Call Expression // Expression to execute at scope exit (typically a function call)
 }
 
@@ -897,6 +928,7 @@ func (d *DeferStmt) statementNode() {}
 
 // FieldUpdateStmt is obj.field <- value.
 type FieldUpdateStmt struct {
+	Pos    Pos
 	Object Expression
 	Field  string
 	Value  Expression
@@ -909,6 +941,7 @@ func (f *FieldUpdateStmt) statementNode() {}
 
 // IndexUpdateStmt is target[index] <- value where target is not a plain variable.
 type IndexUpdateStmt struct {
+	Pos    Pos
 	Target Expression
 	Index  Expression
 	Value  Expression

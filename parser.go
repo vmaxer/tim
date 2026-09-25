@@ -62,6 +62,13 @@ func NewParserWithFilename(input, filename string) *Parser {
 
 // ParseProgram parses a whole file, reporting every syntax error it finds.
 func (p *Parser) ParseProgram() *Program {
+	program := p.ParseProgramRaw()
+	uniquifyLocalFunctions(program)
+	return optimizeProgram(program)
+}
+
+// ParseProgramRaw parses a file without the legacy AST optimizations.
+func (p *Parser) ParseProgramRaw() *Program {
 	program := &Program{}
 	if p.lexErr != nil {
 		p.errors.AddError(SyntaxError(p.lexErr.Msg, SourceLocation{File: p.filename, Line: p.lexErr.Line, Column: p.lexErr.Column, Length: 1}))
@@ -76,8 +83,7 @@ func (p *Parser) ParseProgram() *Program {
 		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
 	program.CStructs = p.cstructs
-	uniquifyLocalFunctions(program)
-	return optimizeProgram(program)
+	return program
 }
 
 func (p *Parser) topStatement(program *Program) {
@@ -132,6 +138,10 @@ func (p *Parser) syncToStatement(start int) {
 // Token helpers.
 
 func (p *Parser) cur() Token { return p.toks[p.i] }
+
+func (p *Parser) pos() Pos { return tokPos(p.toks[p.i]) }
+
+func tokPos(t Token) Pos { return Pos{t.Line, t.Column} }
 
 func (p *Parser) peekAt(n int) Token {
 	if p.i+n < len(p.toks) {
@@ -424,6 +434,7 @@ func (p *Parser) definition() Statement {
 	if p.toks[k].Type != TOKEN_ASSIGN {
 		return nil
 	}
+	defPos := p.pos()
 	name := p.advance().Value
 	if recv != "" {
 		p.advance()
@@ -445,8 +456,9 @@ func (p *Parser) definition() Statement {
 	}
 	p.expect(TOKEN_ASSIGN, "'='")
 	p.skipNewlines()
+	lambda.Pos = defPos
 	lambda.Body = p.functionBody(lambda)
-	return &AssignStmt{Name: name, Value: lambda}
+	return &AssignStmt{Pos: defPos, Name: name, Value: lambda}
 }
 
 // matching returns the index of the bracket closing the one at open, or -1.
@@ -571,6 +583,7 @@ func (p *Parser) binding() Statement {
 	if op != TOKEN_ASSIGN && op != TOKEN_DEFINE {
 		return nil
 	}
+	bindPos := p.pos()
 	p.i += 1 + 2*(len(names)-1)
 	var ann *TimType
 	if annotated {
@@ -586,12 +599,12 @@ func (p *Parser) binding() Statement {
 	start := p.i
 	value := p.expr()
 	if len(names) > 1 {
-		return &MultipleAssignStmt{Names: names, Value: value, Mutable: mutable}
+		return &MultipleAssignStmt{Pos: bindPos, Names: names, Value: value, Mutable: mutable}
 	}
 	if b, ok := value.(*BlockExpr); ok && p.toks[start].Type == TOKEN_LBRACE && p.matching(start) == p.i-1 {
-		value = &LambdaExpr{Params: []string{}, Body: b}
+		value = &LambdaExpr{Pos: tokPos(p.toks[start]), Params: []string{}, Body: b}
 	}
-	return &AssignStmt{Name: names[0], Value: value, Mutable: mutable, TypeAnnotation: ann}
+	return &AssignStmt{Pos: bindPos, Name: names[0], Value: value, Mutable: mutable, TypeAnnotation: ann}
 }
 
 var compoundOps = map[TokenType]string{
@@ -622,26 +635,30 @@ func (p *Parser) update() Statement {
 	if opTok != TOKEN_UPDATE && !compound {
 		return nil
 	}
+	updPos := p.pos()
 	name := p.advance().Value
-	var place Expression = &IdentExpr{Name: name}
+	var place Expression = &IdentExpr{Pos: updPos, Name: name}
 	var last func(Expression) Statement
 	for p.i < k {
+		elemPos := p.pos()
 		if p.accept(TOKEN_DOT) {
 			field := p.advance().Value
 			obj := place
-			place = &FieldAccessExpr{Object: obj, FieldName: field, Offset: -1}
-			last = func(v Expression) Statement { return &FieldUpdateStmt{Object: obj, Field: field, Value: v} }
+			place = &FieldAccessExpr{Pos: elemPos, Object: obj, FieldName: field, Offset: -1}
+			last = func(v Expression) Statement {
+				return &FieldUpdateStmt{Pos: elemPos, Object: obj, Field: field, Value: v}
+			}
 			continue
 		}
 		p.advance()
 		idx := nested(p, p.expr)
 		p.expect(TOKEN_RBRACKET, "']'")
 		obj := place
-		place = &IndexExpr{List: obj, Index: idx}
+		place = &IndexExpr{Pos: elemPos, List: obj, Index: idx}
 		last = func(v Expression) Statement {
 			ident, ok := obj.(*IdentExpr)
 			if !ok {
-				return &IndexUpdateStmt{Target: obj, Index: idx, Value: v}
+				return &IndexUpdateStmt{Pos: elemPos, Target: obj, Index: idx, Value: v}
 			}
 			if c, ok := v.(*CastExpr); ok {
 				if short, ok := map[string]string{"int8": "i8", "int16": "i16", "int32": "i32", "int64": "i64",
@@ -649,23 +666,25 @@ func (p *Parser) update() Statement {
 					return &ExpressionStmt{Expr: &CallExpr{Function: "write_" + short, Args: []Expression{ident, &CastExpr{Expr: idx, Type: "int32"}, c.Expr}}}
 				}
 			}
-			return &MapUpdateStmt{MapName: ident.Name, Index: idx, Value: v}
+			return &MapUpdateStmt{Pos: elemPos, MapName: ident.Name, Index: idx, Value: v}
 		}
 	}
+	opPos := p.pos()
 	p.advance()
 	p.skipNewlines()
 	value := p.expr()
 	if compound {
-		value = &BinaryExpr{Left: place, Operator: compoundOps[opTok], Right: value}
+		value = &BinaryExpr{Pos: opPos, Left: place, Operator: compoundOps[opTok], Right: value}
 	}
 	if last == nil {
-		return &AssignStmt{Name: name, Value: value, Mutable: true, IsUpdate: true}
+		return &AssignStmt{Pos: updPos, Name: name, Value: value, Mutable: true, IsUpdate: true}
 	}
 	return last(value)
 }
 
 // loop parses `@ [spec] [! bound] block`.
 func (p *Parser) loop() Statement {
+	loopPos := p.pos()
 	p.advance()
 	var iterator, iterType string
 	var iterable, cond Expression
@@ -713,15 +732,16 @@ func (p *Parser) loop() Statement {
 	body := p.blockStmts()
 	p.loops--
 	if iterable != nil {
-		return &LoopStmt{Iterator: iterator, IteratorType: iterType, Iterable: iterable, Body: body, MaxIterations: maxIter, NeedsMaxCheck: bounded}
+		return &LoopStmt{Pos: loopPos, Iterator: iterator, IteratorType: iterType, Iterable: iterable, Body: body, MaxIterations: maxIter, NeedsMaxCheck: bounded}
 	}
 	if cond == nil {
 		cond = &NumberExpr{Value: 1}
 	}
-	return &WhileStmt{Condition: cond, Body: body, MaxIterations: maxIter}
+	return &WhileStmt{Pos: loopPos, Condition: cond, Body: body, MaxIterations: maxIter}
 }
 
 func (p *Parser) jump() Statement {
+	jumpPos := p.pos()
 	isBreak := p.advance().Type == TOKEN_BREAK
 	word := map[bool]string{true: "break", false: "continue"}[isBreak]
 	if p.loops == 0 {
@@ -738,7 +758,7 @@ func (p *Parser) jump() Statement {
 		}
 		label = n
 	}
-	return &JumpStmt{IsBreak: isBreak, Label: label}
+	return &JumpStmt{Pos: jumpPos, IsBreak: isBreak, Label: label}
 }
 
 func (p *Parser) endsValue() bool {
@@ -752,6 +772,7 @@ func (p *Parser) endsValue() bool {
 }
 
 func (p *Parser) ret() Statement {
+	retPos := p.pos()
 	isErr := p.advance().Type == TOKEN_ERR
 	var value Expression
 	if !p.endsValue() {
@@ -761,9 +782,9 @@ func (p *Parser) ret() Statement {
 		if value == nil {
 			value = &StringExpr{Value: "err"}
 		}
-		value = &CallExpr{Function: "error", Args: []Expression{value}}
+		value = &CallExpr{Pos: retPos, Function: "error", Args: []Expression{value}}
 	}
-	return &JumpStmt{IsBreak: true, Value: value}
+	return &JumpStmt{Pos: retPos, IsBreak: true, Value: value}
 }
 
 func (p *Parser) ifStmt() Statement {
@@ -878,6 +899,7 @@ func (p *Parser) expr() Expression {
 
 // lambda parses `x -> body` and `(params) -> body`.
 func (p *Parser) lambda() Expression {
+	lambdaPos := p.pos()
 	var lambda *LambdaExpr
 	switch {
 	case p.at(TOKEN_IDENT) && p.peekAt(1).Type == TOKEN_ARROW:
@@ -893,13 +915,16 @@ func (p *Parser) lambda() Expression {
 	}
 	p.expect(TOKEN_ARROW, "'->'")
 	p.skipNewlines()
+	lambda.Pos = lambdaPos
 	lambda.Body = p.functionBody(lambda)
 	return lambda
 }
 
 func (p *Parser) pipe() Expression {
 	left := p.orBang()
-	for p.accept(TOKEN_PIPE_FWD) {
+	for p.at(TOKEN_PIPE_FWD) {
+		pipePos := p.pos()
+		p.advance()
 		p.skipNewlines()
 		switch right := p.orBang().(type) {
 		case *CallExpr:
@@ -909,9 +934,9 @@ func (p *Parser) pipe() Expression {
 			right.Args = append([]Expression{left}, right.Args...)
 			left = right
 		case *IdentExpr:
-			left = &CallExpr{Function: right.Name, Args: []Expression{left}}
+			left = &CallExpr{Pos: right.Pos, Function: right.Name, Args: []Expression{left}}
 		default:
-			left = &DirectCallExpr{Callee: right, Args: []Expression{left}}
+			left = &DirectCallExpr{Pos: pipePos, Callee: right, Args: []Expression{left}}
 		}
 	}
 	return left
@@ -919,32 +944,40 @@ func (p *Parser) pipe() Expression {
 
 func (p *Parser) orBang() Expression {
 	left := p.or()
-	for p.accept(TOKEN_OR_BANG) {
+	for p.at(TOKEN_OR_BANG) {
+		opPos := p.pos()
+		p.advance()
 		p.skipNewlines()
-		left = &BinaryExpr{Left: left, Operator: "or!", Right: p.or()}
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "or!", Right: p.or()}
 	}
 	return left
 }
 
 func (p *Parser) or() Expression {
 	left := p.and()
-	for p.accept(TOKEN_OR) {
-		left = &BinaryExpr{Left: left, Operator: "or", Right: p.and()}
+	for p.at(TOKEN_OR) {
+		opPos := p.pos()
+		p.advance()
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "or", Right: p.and()}
 	}
 	return left
 }
 
 func (p *Parser) and() Expression {
 	left := p.not()
-	for p.accept(TOKEN_AND) {
-		left = &BinaryExpr{Left: left, Operator: "and", Right: p.not()}
+	for p.at(TOKEN_AND) {
+		opPos := p.pos()
+		p.advance()
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: "and", Right: p.not()}
 	}
 	return left
 }
 
 func (p *Parser) not() Expression {
-	if p.accept(TOKEN_NOT) {
-		return &UnaryExpr{Operator: "not", Operand: p.not()}
+	if p.at(TOKEN_NOT) {
+		opPos := p.pos()
+		p.advance()
+		return &UnaryExpr{Pos: opPos, Operator: "not", Operand: p.not()}
 	}
 	return p.compare()
 }
@@ -959,21 +992,22 @@ func (p *Parser) compare() Expression {
 	var result Expression
 	for {
 		var cmp Expression
+		opPos := p.pos()
 		switch t := p.cur().Type; {
 		case compareOps[t] != "":
 			p.advance()
 			right := p.rangeExpr()
-			cmp = &BinaryExpr{Left: left, Operator: compareOps[t], Right: right}
+			cmp = &BinaryExpr{Pos: opPos, Left: left, Operator: compareOps[t], Right: right}
 			left = right
 		case t == TOKEN_IN:
 			p.advance()
 			right := p.rangeExpr()
-			cmp = &InExpr{Value: left, Container: right}
+			cmp = &InExpr{Pos: opPos, Value: left, Container: right}
 			left = right
 		case t == TOKEN_NOT && p.peekAt(1).Type == TOKEN_IN:
 			p.i += 2
 			right := p.rangeExpr()
-			cmp = &UnaryExpr{Operator: "not", Operand: &InExpr{Value: left, Container: right}}
+			cmp = &UnaryExpr{Pos: opPos, Operator: "not", Operand: &InExpr{Pos: opPos, Value: left, Container: right}}
 			left = right
 		default:
 			if result == nil {
@@ -984,7 +1018,7 @@ func (p *Parser) compare() Expression {
 		if result == nil {
 			result = cmp
 		} else {
-			result = &BinaryExpr{Left: result, Operator: "and", Right: cmp}
+			result = &BinaryExpr{Pos: opPos, Left: result, Operator: "and", Right: cmp}
 		}
 	}
 }
@@ -992,8 +1026,9 @@ func (p *Parser) compare() Expression {
 func (p *Parser) rangeExpr() Expression {
 	start := p.bitOr()
 	if p.at(TOKEN_RANGE_EX) || p.at(TOKEN_RANGE_IN) {
+		opPos := p.pos()
 		inclusive := p.advance().Type == TOKEN_RANGE_IN
-		return &RangeExpr{Start: start, End: p.bitOr(), Inclusive: inclusive}
+		return &RangeExpr{Pos: opPos, Start: start, End: p.bitOr(), Inclusive: inclusive}
 	}
 	return start
 }
@@ -1005,8 +1040,9 @@ func (p *Parser) binary(next func() Expression, ops map[TokenType]string) Expres
 		if !ok || op == "|b" && p.noPipe > 0 {
 			return left
 		}
+		opPos := p.pos()
 		p.advance()
-		left = &BinaryExpr{Left: left, Operator: op, Right: next()}
+		left = &BinaryExpr{Pos: opPos, Left: left, Operator: op, Right: next()}
 	}
 }
 
@@ -1039,17 +1075,20 @@ var castTypes = map[string]bool{
 
 func (p *Parser) cast() Expression {
 	e := p.unary()
-	for p.accept(TOKEN_AS) {
+	for p.at(TOKEN_AS) {
+		castPos := p.pos()
+		p.advance()
 		t := p.expect(TOKEN_IDENT, "a type after 'as'").Value
 		if canon, ok := cTypeAliases[t]; ok {
 			t = canon
 		}
-		e = &CastExpr{Expr: e, Type: t}
+		e = &CastExpr{Pos: castPos, Expr: e, Type: t}
 	}
 	return e
 }
 
 func (p *Parser) unary() Expression {
+	opPos := p.pos()
 	switch p.cur().Type {
 	case TOKEN_MINUS:
 		p.advance()
@@ -1060,21 +1099,23 @@ func (p *Parser) unary() Expression {
 			}
 			return &NumberExpr{Value: -n.Value}
 		}
-		return &UnaryExpr{Operator: "-", Operand: operand}
+		return &UnaryExpr{Pos: opPos, Operator: "-", Operand: operand}
 	case TOKEN_TILDE:
 		p.advance()
-		return &UnaryExpr{Operator: "~b", Operand: p.unary()}
+		return &UnaryExpr{Pos: opPos, Operator: "~b", Operand: p.unary()}
 	case TOKEN_HASH:
 		p.advance()
-		return &UnaryExpr{Operator: "#", Operand: p.unary()}
+		return &UnaryExpr{Pos: opPos, Operator: "#", Operand: p.unary()}
 	}
 	return p.power()
 }
 
 func (p *Parser) power() Expression {
 	base := p.postfix()
-	if p.accept(TOKEN_POWER) {
-		return &BinaryExpr{Left: base, Operator: "**", Right: p.unary()}
+	if p.at(TOKEN_POWER) {
+		opPos := p.pos()
+		p.advance()
+		return &BinaryExpr{Pos: opPos, Left: base, Operator: "**", Right: p.unary()}
 	}
 	return base
 }
@@ -1103,23 +1144,25 @@ func (p *Parser) postfix() Expression {
 	for {
 		switch p.cur().Type {
 		case TOKEN_LPAREN:
+			callPos := p.pos()
 			args := p.args()
 			if id, ok := e.(*IdentExpr); ok {
+				callPos = id.Pos
 				op, isBitOp := bitBuiltins[id.Name]
 				switch {
 				case p.isDeclared(id.Name):
-					e = &CallExpr{Function: id.Name, Args: args}
+					e = &CallExpr{Pos: callPos, Function: id.Name, Args: args}
 				case id.Name == "vec2" && len(args) == 2, id.Name == "vec4" && len(args) == 4:
 					e = &VectorExpr{Components: args, Size: len(args)}
 				case isBitOp && len(args) == 2:
-					e = &BinaryExpr{Left: args[0], Operator: op, Right: args[1]}
+					e = &BinaryExpr{Pos: callPos, Left: args[0], Operator: op, Right: args[1]}
 				case id.Name == "random" && len(args) == 0:
 					e = &RandomExpr{}
 				default:
-					e = &CallExpr{Function: id.Name, Args: args}
+					e = &CallExpr{Pos: callPos, Function: id.Name, Args: args}
 				}
 			} else {
-				e = &DirectCallExpr{Callee: e, Args: args}
+				e = &DirectCallExpr{Pos: callPos, Callee: e, Args: args}
 			}
 		case TOKEN_LBRACKET:
 			e = p.indexOrSlice(e)
@@ -1132,6 +1175,7 @@ func (p *Parser) postfix() Expression {
 }
 
 func (p *Parser) indexOrSlice(list Expression) Expression {
+	at := p.pos()
 	p.advance()
 	return nested(p, func() Expression {
 		if p.at(TOKEN_RBRACKET) {
@@ -1145,7 +1189,7 @@ func (p *Parser) indexOrSlice(list Expression) Expression {
 			if start == nil {
 				p.fail("empty index")
 			}
-			return &IndexExpr{List: list, Index: start}
+			return &IndexExpr{Pos: at, List: list, Index: start}
 		}
 		p.expect(TOKEN_COLON, "']' or ':'")
 		var end Expression
@@ -1153,13 +1197,14 @@ func (p *Parser) indexOrSlice(list Expression) Expression {
 			end = p.expr()
 		}
 		p.expect(TOKEN_RBRACKET, "']'")
-		return &SliceExpr{List: list, Start: start, End: end}
+		return &SliceExpr{Pos: at, List: list, Start: start, End: end}
 	})
 }
 
 // member parses `.name` after an expression: C namespaces, cstruct
 // metadata, method calls, `.error` and field access.
 func (p *Parser) member(obj Expression) Expression {
+	at := p.pos()
 	p.advance()
 	field := p.expect(TOKEN_IDENT, "a field or method name after '.'").Value
 	id, isIdent := obj.(*IdentExpr)
@@ -1185,9 +1230,9 @@ func (p *Parser) member(obj Expression) Expression {
 			if p.at(TOKEN_LPAREN) {
 				args := p.args()
 				if id.Name == "c" || id.Name == "C" {
-					return &CallExpr{Function: field, Args: args, IsCFFI: true}
+					return &CallExpr{Pos: id.Pos, Function: field, Args: args, IsCFFI: true}
 				}
-				return &CallExpr{Function: id.Name + "." + field, Args: args}
+				return &CallExpr{Pos: id.Pos, Function: id.Name + "." + field, Args: args}
 			}
 			return &NamespacedIdentExpr{Namespace: id.Name, Name: field}
 		}
@@ -1195,14 +1240,14 @@ func (p *Parser) member(obj Expression) Expression {
 	if p.at(TOKEN_LPAREN) {
 		args := p.args()
 		if isIdent {
-			return &CallExpr{Function: id.Name + "." + field, Args: args}
+			return &CallExpr{Pos: at, Function: id.Name + "." + field, Args: args}
 		}
-		return &CallExpr{Function: field, Args: append([]Expression{obj}, args...)}
+		return &CallExpr{Pos: at, Function: field, Args: append([]Expression{obj}, args...)}
 	}
 	if field == "error" {
-		return &CallExpr{Function: "_error_code_extract", Args: []Expression{obj}}
+		return &CallExpr{Pos: at, Function: "_error_code_extract", Args: []Expression{obj}}
 	}
-	return &FieldAccessExpr{Object: obj, FieldName: field, Offset: -1}
+	return &FieldAccessExpr{Pos: at, Object: obj, FieldName: field, Offset: -1}
 }
 
 func (p *Parser) primary() Expression {
@@ -1215,10 +1260,11 @@ func (p *Parser) primary() Expression {
 			p.i--
 			p.fail("%v", err)
 		}
+		n.Pos = tokPos(t)
 		return n
 	case TOKEN_STRING:
 		p.advance()
-		return &StringExpr{Value: t.Value}
+		return &StringExpr{Pos: tokPos(t), Value: t.Value}
 	case TOKEN_FSTRING:
 		p.advance()
 		return p.fstring(t)
@@ -1230,7 +1276,7 @@ func (p *Parser) primary() Expression {
 		return &NumberExpr{Value: math.Inf(1)}
 	case TOKEN_IDENT:
 		p.advance()
-		return &IdentExpr{Name: t.Value}
+		return &IdentExpr{Pos: tokPos(t), Name: t.Value}
 	case TOKEN_LPAREN:
 		p.advance()
 		e := nested(p, func() Expression {
@@ -1261,6 +1307,7 @@ func (p *Parser) primary() Expression {
 }
 
 func (p *Parser) list() Expression {
+	at := p.pos()
 	p.advance()
 	return nested(p, func() Expression {
 		var elems []Expression
@@ -1277,7 +1324,7 @@ func (p *Parser) list() Expression {
 		if elems == nil {
 			elems = []Expression{}
 		}
-		return &ListExpr{Elements: elems}
+		return &ListExpr{Pos: at, Elements: elems}
 	})
 }
 
@@ -1333,8 +1380,8 @@ func (p *Parser) brace() Expression {
 }
 
 func (p *Parser) mapLiteral() Expression {
+	m := &MapExpr{Pos: p.pos()}
 	p.advance()
-	m := &MapExpr{}
 	nested(p, func() Expression {
 		p.skipNewlines()
 		for !p.at(TOKEN_RBRACE) {
@@ -1391,7 +1438,7 @@ func (p *Parser) matchBlock(subject Expression) Expression {
 	}
 	if !hasArms {
 		body := &BlockExpr{Statements: p.scopedBlockStmts()}
-		return &MatchExpr{Condition: subject, Clauses: []*MatchClause{{Result: body}}, DefaultExpr: &NumberExpr{}}
+		return &MatchExpr{Pos: tokPos(p.toks[open]), Condition: subject, Clauses: []*MatchClause{{Result: body}}, DefaultExpr: &NumberExpr{}}
 	}
 	p.advance()
 	if !hasCall(subject) {
@@ -1407,7 +1454,7 @@ func (p *Parser) matchBlock(subject Expression) Expression {
 
 // arms parses match arms after the opening brace.
 func (p *Parser) arms(subject Expression, guards bool) *MatchExpr {
-	m := &MatchExpr{Condition: subject, DefaultExpr: &NumberExpr{}}
+	m := &MatchExpr{Pos: tokPos(p.toks[p.i-1]), Condition: subject, DefaultExpr: &NumberExpr{}}
 	nested(p, func() Expression {
 		p.skipEnds()
 		for !p.at(TOKEN_RBRACE) {
@@ -1550,7 +1597,7 @@ func (p *Parser) fstring(t Token) Expression {
 	if s, ok := parts[0].(*StringExpr); ok && len(parts) == 1 {
 		return s
 	}
-	return &FStringExpr{Parts: parts}
+	return &FStringExpr{Pos: tokPos(t), Parts: parts}
 }
 
 // subExpression parses the source of an f-string interpolation.
