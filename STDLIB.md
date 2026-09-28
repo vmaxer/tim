@@ -78,3 +78,14 @@ and `*` repeats.
 
 `#xs`, `xs[i]` (negative from the end), `xs[a:b]`, `x in xs`, `a + b`,
 `xs * n`; `m[k]`, `m.name`, `k in m`.
+
+## Memory and C
+
+| Function | Description |
+|---|---|
+| `cstr(p)` | copy the C string at a `ptr` into a string |
+| `read_i8 read_u8 read_i16 read_u16 read_i32 read_u32 read_i64 read_u64 read_f32 read_f64 read_ptr` | `read_u8(p, i)` reads a value of that C type at byte offset `i` |
+| `write_i8 write_u8 write_i16 write_u16 write_i32 write_u32 write_i64 write_u64 write_f32 write_f64 write_ptr` | `write_u8(p, i, v)` writes one |
+
+`p + n` offsets a `ptr` by `n` bytes and `x as ptr` makes one from an address.
+C functions are called through their library: `c.malloc(16)`, `sdl.SDL_Init(0)`.

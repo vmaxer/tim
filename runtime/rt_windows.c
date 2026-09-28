@@ -1,4 +1,5 @@
 // Windows start code: kernel32 and advapi32 through the import address table.
+#define RT_WINDOWS
 #include "rt.c"
 
 #if defined(__x86_64__)

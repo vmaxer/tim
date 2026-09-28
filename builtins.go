@@ -69,8 +69,21 @@ var builtins = map[string]builtin{
 	"zip":       {2, 2, "pairs of corresponding elements"},
 	"enumerate": {1, 1, "pairs of index and element"},
 
+	// Memory through ptr values, at a byte offset
+	"cstr":    {1, 1, "copy the C string at a ptr into a string"},
+	"read_i8": {2, 2, ""}, "read_u8": {2, 2, ""}, "read_i16": {2, 2, ""}, "read_u16": {2, 2, ""},
+	"read_i32": {2, 2, ""}, "read_u32": {2, 2, ""}, "read_i64": {2, 2, ""}, "read_u64": {2, 2, ""},
+	"read_f32": {2, 2, ""}, "read_f64": {2, 2, ""}, "read_ptr": {2, 2, ""},
+	"write_i8": {3, 3, ""}, "write_u8": {3, 3, ""}, "write_i16": {3, 3, ""}, "write_u16": {3, 3, ""},
+	"write_i32": {3, 3, ""}, "write_u32": {3, 3, ""}, "write_i64": {3, 3, ""}, "write_u64": {3, 3, ""},
+	"write_f32": {3, 3, ""}, "write_f64": {3, 3, ""}, "write_ptr": {3, 3, ""},
+
 	"__sort_keys": {2, 2, ""}, // sort(xs, key) in the prelude
 }
+
+// memKinds are the C types of read_* and write_*.
+var memKinds = map[string]uint8{"i8": cI8, "u8": cU8, "i16": cI16, "u16": cU16, "i32": cI32, "u32": cU32,
+	"i64": cI64, "u64": cU64, "f32": cF32, "f64": cF64, "ptr": cPtr}
 
 // legacyBuiltins are low-level functions only the legacy code generators
 // provide (raw memory, arenas, atomics, processes); programs that use them
@@ -79,21 +92,17 @@ var legacyBuiltins = map[string]bool{
 	"__tim_map_update": true, "alloc": true, "and": true, "append": true, "approx": true,
 	"arena_alloc": true, "arena_create": true, "arena_destroy": true, "arena_reset": true,
 	"atomic_add": true, "atomic_cas": true, "atomic_load": true, "atomic_store": true, "call": true,
-	"calloc": true, "chan": true, "close": true, "clz": true, "cstr": true, "ctz": true,
+	"calloc": true, "chan": true, "close": true, "clz": true, "ctz": true,
 	"dlclose": true, "dlopen": true, "dlsym": true, "exitf": true, "exitln": true, "float32": true,
 	"float64": true, "fork": true, "free": true, "getpid": true, "head": true, "int16": true,
 	"int32": true, "int64": true, "int8": true, "is_finite": true, "is_inf": true, "is_nan": true,
 	"is_neg_inf": true, "is_pos_inf": true, "load": true, "malloc": true, "mmap": true,
 	"munmap": true, "or": true, "peek32": true, "peek8": true, "popcount": true, "printa": true,
-	"proc_exit": true, "ptr": true, "read_f32": true, "read_f64": true, "read_i16": true,
-	"read_i32": true, "read_i64": true, "read_i8": true, "read_u16": true, "read_u32": true,
-	"read_u64": true, "read_u8": true, "realloc": true, "result_value": true, "safe_divide": true,
+	"proc_exit": true, "ptr": true, "realloc": true, "result_value": true, "safe_divide": true,
 	"safe_divide_result": true, "safe_ln": true, "safe_ln_result": true, "safe_sqrt": true,
 	"safe_sqrt_result": true, "sizeof_f32": true, "sizeof_f64": true, "sizeof_i16": true,
 	"sizeof_i32": true, "sizeof_i64": true, "sizeof_i8": true, "sizeof_ptr": true, "sizeof_u16": true,
 	"sizeof_u32": true, "sizeof_u64": true, "sizeof_u8": true, "store": true, "syscall": true,
 	"tail": true, "uint16": true, "uint32": true, "uint64": true, "uint8": true, "vadd": true,
-	"vdiv": true, "vdot": true, "vmul": true, "vsub": true, "waitpid": true, "write_f32": true,
-	"write_f64": true, "write_i16": true, "write_i32": true, "write_i64": true, "write_i8": true,
-	"write_u16": true, "write_u32": true, "write_u64": true, "write_u8": true,
+	"vdiv": true, "vdot": true, "vmul": true, "vsub": true, "waitpid": true,
 }

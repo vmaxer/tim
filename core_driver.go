@@ -119,9 +119,8 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 	}()
 	prog := NewParserWithFilename(string(src), path).ParseProgramRaw()
 	for _, s := range prog.Statements {
-		switch s.(type) {
-		case *ImportStmt, *CImportStmt:
-			why = "imports"
+		if _, ok := s.(*ImportStmt); ok {
+			why = "Tim imports"
 			return false, nil
 		}
 	}
@@ -140,35 +139,37 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 		why = strings.Join(c.Unsupported, ", ")
 		return false, nil
 	}
-	code, entry, err := compileCore(c, a, t)
+	code, entry, cimps, err := compileCore(c, a, t)
 	if err != nil {
 		why = err.Error()
 		return false, nil
 	}
-	return true, write(out, p.Arch, code, entry)
+	return true, write(out, p.Arch, code, entry, cimps)
 }
 
+type coreWriter func(path string, arch Arch, code []byte, entry int, cimps []cImport) error
+
 // coreTargetFor returns what the core needs for a platform, or a nil asm.
-func coreTargetFor(p Platform) (coreTarget, asm, func(string, Arch, []byte, int) error) {
+func coreTargetFor(p Platform) (coreTarget, asm, coreWriter) {
 	t := coreTarget{os: p.OS}
 	switch {
 	case p.OS == OSLinux && p.Arch == ArchX86_64:
-		t.blob, t.syms = rtLinuxAMD64, rtLinuxAMD64Syms
+		t.blob, t.syms, t.layout = rtLinuxAMD64, rtLinuxAMD64Syms, elfLayout
 		return t, newX86(), writeCoreELF
 	case p.OS == OSLinux && p.Arch == ArchARM64:
-		t.blob, t.syms = rtLinuxARM64, rtLinuxARM64Syms
+		t.blob, t.syms, t.layout = rtLinuxARM64, rtLinuxARM64Syms, elfLayout
 		return t, newA64(), writeCoreELF
 	case p.OS == OSLinux && p.Arch == ArchRiscv64:
-		t.blob, t.syms = rtLinuxRISCV64, rtLinuxRISCV64Syms
+		t.blob, t.syms, t.layout = rtLinuxRISCV64, rtLinuxRISCV64Syms, elfLayout
 		return t, newRV(), writeCoreELF
 	case p.OS == OSWindows && p.Arch == ArchX86_64:
-		t.blob, t.syms, t.importsAt = rtWindowsAMD64, rtWindowsAMD64Syms, peImportsAt
+		t.blob, t.syms, t.layout = rtWindowsAMD64, rtWindowsAMD64Syms, peLayout
 		return t, newX86(), writeCorePE
 	case p.OS == OSWindows && p.Arch == ArchARM64:
-		t.blob, t.syms, t.importsAt = rtWindowsARM64, rtWindowsARM64Syms, peImportsAt
+		t.blob, t.syms, t.layout = rtWindowsARM64, rtWindowsARM64Syms, peLayout
 		return t, newA64(), writeCorePE
 	case p.OS == OSDarwin && p.Arch == ArchARM64:
-		t.blob, t.syms, t.importsAt = rtDarwinARM64, rtDarwinARM64Syms, machoImportsAt
+		t.blob, t.syms, t.layout = rtDarwinARM64, rtDarwinARM64Syms, machoLayout
 		return t, newA64(), writeCoreMachO
 	}
 	return t, nil, nil

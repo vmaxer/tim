@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"path/filepath"
 	"sort"
 	"strings"
 )
@@ -74,7 +75,9 @@ type Checked struct {
 	Fns         map[*LambdaExpr]*Fun
 	Deferred    map[*DeferStmt]*Fun // the deferred expression as a function of no arguments
 	Types       map[Expression]Type
-	Unsupported []string // features the core code generator does not handle yet
+	CCalls      map[*CallExpr]*cFunc           // calls to C functions
+	CConsts     map[*NamespacedIdentExpr]int64 // C constants
+	Unsupported []string                       // features the core code generator does not handle yet
 }
 
 type scope struct {
@@ -90,7 +93,7 @@ type checker struct {
 	sc     *scope
 	fn     *Fun
 	loops  int
-	cimps  map[string]bool
+	cimps  map[string]*cLib // C libraries by namespace
 	unsupp map[string]bool
 }
 
@@ -110,11 +113,12 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 			Program: prog, Top: top, Funcs: []*Fun{top},
 			Uses: map[*IdentExpr]*Var{}, Defs: map[Statement][]*Var{}, Updates: map[Statement]*Var{},
 			Callees: map[*CallExpr]*Var{}, Fns: map[*LambdaExpr]*Fun{}, Deferred: map[*DeferStmt]*Fun{}, Types: map[Expression]Type{},
+			CCalls: map[*CallExpr]*cFunc{}, CConsts: map[*NamespacedIdentExpr]int64{},
 		},
 		file:   file,
 		errs:   NewErrorCollector(20),
 		fn:     top,
-		cimps:  map[string]bool{"c": true, "C": true},
+		cimps:  map[string]*cLib{"c": libcLib, "C": libcLib},
 		unsupp: map[string]bool{},
 	}
 	k.errs.SetSourceCode(src)
@@ -167,7 +171,11 @@ func (k *checker) predeclare(stmts []Statement) {
 			}
 			names, pos, mutable = s.Names, s.Pos, s.Mutable
 		case *CImportStmt:
-			k.cimps[s.Alias] = true
+			name := s.Library
+			if s.SoPath != "" {
+				name = s.SoPath
+			}
+			k.cimps[s.Alias] = loadCLib(name, filepath.Dir(k.file))
 		}
 		for _, n := range names {
 			if prev, ok := k.sc.names[n]; ok {
@@ -376,7 +384,6 @@ func (k *checker) stmt(s Statement) {
 	case *CStructDecl:
 		k.unsupported("cstruct")
 	case *CImportStmt:
-		k.unsupported("C imports")
 	case *ImportStmt:
 		k.unsupported("Tim imports")
 	case *ExportStmt:
@@ -633,6 +640,10 @@ func (k *checker) infer(e Expression) Type {
 		case "num", "number", "float64", "float32", "int8", "int16", "int32", "int64",
 			"uint8", "uint16", "uint32", "uint64", "bool":
 			return TNum
+		case "ptr", "pointer":
+			return TPtr
+		case "cstr":
+			return TStr
 		}
 		k.unsupported("C casts")
 		return TAny
@@ -709,8 +720,26 @@ func (k *checker) infer(e Expression) Type {
 		k.block(e.Body)
 		return TAny
 	case *NamespacedIdentExpr:
-		k.unsupported("C constants")
-		return TAny
+		lib := k.cimps[e.Namespace]
+		if lib == nil {
+			k.unsupported("module constants")
+			return TAny
+		}
+		v, ok := lib.consts[e.Name]
+		if !ok {
+			msg := fmt.Sprintf("%s has no constant '%s'", e.Namespace, e.Name)
+			names := map[string]int{}
+			for n := range lib.consts {
+				names[n] = 1
+			}
+			if s := findSimilarIdentifiers(e.Name, names, 1); len(s) > 0 {
+				msg += "; did you mean '" + s[0] + "'?"
+			}
+			k.errorf(e.Pos, "%s", msg)
+			return TNum
+		}
+		k.c.CConsts[e] = v
+		return TNum
 	case *VectorExpr:
 		k.unsupported("SIMD vectors")
 		k.exprs(e.Components)
@@ -731,6 +760,10 @@ func (k *checker) infer(e Expression) Type {
 func (k *checker) binary(e *BinaryExpr) Type {
 	l, r := k.expr(e.Left), k.expr(e.Right)
 	switch op := e.Operator; {
+	case l == TPtr && (op == "+" || op == "-") && (r == TNum || r == TAny):
+		return TPtr
+	case l == TPtr && r == TPtr && op == "-":
+		return TNum
 	case op == "+":
 		switch {
 		case l == TAny || r == TAny:
@@ -778,10 +811,8 @@ func (k *checker) binary(e *BinaryExpr) Type {
 func (k *checker) call(e *CallExpr) Type {
 	name := e.Function
 	if recv, method, ok := strings.Cut(name, "."); ok {
-		if k.cimps[recv] && k.lookup(recv) == nil {
-			k.unsupported("C calls")
-			k.exprs(e.Args)
-			return TAny
+		if lib := k.cimps[recv]; lib != nil && k.lookup(recv) == nil {
+			return k.cCall(e, lib, method)
 		}
 		if sym := k.lookup(recv); sym != nil {
 			// x.f(args) calls f(x, args).
@@ -794,9 +825,7 @@ func (k *checker) call(e *CallExpr) Type {
 		return TAny
 	}
 	if e.IsCFFI {
-		k.unsupported("C calls")
-		k.exprs(e.Args)
-		return TAny
+		return k.cCall(e, libcLib, name)
 	}
 	k.exprs(e.Args)
 	if sym := k.lookup(name); sym != nil {
@@ -840,6 +869,30 @@ func (k *checker) call(e *CallExpr) Type {
 		return TNum
 	}
 	return TAny
+}
+
+// cCall checks a call of a C function.
+func (k *checker) cCall(e *CallExpr, lib *cLib, name string) Type {
+	k.exprs(e.Args)
+	f := lib.function(name)
+	k.c.CCalls[e] = f
+	if !f.known {
+		return TAny
+	}
+	if len(e.Args) < f.fixed || !f.variadic && len(e.Args) > f.fixed {
+		want := plural(f.fixed, "argument")
+		if f.variadic {
+			want = "at least " + want
+		}
+		k.errorf(e.Pos, "C function '%s' takes %s, but %d %s given", name, want, len(e.Args), wasWere(len(e.Args)))
+	}
+	switch f.ret {
+	case cPtr, cCstr:
+		return TPtr
+	case cDyn:
+		return TAny
+	}
+	return TNum
 }
 
 func plural(n int, word string) string {

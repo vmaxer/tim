@@ -96,7 +96,7 @@ func TestCheckRecordsUnsupported(t *testing.T) {
 	if err != "" {
 		t.Fatal(err)
 	}
-	if got := strings.Join(c.Unsupported, ","); got != "C calls,C imports,cstruct" {
+	if got := strings.Join(c.Unsupported, ","); got != "cstruct" {
 		t.Errorf("unsupported = %s", got)
 	}
 }

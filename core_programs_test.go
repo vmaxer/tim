@@ -63,6 +63,10 @@ func TestCorePrograms(t *testing.T) {
 				}
 				cmd.Dir = dir
 				cmd.Env = append(os.Environ(), "TIM_TEST=yes")
+				if tg.qemu != "" {
+					// the C library, for programs that call C
+					cmd.Env = append(cmd.Env, "QEMU_LD_PREFIX=/usr/"+map[Arch]string{ArchARM64: "aarch64", ArchRiscv64: "riscv64"}[tg.p.Arch]+"-linux-gnu")
+				}
 				if in, err := os.ReadFile(strings.TrimSuffix(src, ".tim") + ".in"); err == nil {
 					cmd.Stdin = bytes.NewReader(in)
 				}

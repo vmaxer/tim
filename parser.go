@@ -1234,7 +1234,7 @@ func (p *Parser) member(obj Expression) Expression {
 				}
 				return &CallExpr{Pos: id.Pos, Function: id.Name + "." + field, Args: args}
 			}
-			return &NamespacedIdentExpr{Namespace: id.Name, Name: field}
+			return &NamespacedIdentExpr{Pos: at, Namespace: id.Name, Name: field}
 		}
 	}
 	if p.at(TOKEN_LPAREN) {

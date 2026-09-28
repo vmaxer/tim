@@ -20,13 +20,49 @@ const (
 
 func machoTextSize(codeLen int) int { return alignUp(machoCodeOff+codeLen, machoPage) }
 
-// machoImportsAt places the global offset table at the start of __DATA.
-func machoImportsAt(codeLen int) int { return machoTextSize(codeLen) - machoCodeOff }
+type machoImport struct {
+	name    string
+	ordinal uint32 // 1 is libSystem, then the program's dylibs in order
+}
+
+// machoImports lists the runtime's imports, then the program's C functions,
+// and the dylibs after libSystem.
+func machoImports(cimps []cImport) ([]machoImport, []string) {
+	var imps []machoImport
+	for _, n := range machoImportList {
+		imps = append(imps, machoImport{n, 1})
+	}
+	var dylibs []string
+	ord := map[string]uint32{}
+	for _, ci := range cimps {
+		o := uint32(1)
+		if ci.lib != libcLib {
+			d := ci.lib.linkName(OSDarwin)[0]
+			if ord[d] == 0 {
+				dylibs = append(dylibs, d)
+				ord[d] = uint32(1 + len(dylibs))
+			}
+			o = ord[d]
+		}
+		imps = append(imps, machoImport{"_" + ci.name, o})
+	}
+	return imps, dylibs
+}
+
+// machoLayout places the global offset table at the start of __DATA.
+func machoLayout(codeLen int, cimps []cImport) (int, []int) {
+	got := machoTextSize(codeLen) - machoCodeOff
+	entries := make([]int, len(cimps))
+	for i := range cimps {
+		entries[i] = got + 8*(len(machoImportList)+i)
+	}
+	return got, entries
+}
 
 // machoFixups builds the chained fixups that bind every __got entry.
-func machoFixups(dataSegOff int) []byte {
+func machoFixups(dataSegOff int, imps []machoImport) []byte {
 	le := binary.LittleEndian
-	n := len(machoImportList)
+	n := len(imps)
 	const startsOff, segInfo = 32, 24
 	importsOff := startsOff + segInfo + 24
 	symbolsOff := importsOff + 4*n
@@ -46,9 +82,9 @@ func machoFixups(dataSegOff int) []byte {
 	le.PutUint64(seg[8:], uint64(dataSegOff))
 	le.PutUint16(seg[20:], 1) // one page, whose chain starts at offset 0
 	b = append(b, 0)
-	for i, name := range machoImportList {
-		le.PutUint32(b[importsOff+4*i:], 1|uint32(len(b)-symbolsOff)<<9) // libSystem, name offset
-		b = append(b, name...)
+	for i, imp := range imps {
+		le.PutUint32(b[importsOff+4*i:], imp.ordinal|uint32(len(b)-symbolsOff)<<9) // dylib, name offset
+		b = append(b, imp.name...)
 		b = append(b, 0)
 	}
 	for len(b)%8 != 0 {
@@ -58,24 +94,28 @@ func machoFixups(dataSegOff int) []byte {
 }
 
 // writeCoreMachO writes a signed macOS arm64 executable.
-func writeCoreMachO(path string, arch Arch, code []byte, entry int) error {
+func writeCoreMachO(path string, arch Arch, code []byte, entry int, cimps []cImport) error {
 	if arch != ArchARM64 {
 		return fmt.Errorf("no core Mach-O support for %s", arch)
 	}
 	le := binary.LittleEndian
 	textSize := machoTextSize(len(code))
-	dataOff, dataSize := textSize, machoPage
+	imps, dylibs := machoImports(cimps)
+	dataOff, dataSize := textSize, alignUp(8*len(imps), machoPage)
+	if dataSize > machoPage {
+		return fmt.Errorf("too many C imports")
+	}
 	linkOff := dataOff + dataSize
 
-	got := make([]byte, 8*len(machoImportList))
-	for i := range machoImportList {
+	got := make([]byte, 8*len(imps))
+	for i := range imps {
 		v := uint64(i) | 1<<63
-		if i < len(machoImportList)-1 {
+		if i < len(imps)-1 {
 			v |= 2 << 51 // the next entry is 8 bytes on
 		}
 		le.PutUint64(got[8*i:], v)
 	}
-	fixups := machoFixups(dataOff)
+	fixups := machoFixups(dataOff, imps)
 	trie := []byte{0, 0, 0, 0, 0, 0, 0, 0}
 	strtab := []byte{' ', 0, 0, 0, 0, 0, 0, 0}
 	fixupsOff := linkOff
@@ -190,6 +230,13 @@ func writeCoreMachO(path string, arch Arch, code []byte, entry int) error {
 		le.PutUint32(b[16:], 0x05276403)
 		le.PutUint32(b[20:], 0x00010000)
 	}))
+	for _, d := range dylibs {
+		cmd(withName(0xC, 24, d, func(b []byte) {
+			le.PutUint32(b[12:], 2)
+			le.PutUint32(b[16:], 0x00010000)
+			le.PutUint32(b[20:], 0x00010000)
+		}))
+	}
 	cmd(linkedit(0x1D, sigOff, sigSize)) // LC_CODE_SIGNATURE
 
 	if 32+len(cmds) > machoCodeOff {

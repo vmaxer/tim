@@ -1,4 +1,5 @@
 // macOS start code: libSystem through the global offset table.
+#define RT_DARWIN
 #include "rt.c"
 
 // The order of the global offset table written by the compiler (core_macho.go).

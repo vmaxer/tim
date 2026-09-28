@@ -46,7 +46,7 @@ typedef unsigned char u8;
 #define ERR_PRS CODE('p', 'r', 's')
 #define ERR_UDF CODE('u', 'd', 'f')
 
-enum { K_RAW = 1, K_BIG, K_RAT, K_STR, K_LIST, K_MAP, K_FN, K_CELL, K_ARR, K_ERR };
+enum { K_RAW = 1, K_BIG, K_RAT, K_STR, K_LIST, K_MAP, K_FN, K_CELL, K_ARR, K_ERR, K_STRUCT };
 
 enum {
 	OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
@@ -91,6 +91,7 @@ typedef struct {
 	u64 *stack_top;
 	u64 *globals, nglobals;
 	u64 *marks, nmarks, capmarks;
+	u64 c_flush; // C's fflush, when the program uses the C library
 	u64 argc;
 	char **argv, **envp;
 	u64 outn, inpos, inlen;
@@ -1671,6 +1672,10 @@ static int val_eq(R *r, u64 a, u64 b) {
 	return 0;
 }
 
+// A NULL pointer from C is the number 0, so p == 0 tests for NULL.
+static u64 ptr_val(u64 addr) { return addr ? box(TAG_PTR, (void *)addr) : 0; }
+static u64 ptr_addr(u64 v) { return tag_of(v) == TAG_PTR ? v & PTR_MASK : 0; }
+
 // val_cmp orders numbers, strings and lists; *ok is cleared for other types.
 static int val_cmp(R *r, u64 a, u64 b, int *ok) {
 	if (is_num(a) && is_num(b)) {
@@ -1814,7 +1819,10 @@ static u64 utf8_encode(u8 *out, u64 cp);
 
 // Output
 
+static void c_flush(R *r);
+
 static void out_flush(R *r) {
+	c_flush(r); // what C printed came first
 	u64 off = 0;
 	while (off < r->outn) {
 		i64 n = r->os->write(r->os, 1, r->out + off, r->outn - off);
@@ -1828,6 +1836,7 @@ static void out_flush(R *r) {
 static void out_write(R *r, u64 fd, const u8 *s, u64 n) {
 	if (fd != 1) {
 		out_flush(r);
+		c_flush(r);
 		while (n) {
 			i64 k = r->os->write(r->os, (i64)fd, s, n);
 			if (k <= 0)
@@ -1942,6 +1951,12 @@ u64 rt_binop(R *r, u64 op, u64 a, u64 b) {
 	if (is_err(b))
 		return b;
 	u64 ta = tag_of(a), tb = tag_of(b);
+	if (ta == TAG_PTR && is_num(b) && (op == OP_ADD || op == OP_SUB)) {
+		i64 d = to_i64(r, b);
+		return ptr_val(ptr_addr(a) + (u64)(op == OP_ADD ? d : -d));
+	}
+	if (ta == TAG_PTR && tb == TAG_PTR && op == OP_SUB)
+		return from_i64(r, (i64)(ptr_addr(a) - ptr_addr(b)));
 	if (is_num(a) && is_num(b)) {
 		if (op >= OP_BOR)
 			return bitwise(r, op, a, b);
@@ -3094,6 +3109,7 @@ static void mark_addr(R *r, u64 a) {
 static void mark_val(R *r, u64 v) {
 	switch (tag_of(v)) {
 	case TAG_BIG: case TAG_RAT: case TAG_STR: case TAG_LIST: case TAG_MAP: case TAG_FN: case TAG_CELL: case TAG_ERRMSG:
+	case TAG_PTR: // cstructs made by Tim live on the heap; other pointers fail the heap check
 		mark_addr(r, v & PTR_MASK);
 	}
 }
@@ -3126,6 +3142,10 @@ static void trace(R *r, u64 *p) {
 		break;
 	case K_CELL:
 		mark_val(r, p[1]);
+		break;
+	case K_STRUCT: // C data: any word may point at Tim memory, such as a string in a cstr field
+		for (u64 i = 1; i < w; i++)
+			mark_word(r, p[i]);
 		break;
 	}
 }
@@ -3188,3 +3208,292 @@ u64 rt_gc(R *r) {
 
 // rt_bound converts a range bound to a plain double for a counting loop.
 u64 rt_bound(R *r, u64 v) { return is_num(v) ? num(to_double(r, v)) : num(0); }
+
+// C interop. Kinds describe C types, shared with the compiler (core_ffi.go).
+enum { C_DYN, C_I8, C_U8, C_I16, C_U16, C_I32, C_U32, C_I64, C_U64, C_F32, C_F64, C_PTR, C_CSTR, C_VOID };
+
+static int c_float(u64 kind) { return kind == C_F32 || kind == C_F64; }
+
+static int is_integer(u64 v) { return is_small(v) || tag_of(v) == TAG_BIG; }
+
+// to_c converts a Tim value to the bits of a C value of the given kind.
+static u64 to_c(R *r, u64 v, u64 kind) {
+	switch (kind) {
+	case C_F32: {
+		float f = (float)to_double(r, is_num(v) ? v : 0);
+		u32 u;
+		__builtin_memcpy(&u, &f, 4);
+		return u;
+	}
+	case C_F64:
+		return bits_of(to_double(r, is_num(v) ? v : 0));
+	}
+	switch (tag_of(v)) {
+	case TAG_PTR:
+		return ptr_addr(v);
+	case TAG_STR:
+		return (u64)str_data(v);
+	}
+	if (!is_num(v))
+		return 0;
+	if (kind == C_DYN && !is_integer(v))
+		return bits_of(to_double(r, v));
+	return (u64)to_i64(r, v);
+}
+
+// from_c converts the bits of a C result to a Tim value.
+static u64 from_c(R *r, u64 x, u64 kind) {
+	switch (kind) {
+	case C_I8: return num((double)(signed char)x);
+	case C_U8: return num((double)(u8)x);
+	case C_I16: return num((double)(short)x);
+	case C_U16: return num((double)(unsigned short)x);
+	case C_I32: return num((double)(int)x);
+	case C_U32: return num((double)(u32)x);
+	case C_U64:
+		if (x >> 63)
+			return rt_binop(r, OP_ADD, from_i64(r, (i64)(x >> 1)), from_i64(r, (i64)(x - (x >> 1))));
+		return from_i64(r, (i64)x);
+	case C_F32: {
+		float f;
+		u32 u = (u32)x;
+		__builtin_memcpy(&f, &u, 4);
+		return num(f);
+	}
+	case C_F64: return x;
+	case C_PTR: case C_CSTR: return ptr_val(x);
+	case C_VOID: return 0;
+	}
+	return from_i64(r, (i64)x);
+}
+
+#define FFI_REGS 8
+#define FFI_STACK 16
+
+typedef struct {
+	u64 gp[FFI_REGS], fp[FFI_REGS], stack[FFI_STACK];
+	u64 ngp, nfp, nstack, mask; // mask: which of the first four positions hold floats (Windows x64)
+} Frame;
+
+static void push_stack(Frame *f, u64 x) {
+	if (f->nstack < FFI_STACK)
+		f->stack[f->nstack++] = x;
+}
+
+// place puts argument i, whose bits are x, where the platform's C calling
+// convention expects it.
+static void place(Frame *f, u64 i, u64 x, int is_float, int variadic) {
+#if defined(RT_WINDOWS) && defined(__x86_64__)
+	// four positional registers, integer or float, then the stack
+	if (i < 4) {
+		f->gp[i] = x;
+		f->fp[i] = x;
+		if (is_float && !variadic) // va_arg reads variadic doubles from integer registers
+			f->mask |= 1ull << i;
+		return;
+	}
+	push_stack(f, x);
+#else
+	(void)i;
+	(void)variadic;
+#if defined(RT_DARWIN)
+	if (variadic) { // Apple arm64 passes variadic arguments on the stack
+		push_stack(f, x);
+		return;
+	}
+#endif
+#if defined(__x86_64__)
+	const u64 ngp = 6;
+#else
+	const u64 ngp = 8;
+#endif
+#if defined(RT_WINDOWS) || defined(__riscv)
+	if (variadic) // variadic floating point goes in integer registers
+		is_float = 0;
+#endif
+	if (is_float && f->nfp < FFI_REGS) {
+		f->fp[f->nfp++] = x;
+		return;
+	}
+#if !defined(__riscv)
+	if (is_float) {
+		push_stack(f, x);
+		return;
+	}
+#endif
+	// RISC-V passes floats in integer registers once float registers run out
+	if (f->ngp < ngp)
+		f->gp[f->ngp++] = x;
+	else
+		push_stack(f, x);
+#endif
+}
+
+#define S16(s) s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7], s[8], s[9], s[10], s[11], s[12], s[13], s[14], s[15]
+#define U16T u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64, u64
+
+#if defined(RT_WINDOWS) && defined(__x86_64__)
+#define MS __attribute__((ms_abi))
+// Each of the first four positions is an integer or a double: sixteen shapes.
+#define WIN_CALL(T0, T1, T2, T3, a0, a1, a2, a3)                                                          \
+	return retf ? bits_of(((double(MS *)(T0, T1, T2, T3, U16T))fn)(a0, a1, a2, a3, S16(f->stack))) \
+		    : ((u64(MS *)(T0, T1, T2, T3, U16T))fn)(a0, a1, a2, a3, S16(f->stack))
+static u64 call_c(u64 fn, Frame *f, int retf) {
+	double d0 = double_of(f->fp[0]), d1 = double_of(f->fp[1]), d2 = double_of(f->fp[2]), d3 = double_of(f->fp[3]);
+	u64 i0 = f->gp[0], i1 = f->gp[1], i2 = f->gp[2], i3 = f->gp[3];
+	switch (f->mask & 15) {
+	case 0: WIN_CALL(u64, u64, u64, u64, i0, i1, i2, i3);
+	case 1: WIN_CALL(double, u64, u64, u64, d0, i1, i2, i3);
+	case 2: WIN_CALL(u64, double, u64, u64, i0, d1, i2, i3);
+	case 3: WIN_CALL(double, double, u64, u64, d0, d1, i2, i3);
+	case 4: WIN_CALL(u64, u64, double, u64, i0, i1, d2, i3);
+	case 5: WIN_CALL(double, u64, double, u64, d0, i1, d2, i3);
+	case 6: WIN_CALL(u64, double, double, u64, i0, d1, d2, i3);
+	case 7: WIN_CALL(double, double, double, u64, d0, d1, d2, i3);
+	case 8: WIN_CALL(u64, u64, u64, double, i0, i1, i2, d3);
+	case 9: WIN_CALL(double, u64, u64, double, d0, i1, i2, d3);
+	case 10: WIN_CALL(u64, double, u64, double, i0, d1, i2, d3);
+	case 11: WIN_CALL(double, double, u64, double, d0, d1, i2, d3);
+	case 12: WIN_CALL(u64, u64, double, double, i0, i1, d2, d3);
+	case 13: WIN_CALL(double, u64, double, double, d0, i1, d2, d3);
+	case 14: WIN_CALL(u64, double, double, double, i0, d1, d2, d3);
+	default: WIN_CALL(double, double, double, double, d0, d1, d2, d3);
+	}
+}
+#else
+// Integer registers, float registers, then stack slots: declaring the callee
+// with that many parameters makes the compiler lay out any C call.
+#if defined(__x86_64__)
+#define GP u64, u64, u64, u64, u64, u64
+#define GPA(f) f->gp[0], f->gp[1], f->gp[2], f->gp[3], f->gp[4], f->gp[5]
+#define VA , ... // a variadic prototype sets al, the count of vector registers
+#else
+#define GP u64, u64, u64, u64, u64, u64, u64, u64
+#define GPA(f) f->gp[0], f->gp[1], f->gp[2], f->gp[3], f->gp[4], f->gp[5], f->gp[6], f->gp[7]
+#define VA
+#endif
+#define FP double, double, double, double, double, double, double, double
+#define FPA(f)                                                                                      \
+	double_of(f->fp[0]), double_of(f->fp[1]), double_of(f->fp[2]), double_of(f->fp[3]), double_of(f->fp[4]), \
+		double_of(f->fp[5]), double_of(f->fp[6]), double_of(f->fp[7])
+static u64 call_c(u64 fn, Frame *f, int retf) {
+	if (retf == 2) {
+		float x = ((float (*)(GP, FP, U16T VA))fn)(GPA(f), FPA(f), S16(f->stack));
+		u32 u;
+		__builtin_memcpy(&u, &x, 4);
+		return u;
+	}
+	if (retf)
+		return bits_of(((double (*)(GP, FP, U16T VA))fn)(GPA(f), FPA(f), S16(f->stack)));
+	return ((u64(*)(GP, FP, U16T VA))fn)(GPA(f), FPA(f), S16(f->stack));
+}
+#endif
+
+// rt_ffi calls the C function at fn with args of the given kinds. packed holds
+// the argument count, the count of declared parameters (the rest are variadic,
+// with default promotions) and the result kind, a byte each.
+u64 rt_ffi(R *r, u64 fn, const u64 *args, const u8 *kinds, u64 packed) {
+	u64 n = packed & 0xFF, nfixed = packed >> 8 & 0xFF, ret = packed >> 16 & 0xFF;
+	if (!fn)
+		return errorf(r, "C function not found");
+	Frame f;
+	memset(&f, 0, sizeof f);
+	for (u64 i = 0; i < n; i++) {
+		int variadic = i >= nfixed;
+		u64 kind = variadic ? C_DYN : kinds[i];
+		u64 x = to_c(r, args[i], kind);
+		int fl = c_float(kind) || (kind == C_DYN && is_num(args[i]) && !is_integer(args[i]));
+		place(&f, i, x, fl, variadic);
+	}
+	out_flush(r); // C may print too
+	int retf = ret == C_F64 ? 1 : ret == C_F32 ? 2 : 0;
+#if defined(RT_WINDOWS) && defined(__x86_64__)
+	if (retf == 2) { // a float comes back in the low half of xmm0
+		u64 b = call_c(fn, &f, 1);
+		return from_c(r, b, C_F32);
+	}
+#endif
+	return from_c(r, call_c(fn, &f, retf), ret);
+}
+
+// Memory through ptr values.
+
+static u8 *mem_addr(R *r, u64 p, u64 off, u64 *err) {
+	u64 a = ptr_addr(p);
+	if (!a) {
+		*err = tag_of(p) == TAG_PTR || p == 0 ? errorf(r, "null pointer") : type_error(r, "access memory through", p, 0);
+		return 0;
+	}
+	return (u8 *)(a + (u64)to_i64(r, off));
+}
+
+u64 rt_mem_read(R *r, u64 p, u64 off, u64 kind) {
+	u64 err;
+	u8 *a = mem_addr(r, p, off, &err);
+	if (!a)
+		return err;
+	u64 x = 0;
+	switch (kind) {
+	case C_I8: case C_U8: x = *a; break;
+	case C_I16: case C_U16: __builtin_memcpy(&x, a, 2); break;
+	case C_I32: case C_U32: case C_F32: __builtin_memcpy(&x, a, 4); break;
+	case C_CSTR:
+		__builtin_memcpy(&x, a, 8);
+		return x ? cstr(r, (const char *)x) : str_new(r, "", 0);
+	default: __builtin_memcpy(&x, a, 8);
+	}
+	return from_c(r, x, kind);
+}
+
+u64 rt_mem_write(R *r, u64 p, u64 off, u64 kind, u64 v) {
+	u64 err;
+	u8 *a = mem_addr(r, p, off, &err);
+	if (!a)
+		return err;
+	u64 x = to_c(r, v, kind == C_CSTR ? C_PTR : kind);
+	switch (kind) {
+	case C_I8: case C_U8: *a = (u8)x; break;
+	case C_I16: case C_U16: __builtin_memcpy(a, &x, 2); break;
+	case C_I32: case C_U32: case C_F32: __builtin_memcpy(a, &x, 4); break;
+	default: __builtin_memcpy(a, &x, 8);
+	}
+	return v;
+}
+
+// rt_struct allocates n zeroed bytes of C data on the heap.
+u64 rt_struct(R *r, u64 n) {
+	u64 *p = alloc_obj(r, K_STRUCT, 1 + (n + 7) / 8);
+	memset(p + 1, 0, (n + 7) / 8 * 8);
+	return box(TAG_PTR, p + 1);
+}
+
+// rt_ptr is v as ptr: an address from a number, the bytes of a string.
+u64 rt_ptr(R *r, u64 v) {
+	switch (tag_of(v)) {
+	case TAG_PTR: return v;
+	case TAG_STR: return ptr_val((u64)str_data(v));
+	}
+	return is_num(v) ? ptr_val((u64)to_i64(r, v)) : type_error(r, "make a ptr from", v, 0);
+}
+
+u64 rt_cstr(R *r, u64 p) {
+	if (tag_of(p) == TAG_STR)
+		return p;
+	u64 a = ptr_addr(p);
+	return a ? cstr(r, (const char *)a) : str_new(r, "", 0);
+}
+
+static void c_flush(R *r) {
+	if (r->c_flush)
+#if defined(RT_WINDOWS) && defined(__x86_64__)
+		((int(__attribute__((ms_abi)) *)(void *))r->c_flush)(0);
+#else
+		((int (*)(void *))r->c_flush)(0);
+#endif
+}
+
+// rt_c_flush registers C's fflush, so C and Tim output stay in order.
+u64 rt_c_flush(R *r, u64 fflush) {
+	r->c_flush = fflush;
+	return 0;
+}

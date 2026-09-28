@@ -87,8 +87,10 @@ type coreGen struct {
 	hoisted  map[Statement]bool
 	wrappers map[string]*Var // builtins used as values, cached in globals
 	nglobals int
-	argBase  int
 	f        *frame
+
+	cImports      []cImport // C functions the program calls, in order
+	cImportLabels map[cImport]label
 }
 
 // coreTarget describes where generated code will run.
@@ -96,14 +98,15 @@ type coreTarget struct {
 	os   OS
 	blob []byte
 	syms map[string]int
-	// importsAt returns where the loader's import table will be, as an
-	// offset from the start of the code, given the code's length.
-	importsAt func(codeLen int) int
+	// layout returns where the loader's import tables will be, as offsets
+	// from the start of the code: the runtime's own imports, if any, and an
+	// entry for each C function.
+	layout func(codeLen int, cimps []cImport) (osTable int, cEntries []int)
 }
 
 // compileCore generates the whole program and returns the code, starting
-// with the entry point.
-func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, err error) {
+// with the entry point, and the C functions it imports.
+func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, cimps []cImport, err error) {
 	blob, syms := t.blob, t.syms
 	defer func() {
 		if r := recover(); r != nil {
@@ -115,7 +118,8 @@ func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, err e
 		}
 	}()
 	g := &coreGen{c: c, a: a, syms: syms, blob: a.newLabel(), fnLabels: map[*Fun]label{},
-		strs: map[string]label{}, hoisted: map[Statement]bool{}, wrappers: map[string]*Var{}, nglobals: len(c.Globals)}
+		strs: map[string]label{}, hoisted: map[Statement]bool{}, wrappers: map[string]*Var{}, nglobals: len(c.Globals),
+		cImportLabels: map[cImport]label{}}
 	main, imports := a.newLabel(), a.newLabel()
 	entry = a.pos()
 	a.start(main, g.blob, g.sym("rt_start"), imports, t.os)
@@ -133,15 +137,15 @@ func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, err e
 	for i := 0; i < len(g.consts); i++ {
 		g.consts[i]()
 	}
-	if t.importsAt != nil {
-		a.bindAt(imports, t.importsAt(a.pos()))
-	} else {
-		a.bindAt(imports, 0)
+	osTable, entries := t.layout(a.pos(), g.cImports)
+	a.bindAt(imports, osTable)
+	for i, ci := range g.cImports {
+		a.bindAt(g.cImportLabels[ci], entries[i])
 	}
 	if err := a.resolve(); err != nil {
-		return nil, 0, err
+		return nil, 0, nil, err
 	}
-	return a.code(), entry, nil
+	return a.code(), entry, g.cImports, nil
 }
 
 func (g *coreGen) sym(name string) int {
@@ -182,9 +186,10 @@ func (g *coreGen) frameSize() int {
 // argument register on some machines) is read before it is overwritten.
 
 type operand struct {
-	kind uint8 // 0 rA, 1 slot, 2 immediate, 3 slot address, 4 runtime
+	kind uint8 // 0 rA, 1 slot, 2 immediate, 3 slot address, 4 runtime, 5 label address
 	off  int32
 	v    uint64
+	l    label
 }
 
 func inA() operand             { return operand{kind: 0} }
@@ -192,6 +197,7 @@ func slot(off int32) operand   { return operand{kind: 1, off: off} }
 func immv(v uint64) operand    { return operand{kind: 2, v: v} }
 func slotAt(off int32) operand { return operand{kind: 3, off: off} }
 func rt() operand              { return operand{kind: 4} }
+func labelAt(l label) operand  { return operand{kind: 5, l: l} }
 
 func (g *coreGen) callRT(name string, args ...operand) {
 	for i := len(args) - 1; i >= 0; i-- {
@@ -207,6 +213,8 @@ func (g *coreGen) callRT(name string, args ...operand) {
 			g.a.addImm(r, rFP, o.off)
 		case 4:
 			g.a.mov(r, rRT)
+		case 5:
+			g.a.addr(r, o.l)
 		}
 	}
 	g.a.callOff(g.blob, g.sym(name))
@@ -239,6 +247,14 @@ func (g *coreGen) genTop() {
 	g.callRT("rt_globals", rt(), slot(countSlot))
 	g.free(1)
 	g.a.mov(rGlob, rA)
+	for _, f := range g.c.CCalls {
+		if f.lib == libcLib {
+			g.a.addr(rA, g.cImport(libcLib, "fflush"))
+			g.a.load(rA, rA, 0)
+			g.callRT("rt_c_flush", rt(), inA())
+			break
+		}
+	}
 	g.initDefers()
 
 	stmts := g.c.Program.Statements
@@ -784,12 +800,12 @@ func (g *coreGen) expr(e Expression, tail bool) {
 	case *InExpr:
 		g.rtCall("rt_in", e.Value, e.Container)
 	case *RangeExpr:
-		g.args(e.Start, e.End)
+		s := g.args(e.Start, e.End)
 		inc := uint64(0)
 		if e.Inclusive {
 			inc = 1
 		}
-		g.callRT("rt_range", rt(), slot(g.argSlot(0)), inA(), immv(inc))
+		g.callRT("rt_range", rt(), slot(s[0]), inA(), immv(inc))
 		g.free(1)
 	case *CastExpr:
 		g.cast(e)
@@ -804,8 +820,8 @@ func (g *coreGen) expr(e Expression, tail bool) {
 		if end != nil {
 			flags |= 2
 		}
-		g.args(e.List, start, end)
-		g.callRT("rt_slice", rt(), slot(g.argSlot(0)), slot(g.argSlot(1)), inA(), immv(flags))
+		s := g.args(e.List, start, end)
+		g.callRT("rt_slice", rt(), slot(s[0]), slot(s[1]), inA(), immv(flags))
 		g.free(2)
 	case *FieldAccessExpr:
 		g.expr(e.Object, false)
@@ -849,25 +865,32 @@ func (g *coreGen) expr(e Expression, tail bool) {
 		g.rtCall("rt_len", e.Operand)
 	case *RandomExpr:
 		g.callRT("rt_random", rt())
+	case *NamespacedIdentExpr:
+		v := g.c.CConsts[e]
+		n := &NumberExpr{Value: float64(v)}
+		if v >= 1<<53 || v <= -1<<53 {
+			n.Exact = new(big.Rat).SetInt64(v)
+		}
+		g.number(n)
 	default:
 		unsupportedf("expression %T", e)
 	}
 }
 
-// args evaluates expressions into temporaries, leaving the last one in rA;
-// argSlot(i) is where the i-th was saved. The caller frees len-1 slots.
-func (g *coreGen) args(es ...Expression) {
-	g.argBase = g.f.temps
+// args evaluates expressions into temporaries, leaving the last one in rA,
+// and returns where the others were saved. The caller frees len-1 slots.
+func (g *coreGen) args(es ...Expression) []int32 {
+	var slots []int32
 	for i, e := range es {
 		g.expr(e, false)
 		if i < len(es)-1 {
 			t := g.tmp()
 			g.a.store(rA, rFP, t)
+			slots = append(slots, t)
 		}
 	}
+	return slots
 }
-
-func (g *coreGen) argSlot(i int) int32 { return slotOff(g.f.fixed + g.argBase + i) }
 
 // rtCall calls a runtime function with the runtime and the values of es.
 func (g *coreGen) rtCall(name string, es ...Expression) {
@@ -997,9 +1020,55 @@ func (g *coreGen) cast(e *CastExpr) {
 		g.boolValue(e.Expr)
 	case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64":
 		g.rtCall("rt_trunc", e.Expr)
+	case "ptr", "pointer":
+		g.rtCall("rt_ptr", e.Expr)
+	case "cstr":
+		g.rtCall("rt_cstr", e.Expr)
 	default:
 		unsupportedf("cast to %s", e.Type)
 	}
+}
+
+// cCall calls a C function through rt_ffi, which converts the arguments by
+// their C types and follows the platform's calling convention.
+func (g *coreGen) cCall(f *cFunc, args []Expression) {
+	fn := g.tmp()
+	g.a.addr(rA, g.cImport(f.lib, f.name))
+	g.a.load(rA, rA, 0)
+	g.a.store(rA, rFP, fn)
+	kinds := g.bytesConst(f.params)
+	fixed := len(args)
+	if f.known {
+		fixed = f.fixed
+	}
+	packed := uint64(len(args)) | uint64(fixed)<<8 | uint64(f.ret)<<16
+	g.array(args, func(base int32, n int) {
+		g.callRT("rt_ffi", rt(), slot(fn), slotAt(base), labelAt(kinds), immv(packed))
+	})
+	g.free(1)
+}
+
+// cImport returns the label of the import table entry for a C function.
+func (g *coreGen) cImport(lib *cLib, name string) label {
+	key := cImport{lib, name}
+	if l, ok := g.cImportLabels[key]; ok {
+		return l
+	}
+	l := g.a.newLabel()
+	g.cImportLabels[key] = l
+	g.cImports = append(g.cImports, key)
+	return l
+}
+
+func (g *coreGen) bytesConst(b []uint8) label {
+	l := g.a.newLabel()
+	data := append([]byte{}, b...)
+	g.consts = append(g.consts, func() {
+		g.a.bind(l)
+		g.a.emit(append(data, 0))
+		g.a.align(8)
+	})
+	return l
 }
 
 func (g *coreGen) unary(e *UnaryExpr) {
@@ -1219,6 +1288,10 @@ func (g *coreGen) closure(f *Fun) {
 }
 
 func (g *coreGen) call(e *CallExpr, tail bool) {
+	if f := g.c.CCalls[e]; f != nil {
+		g.cCall(f, e.Args)
+		return
+	}
 	if v := g.c.Callees[e]; v != nil {
 		g.callVar(v, e.Args, tail)
 		return
@@ -1345,6 +1418,20 @@ func (g *coreGen) builtinCall(name string, args []Expression) {
 		}
 	case "_error_code_extract":
 		name = "errtext"
+	case "read_i8", "read_u8", "read_i16", "read_u16", "read_i32", "read_u32", "read_i64", "read_u64",
+		"read_f32", "read_f64", "read_ptr":
+		kind := memKinds[strings.TrimPrefix(name, "read_")]
+		s := g.args(args[0], args[1])
+		g.callRT("rt_mem_read", rt(), slot(s[0]), inA(), immv(uint64(kind)))
+		g.free(1)
+		return
+	case "write_i8", "write_u8", "write_i16", "write_u16", "write_i32", "write_u32", "write_i64", "write_u64",
+		"write_f32", "write_f64", "write_ptr":
+		kind := memKinds[strings.TrimPrefix(name, "write_")]
+		s := g.args(args[0], args[1], args[2])
+		g.callRT("rt_mem_write", rt(), slot(s[0]), slot(s[1]), immv(uint64(kind)), inA())
+		g.free(2)
+		return
 	case "bit", "rotl", "rotr":
 		op := map[string]uint64{"bit": opBit, "rotl": opRotl, "rotr": opRotr}[name]
 		g.expr(args[0], false)

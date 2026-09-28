@@ -413,6 +413,7 @@ func (i *IdentExpr) expressionNode() {}
 
 // NamespacedIdentExpr represents a namespaced identifier like sdl.SDL_INIT_VIDEO
 type NamespacedIdentExpr struct {
+	Pos       Pos
 	Namespace string // e.g., "sdl"
 	Name      string // e.g., "SDL_INIT_VIDEO"
 }

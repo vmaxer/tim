@@ -282,7 +282,47 @@ f"{s} has {#s} bytes"
 - **Memory.** Values live on a garbage-collected heap. `arena { ... }` runs its
   block; it is kept for programs written for manual arenas.
 
-## 6. Unsafe code
+## 6. C interop
+
+```tim
+import sdl3 as sdl                  // a C library; its headers are found with pkg-config
+import "libfoo.so" as foo           // a library by file name
+sdl.SDL_Init(sdl.SDL_INIT_VIDEO)    // functions and constants from the headers
+c.puts("hello")                     // `c`, the C library, needs no import
+```
+
+Arguments convert by their C parameter types: numbers to integers (truncated) or to
+floating point, strings to `const char *` (a Tim string ends in a NUL byte; C must not
+write to it), `ptr` values and cstructs to pointers, and `0` to `NULL`. Results
+convert back: integers and floating point to numbers, pointers to `ptr` values (`0` for
+`NULL`), `void` to `0`. When a function has no known signature, an exact integer
+passes as an integer, any other number as a `double`, and the result is an integer.
+
+A **ptr** is a C address. `p + n` is n bytes further, `p == 0` tests for `NULL`,
+`cstr(p)` copies a C string into a Tim string, and `read_u8(p, i)` ...
+`read_f64(p, i)`, `write_u8(p, i, v)` ... `write_f64(p, i, v)` access memory at
+byte offset `i`.
+
+### cstruct
+
+```tim
+cstruct Vec { x: float64, y: float64 }
+v = Vec(3, 4)                       // a new struct; fields in order, missing ones are 0
+v.x <- 6                            // fields read and write through their C types
+p = c.malloc(Vec.size) as Vec       // treat a ptr as a Vec
+Vec.len(self) = sqrt(self.x ** 2 + self.y ** 2)   // a method: v.len()
+println(v.len(), Vec.size, Vec.y.offset)          // 7.211102550927978 16 8
+```
+
+Fields are `int8` ... `uint64`, `float32`, `float64`, `ptr`, `cstr` (a `char *` read as
+a string) or another cstruct, embedded. Layout follows C unless the cstruct is
+`packed` or `aligned(n)`. A cstruct value is a pointer to its bytes, so it passes to C
+as is; constructed ones live on the garbage-collected heap. The compiler knows which
+cstruct a value is from constructors, `as`, parameter annotations `(v: Vec)`, `self`
+and functions that always return one; reading a field of a value of unknown cstruct
+type is a compile error.
+
+## 7. Unsafe code
 
 `unsafe` gives direct access to registers, memory and system calls, with one block
 per architecture:
@@ -312,7 +352,7 @@ pid = unsafe int64 {
 
 The value of `unsafe` is the return register (`rax`, `x0`, `a0`) read as `ctype`.
 
-## 7. Program execution
+## 8. Program execution
 
 Top-level statements run in order. If the program defines a function `main` and
 never calls it at top level, `main()` runs after the top level. The exit code is 0,
@@ -320,7 +360,7 @@ unless the program calls `exit(n)`, returns `ret n` at top level, or `main` give
 number, which is truncated to an integer; an error exits with 1. Deferred calls run
 when the program ends, last first, as they do when a function returns.
 
-## 8. What changed from Tim 1
+## 9. What changed from Tim 1
 
 | Tim 1                                    | Tim 2                                        |
 |------------------------------------------|----------------------------------------------|

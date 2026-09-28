@@ -6,15 +6,58 @@ import (
 	"os"
 )
 
-// Imports of a core program on Windows, in the order runtime/rt_windows.c
-// indexes them; each DLL's list ends with a null entry.
-var peImportList = []struct {
+type peDLL struct {
 	dll   string
 	funcs []string
-}{
+}
+
+// Imports of a core program on Windows, in the order runtime/rt_windows.c
+// indexes them; each DLL's list ends with a null entry.
+var peImportList = []peDLL{
 	{"kernel32.dll", []string{"GetStdHandle", "WriteFile", "ReadFile", "CreateFileA", "CloseHandle", "ExitProcess",
 		"VirtualAlloc", "GetCommandLineA", "GetEnvironmentStringsA"}},
 	{"advapi32.dll", []string{"SystemFunction036"}}, // RtlGenRandom
+}
+
+// peImports adds the program's C functions, grouped by DLL, to the runtime's
+// imports, and returns for each C function its index among all thunks.
+func peImports(cimps []cImport) ([]peDLL, []int) {
+	dlls := append([]peDLL{}, peImportList...)
+	byName := map[string]int{}
+	for _, ci := range cimps {
+		dll := ci.lib.linkName(OSWindows)[0]
+		if _, ok := byName[dll]; !ok {
+			byName[dll] = len(dlls)
+			dlls = append(dlls, peDLL{dll: dll})
+		}
+		d := &dlls[byName[dll]]
+		d.funcs = append(d.funcs, ci.name)
+	}
+	start := map[string]int{}
+	thunk := 0
+	for _, d := range dlls {
+		start[d.dll] = thunk
+		thunk += len(d.funcs) + 1
+	}
+	index := make([]int, len(cimps))
+	seen := map[string]int{}
+	for i, ci := range cimps {
+		dll := ci.lib.linkName(OSWindows)[0]
+		index[i] = start[dll] + seen[dll]
+		seen[dll]++
+	}
+	return dlls, index
+}
+
+// peLayout places the import address table at the start of the section after the code.
+func peLayout(codeLen int, cimps []cImport) (int, []int) {
+	iat := alignUp(peTextRVA+codeLen, 0x1000) - peTextRVA
+	_, index := peImports(cimps)
+	entries := make([]int, len(cimps))
+	for i, t := range index {
+		entries[i] = iat + 8*t
+	}
+	return iat, entries
 }
 
 const (
@@ -26,26 +69,22 @@ const (
 
 func alignUp(n, a int) int { return (n + a - 1) &^ (a - 1) }
 
-// peImportsAt places the import address table at the start of the section
-// after the code.
-func peImportsAt(codeLen int) int { return alignUp(peTextRVA+codeLen, 0x1000) - peTextRVA }
-
 // peIdata builds the import section for rva: the import address table, the
 // import directory, the lookup tables and the names.
-func peIdata(rva int) (data []byte, dirOff, dirSize, iatSize int) {
+func peIdata(rva int, dlls []peDLL) (data []byte, dirOff, dirSize, iatSize int) {
 	le := binary.LittleEndian
 	nThunks := 0
-	for _, d := range peImportList {
+	for _, d := range dlls {
 		nThunks += len(d.funcs) + 1
 	}
 	iatSize = 8 * nThunks
 	dirOff = iatSize
-	dirSize = 20 * (len(peImportList) + 1)
+	dirSize = 20 * (len(dlls) + 1)
 	iltOff := dirOff + dirSize
 	namesOff := iltOff + iatSize
 	data = make([]byte, namesOff)
 	thunk := 0
-	for i, d := range peImportList {
+	for i, d := range dlls {
 		dir := dirOff + 20*i
 		le.PutUint32(data[dir:], uint32(rva+iltOff+8*thunk))
 		le.PutUint32(data[dir+16:], uint32(rva+8*thunk))
@@ -73,7 +112,7 @@ func peIdata(rva int) (data []byte, dirOff, dirSize, iatSize int) {
 }
 
 // writeCorePE writes a Windows console executable.
-func writeCorePE(path string, arch Arch, code []byte, entry int) error {
+func writeCorePE(path string, arch Arch, code []byte, entry int, cimps []cImport) error {
 	var machine uint16
 	switch arch {
 	case ArchX86_64:
@@ -84,8 +123,10 @@ func writeCorePE(path string, arch Arch, code []byte, entry int) error {
 		return fmt.Errorf("no core PE support for %s", arch)
 	}
 	le := binary.LittleEndian
-	idataRVA := peTextRVA + peImportsAt(len(code))
-	idata, dirOff, dirSize, iatSize := peIdata(idataRVA)
+	iat, _ := peLayout(len(code), nil)
+	idataRVA := peTextRVA + iat
+	dlls, _ := peImports(cimps)
+	idata, dirOff, dirSize, iatSize := peIdata(idataRVA, dlls)
 	textRaw := alignUp(len(code), peFileAlgn)
 	idataRaw := alignUp(len(idata), peFileAlgn)
 	// The code is position independent, so the relocation table has one
