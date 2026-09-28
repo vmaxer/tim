@@ -49,6 +49,7 @@ Casts: `x as str`, `x as num`, `x as float64`, `x as int64` (truncates), `x as b
 | `gcd(a, b)` | the greatest common divisor of two integers |
 | `random()` | a float64 in [0, 1) |
 | `bit(x, n)`, `rotl(x, n)`, `rotr(x, n)` | bit n of x, and 64-bit rotations |
+| `popcount(x)`, `clz(x)`, `ctz(x)` | the 1 bits, leading zero bits and trailing zero bits of a 64-bit integer |
 
 ## Strings
 

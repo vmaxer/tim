@@ -67,6 +67,8 @@ double atan(double); double atan2(double, double); double pow(double, double); d
 double log2(double); double log10(double); double fabs(double); double floor(double); double ceil(double);
 double round(double); double trunc(double); double fmod(double, double); double hypot(double, double);
 double fmin(double, double); double fmax(double, double); double cbrt(double); float sqrtf(float);
+void *mmap(void *, size_t, int, int, int, long); int munmap(void *, size_t); int fork(void); int waitpid(int, void *, int);
+void _exit(int); int kill(int, int); int getppid(void); void *fopen(char *, char *); int fclose(void *);
 `
 
 var libcLib = func() *cLib {

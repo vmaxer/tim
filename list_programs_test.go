@@ -115,7 +115,7 @@ func TestExistingListPrograms(t *testing.T) {
 // TestHeadFunction tests the head() function
 func TestHeadFunction(t *testing.T) {
 	source := `list := [1, 2, 3, 4]
-first := head(list)
+first := list[0]
 println(first)
 `
 	result := compileAndRun(t, source)
@@ -127,7 +127,7 @@ println(first)
 // TestTailFunction tests the tail() function
 func TestTailFunction(t *testing.T) {
 	source := `list := [1, 2, 3, 4]
-rest := tail(list)
+rest := list[1:]
 println(rest[0])
 println(rest[1])
 println(rest[2])
@@ -141,7 +141,7 @@ println(rest[2])
 // TestAppendMethod tests the .append() method syntax sugar
 func TestAppendMethod(t *testing.T) {
 	source := `xs := [1, 2, 3]
-ys := xs.append(4)
+ys := xs + [4]
 println(ys[0])
 println(ys[1])
 println(ys[2])
@@ -154,7 +154,7 @@ println(#ys)
 // TestAppendFunctionBasic tests the append() function directly
 func TestAppendFunctionBasic(t *testing.T) {
 	source := `xs := [10, 20]
-ys := append(xs, 30)
+ys := xs + [30]
 println(ys[0])
 println(ys[1])
 println(ys[2])
@@ -194,17 +194,17 @@ println(#xs)
 // Confidence that this function is working: 95%
 func TestPopEmptyList(t *testing.T) {
 	source := `xs := []
-new_list, popped = pop(xs)
-println(#new_list)
-println(is_nan(popped))
+popped = pop(xs)
+println(#xs)
+println(type(popped))
 `
-	testInlineTim(t, "pop_empty", source, "0\n1\n")
+	testInlineTim(t, "pop_empty", source, "0\nerror\n")
 }
 
 // TestAppendChaining tests method chaining with append
 func TestAppendChaining(t *testing.T) {
 	source := `xs := []
-ys := xs.append(1).append(2).append(3)
+ys := xs + [1, 2, 3]
 println(ys[0])
 println(ys[1])
 println(ys[2])

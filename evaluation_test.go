@@ -538,15 +538,15 @@ func TestEvaluation(t *testing.T) {
 				fill(flag) = {
 					@ i in 0..<4 {
 						if flag > 0.5 {
-							write_u32(g_buf, i, 7.0)
+							write_u32(g_buf, i * 4, 7.0)
 						}
 					}
 					1.0
 				}
 				main = {
-					g_buf <- malloc(64)
+					g_buf <- c.malloc(64)
 					fill(1.0)
-					println(read_u32(g_buf, 2))
+					println(read_u32(g_buf, 8))
 				}
 			`,
 			expectedOutput: "7\n",
@@ -638,15 +638,15 @@ func TestEvaluation(t *testing.T) {
 				import libc as c
 				cstruct Buf { v: uint32 }
 				main = {
-					buf = mmap(0, 64, 3, 4097, -1, 0) or! { exitf("mmap\n") }
+					buf = c.mmap(0, 64, 3, 0x21, -1, 0) or! { exitf("mmap\n") }
 					write_u32(buf, 0, 42)
-					pid = fork()
+					pid = c.fork()
 					ischild = { | pid == 0.0 => 1.0 ~> 0.0 }
 					ischild > 0.5 {
 						write_u32(buf, 0, 1234)
-						proc_exit(0)
+						c._exit(0)
 					}
-					waitpid(pid, 0, 0)
+					c.waitpid(pid, 0, 0)
 					b = buf as Buf
 					println(b.v)
 				}

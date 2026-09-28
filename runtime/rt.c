@@ -3419,7 +3419,7 @@ u64 rt_ffi(R *r, u64 fn, const u64 *args, const u8 *kinds, u64 packed) {
 // Memory through ptr values.
 
 static u8 *mem_addr(R *r, u64 p, u64 off, u64 *err) {
-	u64 a = ptr_addr(p);
+	u64 a = is_num(p) ? (u64)to_i64(r, p) : ptr_addr(p); // an address from C as a number
 	if (!a) {
 		*err = tag_of(p) == TAG_PTR || p == 0 ? errorf(r, "null pointer") : type_error(r, "access memory through", p, 0);
 		return 0;
@@ -3474,6 +3474,39 @@ u64 rt_ptr(R *r, u64 v) {
 	case TAG_STR: return ptr_val((u64)str_data(v));
 	}
 	return is_num(v) ? ptr_val((u64)to_i64(r, v)) : type_error(r, "make a ptr from", v, 0);
+}
+
+static u64 bits_arg(R *r, u64 v, u64 *err) {
+	if (!is_num(v)) {
+		*err = type_error(r, "count the bits of", v, 0);
+		return 0;
+	}
+	*err = 0;
+	return (u64)to_i64(r, v);
+}
+
+u64 rt_popcount(R *r, u64 v) {
+	u64 e, x = bits_arg(r, v, &e), n = 0;
+	for (; x; x &= x - 1)
+		n++;
+	return e ? e : num((double)n);
+}
+
+// rt_clz and rt_ctz count leading and trailing zero bits of a 64-bit value.
+u64 rt_clz(R *r, u64 v) {
+	u64 e, x = bits_arg(r, v, &e);
+	return e ? e : num((double)clz64(x));
+}
+
+u64 rt_ctz(R *r, u64 v) {
+	u64 e, x = bits_arg(r, v, &e), n = 0;
+	if (e)
+		return e;
+	if (!x)
+		return num(64);
+	for (; !(x & 1); x >>= 1)
+		n++;
+	return num((double)n);
 }
 
 // rt_int is x as int64: a number truncated, or a ptr's address.

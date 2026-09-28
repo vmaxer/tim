@@ -60,16 +60,16 @@ println("completed")
 			wantExit:   0,
 		},
 		{
-			name:       "exitln exits",
-			code:       `exitln("fatal error")`,
+			name:       "exitf exits",
+			code:       `exitf("fatal %s\n", "error")`,
 			wantStdout: "",
 			wantStderr: "fatal error\n",
 			wantExit:   1,
 		},
 		{
-			name: "exitln does not continue",
+			name: "exitf does not continue",
 			code: `
-exitln("error")
+exitf("error\n")
 println("should not see this")
 `,
 			wantStdout: "",

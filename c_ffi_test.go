@@ -50,10 +50,10 @@ printf("cos(0.0) = %v\n", result)
 func TestTwoArgLibm(t *testing.T) {
 	code := `
 println(pow(2.0, 10.0))
-println(fmod(10.0, 3.0))
-println(hypot(3.0, 4.0))
-println(fmin(3.0, 7.0))
-println(fmax(3.0, 7.0))
+println(c.fmod(10.0, 3.0))
+println(c.hypot(3.0, 4.0))
+println(c.fmin(3.0, 7.0))
+println(c.fmax(3.0, 7.0))
 `
 	output := compileAndRun(t, code)
 	for _, want := range []string{"1024", "1", "5", "3", "7"} {

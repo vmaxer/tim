@@ -98,9 +98,9 @@ printf("sqrt(16) = %v\n", x)
 func TestCFFIFunctionsWork(t *testing.T) {
 	code := `
 // Use C FFI functions - should not produce undefined function errors
-ptr: cptr = malloc(64)
+ptr: cptr = c.malloc(64)
 println("Allocated memory")
-free(ptr)
+c.free(ptr)
 println("Freed memory")
 `
 	output := compileAndRun(t, code)
@@ -171,7 +171,7 @@ main = {
 // Call undefined function in or! block
 x := 42 or! {
     undefined_func()
-    exitln("error")
+    exitf("error\n")
 }
 println(x)
 }
