@@ -3476,6 +3476,19 @@ u64 rt_ptr(R *r, u64 v) {
 	return is_num(v) ? ptr_val((u64)to_i64(r, v)) : type_error(r, "make a ptr from", v, 0);
 }
 
+// rt_int is x as int64: a number truncated, or a ptr's address.
+u64 rt_int(R *r, u64 v) {
+	if (tag_of(v) == TAG_PTR)
+		return from_i64(r, (i64)ptr_addr(v));
+	return rt_trunc(r, v);
+}
+
+// rt_struct_n is alloc(n): n zeroed bytes on the heap.
+u64 rt_struct_n(R *r, u64 n) {
+	i64 k = is_num(n) ? to_i64(r, n) : -1;
+	return k < 0 ? type_error(r, "allocate", n, 0) : rt_struct(r, (u64)k);
+}
+
 u64 rt_cstr(R *r, u64 p) {
 	if (tag_of(p) == TAG_STR)
 		return p;

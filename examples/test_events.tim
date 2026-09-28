@@ -39,7 +39,7 @@ frame := 0
             }
             768 => {
                 printf("KEYDOWN event\n")
-                scancode := peek32(event, 16)
+                scancode := read_u32(event, 16)
                 printf("  Scancode: %d\n", scancode)
                 scancode {
                     41 => { 

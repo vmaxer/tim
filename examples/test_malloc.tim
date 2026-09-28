@@ -1,4 +1,4 @@
-ptr: cptr = malloc(64)
+ptr: cptr = c.malloc(64)
 println("Allocated memory")
-free(ptr)
+c.free(ptr)
 println("Freed memory")

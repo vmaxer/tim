@@ -110,7 +110,8 @@ type checker struct {
 // CheckError lists everything wrong with a program.
 type CheckError struct {
 	Plain, Color  string
-	OnlyUndefined bool // every error is an undefined name, which a sibling file or import may define
+	OnlyUndefined bool     // every error is an undefined name, which a sibling file or import may define
+	Undefined     []string // the undefined names
 }
 
 func (e *CheckError) Error() string { return e.Plain }
@@ -151,6 +152,8 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 		for _, e := range k.errs.errors {
 			if !strings.HasPrefix(e.Message, "undefined ") {
 				ce.OnlyUndefined = false
+			} else if _, name, ok := strings.Cut(e.Message, "'"); ok {
+				ce.Undefined = append(ce.Undefined, name[:strings.IndexByte(name, '\'')])
 			}
 		}
 		return nil, ce
@@ -429,9 +432,7 @@ func (k *checker) assign(s *AssignStmt) {
 		}
 		return
 	}
-	if s.TypeAnnotation != nil && s.TypeAnnotation.Kind >= TypeCString {
-		k.unsupported("C type annotations")
-	}
+
 	lambda, isFn := s.Value.(*LambdaExpr)
 	var sym *Var
 	if isFn {
@@ -798,8 +799,10 @@ func (k *checker) infer(e Expression) Type {
 		case "num", "number", "float64", "float32", "int8", "int16", "int32", "int64",
 			"uint8", "uint16", "uint32", "uint64", "bool":
 			return TNum
-		case "ptr", "pointer":
+		case "ptr", "pointer", "cptr", "cstring":
 			return TPtr
+		case "float", "double":
+			return TNum
 		case "cstr":
 			return TStr
 		}

@@ -58,7 +58,7 @@ arena {
         poll_result {
             | poll_result > 0 => {
                 printf("Got event, reading type...\n")
-                event_type = peek32(event, 0)
+                event_type = read_u32(event, 0)
                 printf("Event type: %d\n", event_type)
             }
         }

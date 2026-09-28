@@ -1032,10 +1032,12 @@ func (g *coreGen) cast(e *CastExpr) {
 		g.rtCall("rt_float", e.Expr)
 	case "bool":
 		g.boolValue(e.Expr)
-	case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64":
-		g.rtCall("rt_trunc", e.Expr)
-	case "ptr", "pointer":
+	case "int8", "int16", "int32", "int64", "uint8", "uint16", "uint32", "uint64", "int":
+		g.rtCall("rt_int", e.Expr)
+	case "ptr", "pointer", "cptr", "cstring":
 		g.rtCall("rt_ptr", e.Expr)
+	case "float", "double":
+		g.rtCall("rt_float", e.Expr)
 	case "cstr":
 		g.rtCall("rt_cstr", e.Expr)
 	default:
@@ -1474,6 +1476,13 @@ func (g *coreGen) builtinCall(name string, args []Expression) {
 		return
 	case "min", "max":
 		g.array(args, func(base int32, n int) { g.callRT("rt_"+name, rt(), slotAt(base), immv(uint64(n))) })
+		return
+	case "exitf":
+		g.builtinCall("eprintf", args)
+		g.callRT("rt_exit", rt(), immv(num(1)))
+		return
+	case "alloc":
+		g.rtCall("rt_struct_n", args...)
 		return
 	case "exit":
 		if len(args) == 0 {

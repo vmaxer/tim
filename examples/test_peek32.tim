@@ -6,7 +6,7 @@ ptr = c.malloc(16)
 // Write some test data
 // (We can't write directly, but let's test reading)
 
-val = peek32(ptr, 0)
+val = read_u32(ptr, 0)
 println("Read value:")
 println(val)
 

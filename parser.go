@@ -12,6 +12,7 @@ import (
 // Parser is a recursive-descent parser for the grammar in GRAMMAR.md. It
 // produces the AST in ast.go.
 type Parser struct {
+	quiet    bool // do not print errors
 	toks     []Token
 	i        int
 	filename string
@@ -79,7 +80,9 @@ func (p *Parser) ParseProgramRaw() *Program {
 		p.skipEnds()
 	}
 	if p.errors.HasErrors() {
-		fmt.Fprintln(os.Stderr, p.errors.Report(true))
+		if !p.quiet {
+			fmt.Fprintln(os.Stderr, p.errors.Report(true))
+		}
 		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
 	program.CStructs = p.cstructs

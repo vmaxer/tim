@@ -47,7 +47,7 @@ event := c.malloc(192) as SDL_Event
             event.type {
                 256 => { running = 0 }
                 768 => {
-                    scancode := peek32(event, 16)
+                    scancode := read_u32(event, 16)
                     scancode {
                         41 => { running = 0 }
                     }

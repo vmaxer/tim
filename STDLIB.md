@@ -12,6 +12,7 @@ name, which then takes precedence. Functions that fail return an error value.
 | `printf(fmt, v...)` | print with a format: `%d %x %X %f %.2f %e %g %s %v %q %c %b %%`, with widths like `%5d` and `%-8s` |
 | `eprint(v...)`, `eprintln(v...)`, `eprintf(fmt, v...)` | the same, to stderr |
 | `exit(code)` | end the program; an error exits with 1 |
+| `exitf(fmt, v...)` | `eprintf`, then exit with 1: `x or! { exitf("failed: %s\n", why) }` |
 | `args()` | the command-line arguments as a list of strings |
 | `env(name)` | an environment variable, or an error |
 
@@ -84,6 +85,7 @@ and `*` repeats.
 | Function | Description |
 |---|---|
 | `cstr(p)` | copy the C string at a `ptr` into a string |
+| `alloc(n)` | `n` zeroed bytes on the garbage-collected heap, as a `ptr`, kept while the program references it |
 | `read_i8 read_u8 read_i16 read_u16 read_i32 read_u32 read_i64 read_u64 read_f32 read_f64 read_ptr` | `read_u8(p, i)` reads a value of that C type at byte offset `i` |
 | `write_i8 write_u8 write_i16 write_u16 write_i32 write_u32 write_i64 write_u64 write_f32 write_f64 write_ptr` | `write_u8(p, i, v)` writes one |
 

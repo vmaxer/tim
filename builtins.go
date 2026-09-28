@@ -16,6 +16,7 @@ var builtins = map[string]builtin{
 	"eprintln": {0, -1, "print to stderr with a newline"},
 	"eprintf":  {1, -1, "printf to stderr"},
 	"exit":     {0, 1, "end the program with an exit code"},
+	"exitf":    {1, -1, "printf to stderr, then exit with 1"},
 	"args":     {0, 0, "the command-line arguments as a list of strings"},
 	"env":      {1, 1, "an environment variable, or an error"},
 
@@ -71,6 +72,7 @@ var builtins = map[string]builtin{
 
 	// Memory through ptr values, at a byte offset
 	"cstr":    {1, 1, "copy the C string at a ptr into a string"},
+	"alloc":   {1, 1, "n zeroed bytes on the garbage-collected heap, as a ptr"},
 	"read_i8": {2, 2, ""}, "read_u8": {2, 2, ""}, "read_i16": {2, 2, ""}, "read_u16": {2, 2, ""},
 	"read_i32": {2, 2, ""}, "read_u32": {2, 2, ""}, "read_i64": {2, 2, ""}, "read_u64": {2, 2, ""},
 	"read_f32": {2, 2, ""}, "read_f64": {2, 2, ""}, "read_ptr": {2, 2, ""},
@@ -89,16 +91,16 @@ var memKinds = map[string]uint8{"i8": cI8, "u8": cU8, "i16": cI16, "u16": cU16, 
 // provide (raw memory, arenas, atomics, processes); programs that use them
 // are compiled by the legacy backends.
 var legacyBuiltins = map[string]bool{
-	"__tim_map_update": true, "alloc": true, "and": true, "append": true, "approx": true,
+	"__tim_map_update": true, "and": true, "append": true, "approx": true,
 	"arena_alloc": true, "arena_create": true, "arena_destroy": true, "arena_reset": true,
 	"atomic_add": true, "atomic_cas": true, "atomic_load": true, "atomic_store": true, "call": true,
 	"calloc": true, "chan": true, "close": true, "clz": true, "ctz": true,
-	"dlclose": true, "dlopen": true, "dlsym": true, "exitf": true, "exitln": true, "float32": true,
+	"dlclose": true, "dlopen": true, "dlsym": true, "exitln": true, "float32": true,
 	"float64": true, "fork": true, "free": true, "getpid": true, "head": true, "int16": true,
 	"int32": true, "int64": true, "int8": true, "is_finite": true, "is_inf": true, "is_nan": true,
 	"is_neg_inf": true, "is_pos_inf": true, "load": true, "malloc": true, "mmap": true,
 	"munmap": true, "or": true, "peek32": true, "peek8": true, "popcount": true, "printa": true,
-	"proc_exit": true, "ptr": true, "realloc": true, "result_value": true, "safe_divide": true,
+	"proc_exit": true, "realloc": true, "result_value": true, "safe_divide": true,
 	"safe_divide_result": true, "safe_ln": true, "safe_ln_result": true, "safe_sqrt": true,
 	"safe_sqrt_result": true, "sizeof_f32": true, "sizeof_f64": true, "sizeof_i16": true,
 	"sizeof_i32": true, "sizeof_i64": true, "sizeof_i8": true, "sizeof_ptr": true, "sizeof_u16": true,

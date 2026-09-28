@@ -126,12 +126,17 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 	}
 	addPrelude(prog)
 	c, err := Check(prog, path, string(src))
-	if err != nil {
+	// A program may span the .tim files of its directory: take definitions
+	// of undefined names from them until nothing more resolves.
+	for range 8 {
 		var ce *CheckError
-		if errors.As(err, &ce) && ce.OnlyUndefined && hasSiblings(path) {
-			why = "undefined names, perhaps defined by a sibling file"
-			return false, nil
+		if !errors.As(err, &ce) || !ce.OnlyUndefined || !addSiblingDefs(prog, path, ce.Undefined) {
+			break
 		}
+		c, err = Check(prog, path, string(src))
+	}
+	if err != nil {
+		ce := err.(*CheckError)
 		fmt.Fprint(os.Stderr, ce.Color)
 		return true, newReportedError(ce.Plain)
 	}
@@ -175,14 +180,69 @@ func coreTargetFor(p Platform) (coreTarget, asm, coreWriter) {
 	return t, nil, nil
 }
 
-// hasSiblings reports whether other .tim files sit next to path; the legacy
-// driver loads them to find functions a program does not define.
-func hasSiblings(path string) bool {
-	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tim"))
-	for _, m := range matches {
-		if filepath.Base(m) != filepath.Base(path) {
-			return true
-		}
+// addSiblingDefs adds the definitions of the given names from the other
+// .tim files next to path, with those files' cstructs and C imports. It
+// reports whether it added any.
+func addSiblingDefs(prog *Program, path string, names []string) bool {
+	want := map[string]bool{}
+	for _, n := range names {
+		want[n] = true
 	}
-	return false
+	matches, _ := filepath.Glob(filepath.Join(filepath.Dir(path), "*.tim"))
+	added := false
+	for _, m := range matches {
+		if filepath.Base(m) == filepath.Base(path) {
+			continue
+		}
+		src, err := os.ReadFile(m)
+		if err != nil {
+			continue
+		}
+		sib := parseQuietly(string(src), m)
+		if sib == nil {
+			continue
+		}
+		var defs, support []Statement
+		for _, s := range sib.Statements {
+			switch s := s.(type) {
+			case *AssignStmt:
+				if _, fn := s.Value.(*LambdaExpr); fn && !s.IsUpdate && want[s.Name] {
+					want[s.Name] = false
+					defs = append(defs, s)
+				}
+			case *CStructDecl, *CImportStmt:
+				support = append(support, s)
+			}
+		}
+		if len(defs) == 0 {
+			continue
+		}
+		for _, s := range support {
+			if cs, ok := s.(*CStructDecl); ok {
+				if prog.CStructs[cs.Name] != nil {
+					continue
+				}
+				if prog.CStructs == nil {
+					prog.CStructs = map[string]*CStructDecl{}
+				}
+				prog.CStructs[cs.Name] = cs
+			}
+			prog.Statements = append([]Statement{s}, prog.Statements...)
+		}
+		prog.Statements = append(prog.Statements, defs...)
+		added = true
+	}
+	return added
+}
+
+// parseQuietly parses a file, returning nil instead of reporting errors.
+func parseQuietly(src, path string) (prog *Program) {
+	defer func() {
+		if recover() != nil {
+			prog = nil
+		}
+	}()
+	p := NewParserWithFilename(src, path)
+	p.quiet = true
+	return p.ParseProgramRaw()
 }
