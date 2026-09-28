@@ -31,7 +31,7 @@ func peImports(cimps []cImport) ([]peDLL, []int) {
 			dlls = append(dlls, peDLL{dll: dll})
 		}
 		d := &dlls[byName[dll]]
-		d.funcs = append(d.funcs, ci.name)
+		d.funcs = append(d.funcs, peSymbol(ci))
 	}
 	start := map[string]int{}
 	thunk := 0
@@ -47,6 +47,17 @@ func peImports(cimps []cImport) ([]peDLL, []int) {
 		seen[dll]++
 	}
 	return dlls, index
+}
+
+// msvcrtNames are the names msvcrt.dll exports C99 and POSIX functions under.
+var msvcrtNames = map[string]string{"snprintf": "_snprintf", "hypot": "_hypot", "strdup": "_strdup",
+	"getpid": "_getpid", "write": "_write", "read": "_read", "close": "_close"}
+
+func peSymbol(ci cImport) string {
+	if n, ok := msvcrtNames[ci.name]; ok && ci.lib == libcLib {
+		return n
+	}
+	return ci.name
 }
 
 // peLayout places the import address table at the start of the section after the code.
