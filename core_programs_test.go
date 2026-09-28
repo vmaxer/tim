@@ -80,7 +80,8 @@ func TestCorePrograms(t *testing.T) {
 				} else if err != nil {
 					t.Fatal(err)
 				}
-				got := fmt.Sprintf("%s[exit %d]\n", stdout.String(), exit)
+				// C's stdio writes \r\n on Windows
+				got := fmt.Sprintf("%s[exit %d]\n", strings.ReplaceAll(stdout.String(), "\r\n", "\n"), exit)
 				golden := strings.TrimSuffix(src, ".tim") + ".want"
 				if os.Getenv("TIM_UPDATE") != "" && tg.qemu == "" {
 					if err := os.WriteFile(golden, []byte(got), 0o644); err != nil {
