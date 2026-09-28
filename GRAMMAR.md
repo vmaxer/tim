@@ -307,20 +307,26 @@ byte offset `i`.
 
 ```tim
 cstruct Vec { x: float64, y: float64 }
-v = Vec(3, 4)                       // a new struct; fields in order, missing ones are 0
+v := Vec(3, 4)                      // a new struct; fields in order, missing ones are 0
 v.x <- 6                            // fields read and write through their C types
 p = c.malloc(Vec.size) as Vec       // treat a ptr as a Vec
 Vec.len(self) = sqrt(self.x ** 2 + self.y ** 2)   // a method: v.len()
-println(v.len(), Vec.size, Vec.y.offset)          // 7.211102550927978 16 8
+Vec.add(self, o: Vec) = Vec(self.x + o.x, self.y + o.y)
+println(v.len(), (v + v).x, Vec.size, Vec.y.offset)   // 7.211102550927978 12 16 8
 ```
 
 Fields are `int8` ... `uint64`, `float32`, `float64`, `ptr`, `cstr` (a `char *` read as
-a string) or another cstruct, embedded. Layout follows C unless the cstruct is
-`packed` or `aligned(n)`. A cstruct value is a pointer to its bytes, so it passes to C
-as is; constructed ones live on the garbage-collected heap. The compiler knows which
-cstruct a value is from constructors, `as`, parameter annotations `(v: Vec)`, `self`
-and functions that always return one; reading a field of a value of unknown cstruct
-type is a compile error.
+a string) or another cstruct, held as a pointer to it. Layout follows C unless the
+cstruct is `packed` or `aligned(n)`. A cstruct value is a pointer to its bytes, so it
+passes to C as is; constructed ones live on the garbage-collected heap. Writing a
+field needs a variable bound with `:=`, as for list elements.
+
+The compiler knows which cstruct a value is from constructors, `as`, parameter
+annotations `(v: Vec)`, `self`, typed loop variables `@ v: Vec in vs`, lists of
+cstructs, and functions that always return one. Reading a field of a value of
+unknown cstruct type is a compile error. On cstruct values, `a + b`, `a - b` and
+`a * b` call the methods `add`, `sub` and `mul`; `a * s`, `s * a` and `a / s` call
+`scale(a, s)` and `scale(a, 1 / s)`.
 
 ## 7. Unsafe code
 

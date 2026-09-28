@@ -1,0 +1,34 @@
+cstruct V3 { x: float64, y: float64, z: float64 }
+V3.add(self, o: V3) = V3(self.x + o.x, self.y + o.y, self.z + o.z)
+V3.scale(self, s) = V3(self.x * s, self.y * s, self.z * s)
+V3.dot(self, o: V3) = self.x * o.x + self.y * o.y + self.z * o.z
+V3.len(self) = sqrt(self.dot(self))
+a = V3(1, 2, 3)
+b = V3(4, 5, 6)
+println(a.x, a.y, a.z, a.dot(b), a.add(b).scale(2).x, a.len())
+m := V3(0, 0)
+m.z <- 7
+println(m.x, m.z, V3.size, V3.z.offset)
+cstruct Pair packed { tag: uint8, n: int32, name: cstr }
+p := Pair(200, -5, "hello")
+println(p.tag, p.n, p.name, Pair.size)
+raw = c.calloc(1, V3.size) as V3
+println(raw.x)
+q := c.malloc(Pair.size) as Pair
+q.n <- 123456
+q.name <- "c string"
+println(q.n, q.name, c.strlen(read_ptr(q, 5)))
+c.free(q)
+pts = [V3(i, i * i, 0) @ i in 0..<4]
+@ v: V3 in pts { print(v.y, "") }
+println()
+f(v: V3) = v.x + v.y
+println(f(V3(10, 20)))
+V3.sub(self, o: V3) = V3(self.x - o.x, self.y - o.y, self.z - o.z)
+V3.mul(self, o: V3) = V3(self.x * o.x, self.y * o.y, self.z * o.z)
+u = V3(1, 2, 3)
+w = (u + u) * 2 - u / 2
+println(w.x, w.y, w.z, (u * u).z, (3 * u).y)
+cstruct Ball { c: V3, r: float64 }
+balls = [Ball(V3(1, 0, 0), 2), Ball(V3(4, 0, 0), 1)]
+println(balls[1].r, balls[0].c.x, [b.c.x @ b in balls])

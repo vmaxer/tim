@@ -65,8 +65,8 @@ cstruct Point {
 }
 
 p := c.malloc(8) as Point
-p[0] <- 42 as uint32
-p[1] <- 99 as uint32
+p.x <- 42
+p.y <- 99
 println(p.x)
 println(p.y)
 c.free(p)
@@ -83,8 +83,8 @@ cstruct Vec {
 }
 
 v := c.malloc(16) as Vec
-v[0] <- 10.0 as float64
-v[1] <- 20.0 as float64
+v.a <- 10.0
+v.b <- 20.0
 println(v.a)
 println(v.b)
 c.free(v)
@@ -218,7 +218,7 @@ main = {
     println(w.z)
 }
 `
-	testInlineTim(t, "cstruct_method_on_local_in_if_arm", source, "1.35\n0.3\n1.14\n")
+	testInlineTim(t, "cstruct_method_on_local_in_if_arm", source, "1.35\n0.30000000000000004\n1.1400000000000001\n")
 }
 
 func TestExistingCStructPrograms(t *testing.T) {

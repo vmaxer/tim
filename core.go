@@ -557,6 +557,12 @@ func (g *coreGen) stmt(s Statement, tail bool) {
 		g.expr(s.Target, false)
 		g.setIndex(func() {}, s.Index, s.Value)
 	case *FieldUpdateStmt:
+		if f := g.c.FieldSets[s]; f != nil {
+			s2 := g.args(s.Object, s.Value)
+			g.callRT("rt_mem_write", rt(), slot(s2[0]), immv(num(float64(f.Offset))), immv(uint64(fieldKind(f))), inA())
+			g.free(1)
+			return
+		}
 		g.expr(s.Object, false)
 		g.setIndex(func() {}, &StringExpr{Value: s.Field}, s.Value)
 	case *LoopStmt:
@@ -584,7 +590,7 @@ func (g *coreGen) stmt(s Statement, tail bool) {
 		g.a.store(rA, rFP, t)
 		g.callRT("rt_push", rt(), slot(g.f.defers), slot(t))
 		g.free(1)
-	case *ExportStmt:
+	case *ExportStmt, *CStructDecl, *CImportStmt:
 	default:
 		unsupportedf("statement %T", s)
 	}
@@ -764,6 +770,9 @@ func (g *coreGen) while(s *WhileStmt) {
 // Expressions leave their value in rA.
 
 func (g *coreGen) expr(e Expression, tail bool) {
+	if rw := g.c.Rewrites[e]; rw != nil {
+		e = rw
+	}
 	switch e := e.(type) {
 	case nil:
 		g.a.imm(rA, 0)
@@ -824,6 +833,11 @@ func (g *coreGen) expr(e Expression, tail bool) {
 		g.callRT("rt_slice", rt(), slot(s[0]), slot(s[1]), inA(), immv(flags))
 		g.free(2)
 	case *FieldAccessExpr:
+		if f := g.c.Fields[e]; f != nil {
+			g.expr(e.Object, false)
+			g.callRT("rt_mem_read", rt(), inA(), immv(num(float64(f.Offset))), immv(uint64(fieldKind(f))))
+			return
+		}
 		g.expr(e.Object, false)
 		t := g.tmp()
 		g.a.store(rA, rFP, t)
@@ -1025,8 +1039,57 @@ func (g *coreGen) cast(e *CastExpr) {
 	case "cstr":
 		g.rtCall("rt_cstr", e.Expr)
 	default:
+		if g.c.Structs[e] != nil {
+			g.rtCall("rt_ptr", e.Expr)
+			return
+		}
 		unsupportedf("cast to %s", e.Type)
 	}
+}
+
+func num(d float64) uint64 { return math.Float64bits(d) }
+
+// fieldKind is the C type of a cstruct field.
+func fieldKind(f *CStructField) uint8 {
+	switch f.Type {
+	case "int8":
+		return cI8
+	case "uint8":
+		return cU8
+	case "int16":
+		return cI16
+	case "uint16":
+		return cU16
+	case "int32":
+		return cI32
+	case "uint32":
+		return cU32
+	case "int64":
+		return cI64
+	case "uint64":
+		return cU64
+	case "float32":
+		return cF32
+	case "float64":
+		return cF64
+	case "cstr":
+		return cCstr
+	}
+	return cPtr
+}
+
+// construct makes a cstruct on the heap and sets its fields in order.
+func (g *coreGen) construct(st *CStructDecl, args []Expression) {
+	g.callRT("rt_struct", rt(), immv(uint64(st.Size)))
+	p := g.tmp()
+	g.a.store(rA, rFP, p)
+	for i, arg := range args {
+		f := &st.Fields[i]
+		g.expr(arg, false)
+		g.callRT("rt_mem_write", rt(), slot(p), immv(num(float64(f.Offset))), immv(uint64(fieldKind(f))), inA())
+	}
+	g.a.load(rA, rFP, p)
+	g.free(1)
 }
 
 // cCall calls a C function through rt_ffi, which converts the arguments by
@@ -1288,6 +1351,10 @@ func (g *coreGen) closure(f *Fun) {
 }
 
 func (g *coreGen) call(e *CallExpr, tail bool) {
+	if st := g.c.Ctors[e]; st != nil {
+		g.construct(st, e.Args)
+		return
+	}
 	if f := g.c.CCalls[e]; f != nil {
 		g.cCall(f, e.Args)
 		return

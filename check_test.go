@@ -92,11 +92,11 @@ func TestCheckCapturesAndBoxing(t *testing.T) {
 }
 
 func TestCheckRecordsUnsupported(t *testing.T) {
-	c, err := checkSource(t, "cstruct P { x: f64 }\nimport sdl3 as sdl\nsdl.SDL_Init(0)")
+	c, err := checkSource(t, "x = unsafe int64 { rax <- 1 } { x0 <- 1 } { a0 <- 1 }\nprintln(x)")
 	if err != "" {
 		t.Fatal(err)
 	}
-	if got := strings.Join(c.Unsupported, ","); got != "cstruct" {
+	if got := strings.Join(c.Unsupported, ","); got != "unsafe" {
 		t.Errorf("unsupported = %s", got)
 	}
 }

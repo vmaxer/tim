@@ -47,19 +47,23 @@ type Var struct {
 	Outer   *Var // for captures: the symbol captured from the enclosing function
 	Func    *Fun // the function literal it is bound to, when known
 	Type    Type
+	Struct  *CStructDecl // the cstruct it points to, when known
+	Elem    *CStructDecl // for a list: the cstruct of its elements, when known
 	Pos     Pos
 }
 
 // Fun is a function literal, or the top level of the program.
 type Fun struct {
-	Name     string
-	Lambda   *LambdaExpr
-	Parent   *Fun
-	Params   []*Var
-	Variadic *Var
-	Locals   []*Var
-	Captures []*Var
-	Defers   bool // the function has defer statements
+	Name        string
+	Lambda      *LambdaExpr
+	Parent      *Fun
+	Params      []*Var
+	Variadic    *Var
+	Locals      []*Var
+	Captures    []*Var
+	Defers      bool         // the function has defer statements
+	Returns     *CStructDecl // the cstruct every result points to, when known
+	ReturnsElem *CStructDecl // the cstruct of the elements of every result list
 }
 
 // Checked is the result of checking a program.
@@ -77,7 +81,13 @@ type Checked struct {
 	Types       map[Expression]Type
 	CCalls      map[*CallExpr]*cFunc           // calls to C functions
 	CConsts     map[*NamespacedIdentExpr]int64 // C constants
-	Unsupported []string                       // features the core code generator does not handle yet
+	Structs     map[Expression]*CStructDecl    // expressions that are cstructs
+	Ctors       map[*CallExpr]*CStructDecl     // cstruct constructors
+	Fields      map[Expression]*CStructField   // cstruct field reads
+	FieldSets   map[*FieldUpdateStmt]*CStructField
+	Elems       map[Expression]*CStructDecl // lists whose elements are cstructs
+	Rewrites    map[Expression]Expression   // operators on cstructs, as method calls
+	Unsupported []string                    // features the core code generator does not handle yet
 }
 
 type scope struct {
@@ -114,6 +124,9 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 			Uses: map[*IdentExpr]*Var{}, Defs: map[Statement][]*Var{}, Updates: map[Statement]*Var{},
 			Callees: map[*CallExpr]*Var{}, Fns: map[*LambdaExpr]*Fun{}, Deferred: map[*DeferStmt]*Fun{}, Types: map[Expression]Type{},
 			CCalls: map[*CallExpr]*cFunc{}, CConsts: map[*NamespacedIdentExpr]int64{},
+			Structs: map[Expression]*CStructDecl{}, Ctors: map[*CallExpr]*CStructDecl{},
+			Fields: map[Expression]*CStructField{}, FieldSets: map[*FieldUpdateStmt]*CStructField{},
+			Elems: map[Expression]*CStructDecl{}, Rewrites: map[Expression]Expression{},
 		},
 		file:   file,
 		errs:   NewErrorCollector(20),
@@ -236,7 +249,7 @@ func (k *checker) capture(fn *Fun, sym *Var) *Var {
 	if root.Mutable {
 		root.Boxed = true
 	}
-	c := &Var{Name: sym.Name, Kind: SymCapture, Mutable: sym.Mutable, Fn: fn, Outer: outer, Index: len(fn.Captures),
+	c := &Var{Name: sym.Name, Kind: SymCapture, Mutable: sym.Mutable, Fn: fn, Outer: outer, Index: len(fn.Captures), Struct: sym.Struct, Elem: sym.Elem,
 		Func: sym.Func, Type: sym.Type, Pos: sym.Pos}
 	fn.Captures = append(fn.Captures, c)
 	return c
@@ -333,26 +346,40 @@ func (k *checker) stmt(s Statement) {
 		k.expr(s.Value)
 		if sym := k.modifyTarget(s.Pos, s.MapName); sym != nil {
 			k.c.Updates[s] = sym
+			if sym.Struct != nil {
+				k.errorf(s.Pos, "a cstruct has named fields: write %s.%s <- v instead of indexing", s.MapName, sym.Struct.Fields[0].Name)
+			}
 		}
 	case *IndexUpdateStmt:
 		k.expr(s.Target)
 		k.expr(s.Index)
 		k.expr(s.Value)
 		k.requireMutableRoot(s.Pos, s.Target)
+		if st := k.c.Structs[s.Target]; st != nil {
+			k.errorf(s.Pos, "a cstruct has named fields: write x.%s <- v instead of indexing", st.Fields[0].Name)
+		}
 	case *FieldUpdateStmt:
 		k.expr(s.Object)
 		k.expr(s.Value)
 		k.requireMutableRoot(s.Pos, s.Object)
+		if st := k.c.Structs[s.Object]; st != nil {
+			k.c.FieldSets[s] = k.field(s.Pos, st, s.Field)
+		} else if k.c.Types[s.Object] == TPtr {
+			k.errorf(s.Pos, "cannot tell which cstruct this is; write (x as T).%s", s.Field)
+		}
 	case *LoopStmt:
 		t := k.expr(s.Iterable)
 		if t == TNum || t == TFn {
 			k.errorf(s.Pos, "cannot loop over a %s; loop over a range like 0..<n, a list, a string or a map", t)
 		}
-		if s.IteratorType != "" {
-			k.unsupported("typed loop variables")
-		}
 		k.push()
 		it := k.define(s.Iterator, false, s.Pos)
+		if st := k.c.Elems[s.Iterable]; st != nil {
+			it.Struct = st
+		}
+		if s.IteratorType != "" && !castNumTypes[s.IteratorType] {
+			it.Struct = k.structNamed(s.Pos, s.IteratorType)
+		}
 		if _, isRange := s.Iterable.(*RangeExpr); isRange {
 			it.Type = TNum
 		}
@@ -382,7 +409,6 @@ func (k *checker) stmt(s Statement) {
 	case *ArenaStmt:
 		k.block(s.Body)
 	case *CStructDecl:
-		k.unsupported("cstruct")
 	case *CImportStmt:
 	case *ImportStmt:
 		k.unsupported("Tim imports")
@@ -424,6 +450,8 @@ func (k *checker) assign(s *AssignStmt) {
 		t := k.expr(s.Value)
 		sym = k.define(s.Name, s.Mutable, s.Pos)
 		sym.Type = t
+		sym.Struct = k.c.Structs[s.Value]
+		sym.Elem = k.c.Elems[s.Value]
 	}
 	k.c.Defs[s] = []*Var{sym}
 }
@@ -506,9 +534,6 @@ func (k *checker) lambda(l *LambdaExpr, name string) *Fun {
 	fn := &Fun{Name: name, Lambda: l, Parent: k.fn}
 	k.c.Fns[l] = fn
 	k.c.Funcs = append(k.c.Funcs, fn)
-	if len(l.ParamCStructTypes) > 0 {
-		k.unsupported("cstruct parameters")
-	}
 	savedFn, savedLoops := k.fn, k.loops
 	k.fn, k.loops = fn, 0
 	k.push()
@@ -517,6 +542,9 @@ func (k *checker) lambda(l *LambdaExpr, name string) *Fun {
 			k.errorf(l.Pos, "parameter '%s' appears twice", n)
 		}
 		sym := &Var{Name: n, Kind: SymParam, Fn: fn, Index: len(fn.Params), Pos: l.Pos}
+		if t, ok := l.ParamCStructTypes[n]; ok {
+			sym.Struct = k.structNamed(l.Pos, t)
+		}
 		k.sc.names[n] = sym
 		return sym
 	}
@@ -528,6 +556,8 @@ func (k *checker) lambda(l *LambdaExpr, name string) *Fun {
 		fn.Variadic.Type = TList
 	}
 	k.expr(l.Body)
+	fn.Returns = k.c.Structs[l.Body]
+	fn.ReturnsElem = k.c.Elems[l.Body]
 	k.pop()
 	k.fn, k.loops = savedFn, savedLoops
 	return fn
@@ -561,10 +591,127 @@ func (k *checker) exprs(es []Expression) {
 
 func (k *checker) expr(e Expression) Type {
 	t := k.infer(e)
+	if el := k.derivedElem(e); el != nil {
+		k.c.Elems[e] = el
+	}
+	if rw := k.c.Rewrites[e]; rw != nil {
+		if st := k.c.Structs[rw]; st != nil {
+			k.c.Structs[e] = st
+		}
+	}
+	if ix, ok := e.(*IndexExpr); ok {
+		if el := k.c.Elems[ix.List]; el != nil {
+			k.c.Structs[e] = el
+		}
+	}
+	if st := k.derivedStruct(e); st != nil {
+		k.c.Structs[e] = st
+		t = TPtr
+	}
 	if t != TAny {
 		k.c.Types[e] = t
 	}
 	return t
+}
+
+// derivedElem is the cstruct of the elements of a list expression.
+func (k *checker) derivedElem(e Expression) *CStructDecl {
+	switch e := e.(type) {
+	case *IdentExpr:
+		if v := k.c.Uses[e]; v != nil {
+			return v.Elem
+		}
+	case *CallExpr:
+		if v := k.c.Callees[e]; v != nil && v.Func != nil && !v.Mutable {
+			return v.Func.ReturnsElem
+		}
+	case *BlockExpr:
+		if n := len(e.Statements); n > 0 {
+			if es, ok := e.Statements[n-1].(*ExpressionStmt); ok {
+				return k.c.Elems[es.Expr]
+			}
+		}
+	}
+	return k.c.Elems[e]
+}
+
+// derivedStruct is the cstruct an expression has through its parts.
+func (k *checker) derivedStruct(e Expression) *CStructDecl {
+	switch e := e.(type) {
+	case *IdentExpr:
+		if v := k.c.Uses[e]; v != nil {
+			return v.Struct
+		}
+	case *BlockExpr:
+		return k.stmtsStruct(e.Statements)
+	case *MatchExpr:
+		st := k.c.Structs[e.DefaultExpr]
+		for _, c := range e.Clauses {
+			if k.c.Structs[c.Result] != st {
+				return nil
+			}
+		}
+		return st
+	}
+	return k.c.Structs[e]
+}
+
+// stmtsStruct is the cstruct a block's value has, through a final if.
+func (k *checker) stmtsStruct(ss []Statement) *CStructDecl {
+	if len(ss) == 0 {
+		return nil
+	}
+	switch s := ss[len(ss)-1].(type) {
+	case *ExpressionStmt:
+		return k.c.Structs[s.Expr]
+	case *IfStmt:
+		st := k.stmtsStruct(s.ElseBody)
+		for _, b := range s.Branches {
+			if k.stmtsStruct(b.Body) != st {
+				return nil
+			}
+		}
+		return st
+	}
+	return nil
+}
+
+func (k *checker) structNamed(pos Pos, name string) *CStructDecl {
+	if st := k.c.Program.CStructs[name]; st != nil {
+		return st
+	}
+	k.errorf(pos, "unknown cstruct '%s'", name)
+	return nil
+}
+
+func (k *checker) field(pos Pos, st *CStructDecl, name string) *CStructField {
+	for i := range st.Fields {
+		if st.Fields[i].Name == name {
+			return &st.Fields[i]
+		}
+	}
+	var names []string
+	for _, f := range st.Fields {
+		names = append(names, f.Name)
+	}
+	k.errorf(pos, "cstruct %s has no field '%s'; its fields are %s", st.Name, name, strings.Join(names, ", "))
+	return nil
+}
+
+// castNumTypes are the types `as` converts to a number.
+var castNumTypes = map[string]bool{"num": true, "number": true, "float64": true, "float32": true, "int8": true,
+	"int16": true, "int32": true, "int64": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"bool": true, "f64": true, "f32": true, "i32": true, "i64": true, "u8": true}
+
+// fieldType is how a field reads.
+func fieldType(f *CStructField) Type {
+	switch f.Type {
+	case "cstr":
+		return TStr
+	case "ptr":
+		return TPtr
+	}
+	return TNum
 }
 
 func (k *checker) infer(e Expression) Type {
@@ -580,6 +727,17 @@ func (k *checker) infer(e Expression) Type {
 		return TStr
 	case *ListExpr:
 		k.exprs(e.Elements)
+		if len(e.Elements) > 0 {
+			st := k.c.Structs[e.Elements[0]]
+			for _, x := range e.Elements {
+				if k.c.Structs[x] != st {
+					st = nil
+				}
+			}
+			if st != nil {
+				k.c.Elems[e] = st
+			}
+		}
 		return TList
 	case *MapExpr:
 		for i := range e.Keys {
@@ -645,10 +803,17 @@ func (k *checker) infer(e Expression) Type {
 		case "cstr":
 			return TStr
 		}
+		if st := k.c.Program.CStructs[e.Type]; st != nil {
+			k.c.Structs[e] = st
+			return TPtr
+		}
 		k.unsupported("C casts")
 		return TAny
 	case *IndexExpr:
 		t := k.expr(e.List)
+		if st := k.c.Structs[e.List]; st != nil {
+			k.errorf(e.Pos, "a cstruct has named fields: write x.%s instead of indexing", st.Fields[0].Name)
+		}
 		k.expr(e.Index)
 		if t == TNum || t == TFn {
 			k.errorf(e.Pos, "cannot index a %s", t)
@@ -670,6 +835,20 @@ func (k *checker) infer(e Expression) Type {
 		return t
 	case *FieldAccessExpr:
 		t := k.expr(e.Object)
+		if st := k.c.Structs[e.Object]; st != nil {
+			f := k.field(e.Pos, st, e.FieldName)
+			if f == nil {
+				return TAny
+			}
+			k.c.Fields[e] = f
+			if f.StructName != "" {
+				k.c.Structs[e] = k.c.Program.CStructs[f.StructName]
+			}
+			return fieldType(f)
+		}
+		if t == TPtr {
+			k.errorf(e.Pos, "cannot tell which cstruct this is; write (x as T).%s", e.FieldName)
+		}
 		if t == TNum || t == TStr || t == TList || t == TFn {
 			k.errorf(e.Pos, "a %s has no field '%s'", t, e.FieldName)
 		}
@@ -757,8 +936,44 @@ func (k *checker) infer(e Expression) Type {
 	return TAny
 }
 
+// structOp rewrites an arithmetic operator on cstructs into a call of the
+// struct's method: add, sub, mul, or scale for a number.
+func (k *checker) structOp(e *BinaryExpr) (Type, bool) {
+	ls, rs := k.c.Structs[e.Left], k.c.Structs[e.Right]
+	if ls == nil && rs == nil {
+		return 0, false
+	}
+	var st *CStructDecl
+	var method string
+	var args []Expression
+	switch {
+	case ls != nil && rs != nil && ls == rs && (e.Operator == "+" || e.Operator == "-" || e.Operator == "*"):
+		st, method, args = ls, map[string]string{"+": "add", "-": "sub", "*": "mul"}[e.Operator], []Expression{e.Left, e.Right}
+	case ls != nil && rs == nil && e.Operator == "*":
+		st, method, args = ls, "scale", []Expression{e.Left, e.Right}
+	case ls == nil && rs != nil && e.Operator == "*":
+		st, method, args = rs, "scale", []Expression{e.Right, e.Left}
+	case ls != nil && rs == nil && e.Operator == "/":
+		st, method, args = ls, "scale", []Expression{e.Left, &BinaryExpr{Pos: e.Pos, Left: &NumberExpr{Value: 1}, Operator: "/", Right: e.Right}}
+	default:
+		return 0, false
+	}
+	name := st.Name + "_" + method
+	if k.lookup(name) == nil {
+		k.errorf(e.Pos, "'%s' on a %s needs the method %s.%s", e.Operator, st.Name, st.Name, method)
+		return TAny, true
+	}
+	call := &CallExpr{Pos: e.Pos, Function: name, Args: args}
+	t := k.expr(call)
+	k.c.Rewrites[e] = call
+	return t, true
+}
+
 func (k *checker) binary(e *BinaryExpr) Type {
 	l, r := k.expr(e.Left), k.expr(e.Right)
+	if t, ok := k.structOp(e); ok {
+		return t
+	}
 	switch op := e.Operator; {
 	case l == TPtr && (op == "+" || op == "-") && (r == TNum || r == TAny):
 		return TPtr
@@ -815,8 +1030,11 @@ func (k *checker) call(e *CallExpr) Type {
 			return k.cCall(e, lib, method)
 		}
 		if sym := k.lookup(recv); sym != nil {
-			// x.f(args) calls f(x, args).
+			// x.f(args) calls f(x, args), or the method T.f when x is a cstruct T.
 			e.Function = method
+			if sym.Struct != nil && k.lookup(sym.Struct.Name+"_"+method) != nil {
+				e.Function = sym.Struct.Name + "_" + method
+			}
 			e.Args = append([]Expression{&IdentExpr{Pos: e.Pos, Name: recv}}, e.Args...)
 			return k.call(e)
 		}
@@ -828,8 +1046,26 @@ func (k *checker) call(e *CallExpr) Type {
 		return k.cCall(e, libcLib, name)
 	}
 	k.exprs(e.Args)
+	if st := k.c.Program.CStructs[name]; st != nil && k.lookup(name) == nil {
+		if len(e.Args) > len(st.Fields) {
+			k.errorf(e.Pos, "cstruct %s has %s, but %d %s given", name, plural(len(st.Fields), "field"), len(e.Args), wasWere(len(e.Args)))
+		}
+		k.c.Ctors[e] = st
+		k.c.Structs[e] = st
+		return TPtr
+	}
+	if len(e.Args) > 0 && k.lookup(name) == nil {
+		// obj.f(args) on an expression: the method T.f when obj is a cstruct T
+		if st := k.c.Structs[e.Args[0]]; st != nil && k.lookup(st.Name+"_"+name) != nil {
+			name = st.Name + "_" + name
+			e.Function = name
+		}
+	}
 	if sym := k.lookup(name); sym != nil {
 		k.c.Callees[e] = sym
+		if f := sym.Func; f != nil && f.Returns != nil && !sym.Mutable {
+			k.c.Structs[e] = f.Returns
+		}
 		if t := sym.Type; t != TAny && t != TFn && !sym.Mutable {
 			k.errorf(e.Pos, "cannot call '%s': it is a %s", name, t)
 		}
