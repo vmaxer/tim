@@ -15,6 +15,7 @@ name, which then takes precedence. Functions that fail return an error value.
 | `exitf(fmt, v...)` | `eprintf`, then exit with 1: `x or! { exitf("failed: %s\n", why) }` |
 | `args()` | the command-line arguments as a list of strings |
 | `env(name)` | an environment variable, or an error |
+| `platform()` | the target, like `"amd64-linux"` or `"arm64-darwin"`, known when compiling |
 
 ## Files and input
 
@@ -89,6 +90,7 @@ and `*` repeats.
 | `alloc(n)` | `n` zeroed bytes on the garbage-collected heap, as a `ptr`, kept while the program references it |
 | `read_i8 read_u8 read_i16 read_u16 read_i32 read_u32 read_i64 read_u64 read_f32 read_f64 read_ptr` | `read_u8(p, i)` reads a value of that C type at byte offset `i` |
 | `write_i8 write_u8 write_i16 write_u16 write_i32 write_u32 write_i64 write_u64 write_f32 write_f64 write_ptr` | `write_u8(p, i, v)` writes one |
+| `syscall(n, a...)` | Linux system call `n` with up to six arguments, one instruction: numbers pass as integers, strings and `ptr`s as addresses; the result is the kernel's, a negative errno on failure |
 
 `p + n` offsets a `ptr` by `n` bytes and `x as ptr` makes one from an address.
 C functions are called through their library: `c.malloc(16)`, `sdl.SDL_Init(0)`.

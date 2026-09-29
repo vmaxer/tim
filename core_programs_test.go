@@ -15,6 +15,7 @@ import (
 // TestCorePrograms compiles testdata/core/*.tim with the core code generator
 // for the host, and on Linux also for the other architectures under qemu,
 // and compares their output with the .want files. TIM_UPDATE=1 rewrites them.
+// Programs named *_linux.tim run only on Linux.
 func TestCorePrograms(t *testing.T) {
 	files, _ := filepath.Glob("testdata/core/*.tim")
 	if len(files) == 0 {
@@ -42,6 +43,9 @@ func TestCorePrograms(t *testing.T) {
 		name := strings.TrimSuffix(filepath.Base(src), ".tim")
 		for _, tg := range targets {
 			t.Run(name+"/"+tg.p.FullString(), func(t *testing.T) {
+				if strings.HasSuffix(name, "_linux") && tg.p.OS != OSLinux {
+					t.Skip("Linux only")
+				}
 				code, err := os.ReadFile(src)
 				if err != nil {
 					t.Fatal(err)

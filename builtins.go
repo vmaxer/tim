@@ -19,6 +19,7 @@ var builtins = map[string]builtin{
 	"exitf":    {1, -1, "printf to stderr, then exit with 1"},
 	"args":     {0, 0, "the command-line arguments as a list of strings"},
 	"env":      {1, 1, "an environment variable, or an error"},
+	"platform": {0, 0, `the target: "amd64-linux", "arm64-darwin", ...`},
 
 	// Files and input
 	"readln":     {0, 0, "read a line from stdin without its newline, or an error at end of input"},
@@ -75,6 +76,7 @@ var builtins = map[string]builtin{
 	// Memory through ptr values, at a byte offset
 	"cstr":    {1, 1, "copy the C string at a ptr into a string"},
 	"alloc":   {1, 1, "n zeroed bytes on the garbage-collected heap, as a ptr"},
+	"syscall": {1, 7, "a Linux system call: its number and up to six arguments; strings and ptrs pass as addresses"},
 	"read_i8": {2, 2, ""}, "read_u8": {2, 2, ""}, "read_i16": {2, 2, ""}, "read_u16": {2, 2, ""},
 	"read_i32": {2, 2, ""}, "read_u32": {2, 2, ""}, "read_i64": {2, 2, ""}, "read_u64": {2, 2, ""},
 	"read_f32": {2, 2, ""}, "read_f64": {2, 2, ""}, "read_ptr": {2, 2, ""},
@@ -105,7 +107,7 @@ var removedBuiltins = map[string]string{
 	"is_nan": "x != x is true only for NaN", "is_inf": "compare with 1 / 0.0", "is_finite": "compare with 1 / 0.0",
 	"safe_divide": "division by zero is already an error value: a / b or! 0", "safe_sqrt": "use sqrt(x) or! 0", "safe_ln": "use log(x) or! 0",
 	"getpid": "call C: c.getpid()", "fork": "call C: c.fork()", "waitpid": "call C: c.waitpid(pid, 0, 0)",
-	"mmap": "call C: c.mmap(...)", "munmap": "call C: c.munmap(p, n)", "syscall": "call C functions through import",
+	"mmap": "call C: c.mmap(...)", "munmap": "call C: c.munmap(p, n)",
 	"dlopen": "import the library: import foo as f", "dlsym": "import the library: import foo as f",
 	"atomic_add": "Tim 2 programs are single-threaded", "atomic_cas": "Tim 2 programs are single-threaded",
 	"atomic_load": "Tim 2 programs are single-threaded", "atomic_store": "Tim 2 programs are single-threaded",

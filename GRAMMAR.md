@@ -302,6 +302,11 @@ convert back: integers and floating point to numbers, pointers to `ptr` values (
 `NULL`), `void` to `0`. When a function has no known signature, an exact integer
 passes as an integer, any other number as a `double`, and the result is an integer.
 
+A call to a function whose signature is known, and whose arguments fit in the
+platform's argument registers, is a direct machine call: the conversions are a few
+inline instructions. Variadic functions such as `printf` go through a general path.
+On Linux, `syscall(n, ...)` is a system call without any library.
+
 A **ptr** is a C address. `p + n` is n bytes further, `p == 0` tests for `NULL`,
 `cstr(p)` copies a C string into a Tim string, and `read_u8(p, i)` ...
 `read_f64(p, i)`, `write_u8(p, i, v)` ... `write_f64(p, i, v)` access memory at

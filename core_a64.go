@@ -223,10 +223,34 @@ func (a *a64) shiftImm(o alu, dst, x reg, n uint8) {
 	s := uint32(n)
 	if o == aluShl {
 		a.i(0xD3400000 | ((64-s)&63)<<16 | (63-s)<<10 | a.r(x)<<5 | a.r(dst)) // lsl
+	} else if o == aluSar {
+		a.i(0x93400000 | s<<16 | 63<<10 | a.r(x)<<5 | a.r(dst)) // asr
 	} else {
 		a.i(0xD3400000 | s<<16 | 63<<10 | a.r(x)<<5 | a.r(dst)) // lsr
 	}
 }
+
+func (a *a64) convert(o cvt, dst, src reg) {
+	switch o {
+	case cvtF64I64:
+		a.toD(0, src)
+		a.i(0x9E780000 | a.r(dst)) // fcvtzs x, d0
+	case cvtI64F64:
+		a.i(0x9E620000 | a.r(src)<<5) // scvtf d0, x
+		a.fromD(dst, 0)
+	case cvtF64F32:
+		a.toD(0, src)
+		a.i(0x1E624000)            // fcvt s0, d0
+		a.i(0x1E260000 | a.r(dst)) // fmov w, s0
+	case cvtF32F64:
+		a.i(0x1E270000 | a.r(src)<<5) // fmov s0, w
+		a.i(0x1E22C000)               // fcvt d0, s0
+		a.fromD(dst, 0)
+	}
+}
+
+func (a *a64) fArg(i int, src reg, _ bool) { a.toD(uint32(i), src) }
+func (a *a64) fRet(dst reg)                { a.fromD(dst, 0) }
 
 func (a *a64) toD(d uint32, r reg)   { a.i(0x9E670000 | a.r(r)<<5 | d) } // fmov d, x
 func (a *a64) fromD(r reg, d uint32) { a.i(0x9E660000 | d<<5 | a.r(r)) } // fmov x, d
@@ -302,3 +326,8 @@ func (a *a64) callOff(l label, off int) {
 }
 
 func (a *a64) callReg(r reg) { a.i(0xD63F0000 | a.r(r)<<5) }
+
+func (a *a64) syscall() {
+	a.i(0xAA0003E8 | a.r(rEnv)<<16) // mov x8, env
+	a.i(0xD4000001)                 // svc #0
+}

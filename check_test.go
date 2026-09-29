@@ -11,7 +11,7 @@ func checkSource(t *testing.T, src string) (*Checked, string) {
 	if perr != "" {
 		t.Fatalf("parse error: %s", perr)
 	}
-	c, err := Check(prog, "test.tim", src)
+	c, err := Check(prog, "test.tim", src, OSLinux)
 	if err != nil {
 		return nil, err.Error()
 	}

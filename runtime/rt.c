@@ -102,6 +102,7 @@ typedef struct {
 typedef struct {
 	const OS *os;
 	u64 depth; // the arena depth; generated code reads it at offset 8
+	u64 outn;  // bytes in out; generated code reads it at offset 16
 	u64 overflow, collecting;
 	Region regions[MAX_DEPTH + 1];
 	u64 *rem, nrem, caprem;
@@ -119,7 +120,7 @@ typedef struct {
 	u64 c_flush; // C's fflush, when the program uses the C library
 	u64 argc;
 	char **argv, **envp;
-	u64 outn, inpos, inlen;
+	u64 inpos, inlen;
 	int ineof;
 	u64 rng[4];
 	int seeded;
@@ -3516,14 +3517,18 @@ static u64 from_c(R *r, u64 x, u64 kind) {
 		float f;
 		u32 u = (u32)x;
 		__builtin_memcpy(&f, &u, 4);
-		return num(f);
+		return f != f ? NAN_BITS : num(f);
 	}
-	case C_F64: return x;
+	case C_F64: return double_of(x) != double_of(x) ? NAN_BITS : x;
 	case C_PTR: case C_CSTR: return ptr_val(x);
 	case C_VOID: return 0;
 	}
 	return from_i64(r, (i64)x);
 }
+
+// rt_to_c and rt_from_c are the slow paths of direct C calls.
+u64 rt_to_c(R *r, u64 v, u64 kind) { return to_c(r, v, kind); }
+u64 rt_from_c(R *r, u64 x, u64 kind) { return from_c(r, x, kind); }
 
 #define FFI_REGS 8
 #define FFI_STACK 16

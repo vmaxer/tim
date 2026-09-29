@@ -102,11 +102,14 @@ type coreGen struct {
 
 	cImports      []cImport // C functions the program calls, in order
 	cImportLabels map[cImport]label
+	win64         bool // Windows on x86-64: the Microsoft calling convention
+	platform      string
 }
 
 // coreTarget describes where generated code will run.
 type coreTarget struct {
 	os   OS
+	arch Arch
 	blob []byte
 	syms map[string]int
 	// layout returns where the loader's import tables will be, as offsets
@@ -131,6 +134,9 @@ func compileCore(c *Checked, a asm, t coreTarget) (code []byte, entry int, cimps
 	g := &coreGen{c: c, a: a, syms: syms, blob: a.newLabel(), fnLabels: map[*Fun]label{},
 		strs: map[string]label{}, hoisted: map[Statement]bool{}, wrappers: map[string]*Var{}, nglobals: len(c.Globals),
 		cImportLabels: map[cImport]label{}}
+	_, isX86 := a.(*x86)
+	g.win64 = isX86 && t.os == OSWindows
+	g.platform = Platform{Arch: t.arch, OS: t.os}.FullString()
 	main, imports := a.newLabel(), a.newLabel()
 	entry = a.pos()
 	a.start(main, g.blob, g.sym("rt_start"), imports, t.os)
@@ -1150,7 +1156,181 @@ func (g *coreGen) construct(st *CStructDecl, args []Expression) {
 
 // cCall calls a C function through rt_ffi, which converts the arguments by
 // their C types and follows the platform's calling convention.
+// cCall calls a C function. A call with a known signature whose arguments
+// all go in registers is a direct call: arguments are converted inline and
+// the function is called through its import entry. Other calls, such as
+// variadic ones, go through rt_ffi.
 func (g *coreGen) cCall(f *cFunc, args []Expression) {
+	ps, direct := g.cPlaces(f, len(args))
+	if !direct {
+		g.cCallRT(f, args)
+		return
+	}
+	g.array(args, func(base int32, n int) {
+		for i, k := range f.params {
+			g.toC(base+int32(8*i), k)
+		}
+		// Tim's buffered output comes before whatever C prints (R.outn)
+		flushed := g.a.newLabel()
+		g.a.load(rB, rRT, 16)
+		g.a.brZero(rB, flushed)
+		g.callRT("rt_flush", rt())
+		g.a.bind(flushed)
+		for i, p := range ps {
+			if p.fp {
+				g.a.load(rA, rFP, base+int32(8*i))
+				g.a.fArg(p.reg, rA, f.params[i] == cF32)
+			}
+		}
+		g.a.addr(rEnv, g.cImport(f.lib, f.name))
+		g.a.load(rEnv, rEnv, 0)
+		for i, p := range ps {
+			if !p.fp {
+				g.a.load(g.cArgReg(p.reg), rFP, base+int32(8*i))
+			}
+		}
+		if g.win64 {
+			g.f.maxOut = max(g.f.maxOut, 4) // the callee's home area
+		}
+		g.a.callReg(rEnv)
+		g.fromC(f.ret)
+	})
+}
+
+// cPlace is the register of a C argument: the index among the integer or
+// the floating-point argument registers.
+type cPlace struct {
+	fp  bool
+	reg int
+}
+
+// cPlaces returns where a direct call puts the arguments of f, or false
+// when the call needs rt_ffi.
+func (g *coreGen) cPlaces(f *cFunc, n int) ([]cPlace, bool) {
+	if !f.known || f.variadic || n != len(f.params) {
+		return nil, false
+	}
+	var ps []cPlace
+	gp, fp := 0, 0
+	for i, k := range f.params {
+		isF := k == cF32 || k == cF64
+		switch {
+		case k == cDyn || k == cVoid:
+			return nil, false
+		case g.win64: // positional: rcx rdx r8 r9 or xmm0-3
+			if i == 4 {
+				return nil, false
+			}
+			ps = append(ps, cPlace{isF, i})
+		case isF:
+			if fp == 8 {
+				return nil, false
+			}
+			ps = append(ps, cPlace{true, fp})
+			fp++
+		default:
+			if gp == 6 {
+				return nil, false
+			}
+			ps = append(ps, cPlace{false, gp})
+			gp++
+		}
+	}
+	return ps, true
+}
+
+// cArgReg is the i-th integer argument register of C.
+func (g *coreGen) cArgReg(i int) reg {
+	if g.win64 {
+		return argReg([]int{3, 2, 4, 5}[i]) // rcx rdx r8 r9 among rdi rsi rdx rcx r8 r9
+	}
+	return argReg(i)
+}
+
+// toC converts the Tim value in slot t to the bits of a C value of kind k,
+// inline for plain doubles and C pointers, through the runtime otherwise.
+func (g *coreGen) toC(t int32, k uint8) {
+	slow, done := g.a.newLabel(), g.a.newLabel()
+	g.a.load(rA, rFP, t)
+	switch k {
+	case cF64:
+		g.a.brTagged(rA, slow)
+	case cF32:
+		g.a.brTagged(rA, slow)
+		g.a.convert(cvtF64F32, rA, rA)
+	case cPtr:
+		g.a.shiftImm(aluShr, rB, rA, 48)
+		g.a.imm(rC, 0xFFFF)
+		g.a.br(cNe, rB, rC, slow)
+		g.untag(rA)
+	case cCstr:
+		g.a.jmp(slow)
+	default:
+		g.a.brTagged(rA, slow)
+		g.a.convert(cvtF64I64, rA, rA)
+		// out of range saturates, or gives the minimum on x86
+		g.a.imm(rB, 1<<63)
+		g.a.br(cEq, rA, rB, slow)
+		g.a.imm(rB, 1<<63-1)
+		g.a.br(cEq, rA, rB, slow)
+	}
+	g.a.store(rA, rFP, t)
+	g.a.jmp(done)
+	g.a.bind(slow)
+	g.callRT("rt_to_c", rt(), slot(t), immv(uint64(k)))
+	g.a.store(rA, rFP, t)
+	g.a.bind(done)
+}
+
+// fromC converts the result of a C call of kind k to a Tim value in rA.
+func (g *coreGen) fromC(k uint8) {
+	slow, done := g.a.newLabel(), g.a.newLabel()
+	narrow := map[uint8]uint8{cI8: 56, cU8: 56, cI16: 48, cU16: 48, cI32: 32, cU32: 32}
+	switch k {
+	case cVoid:
+		g.a.imm(rA, 0)
+	case cF64, cF32:
+		g.a.fRet(rA)
+		if k == cF32 {
+			g.a.convert(cvtF32F64, rA, rA)
+		}
+		g.a.brTagged(rA, slow) // a NaN
+		k = cF64
+	case cPtr:
+		g.a.brZero(rA, done) // NULL is 0
+		g.a.imm(rB, 0xFFFF<<48)
+		g.a.op(aluOr, rA, rA, rB)
+	case cCstr:
+		g.a.jmp(slow)
+	case cI8, cI16, cI32:
+		g.a.shiftImm(aluShl, rA, rA, narrow[k])
+		g.a.shiftImm(aluSar, rA, rA, narrow[k])
+		g.a.convert(cvtI64F64, rA, rA)
+	case cU8, cU16, cU32:
+		g.a.shiftImm(aluShl, rA, rA, narrow[k])
+		g.a.shiftImm(aluShr, rA, rA, narrow[k])
+		g.a.convert(cvtI64F64, rA, rA)
+	default: // 64-bit integers are plain doubles below 2^53
+		g.a.mov(rB, rA)
+		if k != cU64 {
+			g.a.imm(rC, 1<<53)
+			g.a.op(aluAdd, rB, rB, rC)
+		}
+		g.a.imm(rC, 1<<53)
+		if k != cU64 {
+			g.a.imm(rC, 1<<54)
+		}
+		g.a.br(cGeU, rB, rC, slow)
+		g.a.convert(cvtI64F64, rA, rA)
+	}
+	g.a.jmp(done)
+	g.a.bind(slow)
+	g.callRT("rt_from_c", rt(), inA(), immv(uint64(k)))
+	g.a.bind(done)
+}
+
+// cCallRT calls a C function through rt_ffi, which handles any signature.
+func (g *coreGen) cCallRT(f *cFunc, args []Expression) {
 	fn := g.tmp()
 	g.a.addr(rA, g.cImport(f.lib, f.name))
 	g.a.load(rA, rA, 0)
@@ -1537,6 +1717,27 @@ func (g *coreGen) builtinCall(name string, args []Expression) {
 		return
 	case "alloc":
 		g.rtCall("rt_struct_n", args...)
+		return
+	case "platform":
+		g.expr(&StringExpr{Value: g.platform}, false)
+		return
+	case "syscall":
+		g.array(args, func(base int32, n int) {
+			for i := range n {
+				g.toC(base+int32(8*i), cI64)
+			}
+			flushed := g.a.newLabel()
+			g.a.load(rB, rRT, 16)
+			g.a.brZero(rB, flushed)
+			g.callRT("rt_flush", rt())
+			g.a.bind(flushed)
+			g.a.load(rEnv, rFP, base)
+			for i := 1; i < n; i++ {
+				g.a.load(argReg(i-1), rFP, base+int32(8*i))
+			}
+			g.a.syscall()
+			g.fromC(cI64)
+		})
 		return
 	case "exit":
 		if len(args) == 0 {

@@ -238,12 +238,45 @@ func (a *rv) op(o alu, dst, x, y reg) {
 }
 
 func (a *rv) shiftImm(o alu, dst, x reg, n uint8) {
-	f3 := uint32(1)
-	if o == aluShr {
+	f3, imm := uint32(1), int32(n)
+	switch o {
+	case aluShr:
 		f3 = 5
+	case aluSar:
+		f3, imm = 5, 0x400|imm
 	}
-	a.i(cvI(0x13, f3, a.r(dst), a.r(x), int32(n)))
+	a.i(cvI(0x13, f3, a.r(dst), a.r(x), imm))
 }
+
+func (a *rv) convert(o cvt, dst, src reg) {
+	switch o {
+	case cvtF64I64:
+		a.toF(0, src)
+		a.i(0xC2201053 | a.r(dst)<<7) // fcvt.l.d rd, f0, rtz
+	case cvtI64F64:
+		a.i(0xD2207053 | a.r(src)<<15) // fcvt.d.l f0, rs
+		a.fromF(dst, 0)
+	case cvtF64F32:
+		a.toF(0, src)
+		a.i(0x40107053)               // fcvt.s.d f0, f0
+		a.i(0xE0000053 | a.r(dst)<<7) // fmv.x.w rd, f0
+	case cvtF32F64:
+		a.i(0xF0000053 | a.r(src)<<15) // fmv.w.x f0, rs
+		a.i(0x42000053)                // fcvt.d.s f0, f0
+		a.fromF(dst, 0)
+	}
+}
+
+// fArg moves into fa<i>; a float is NaN-boxed, as the ABI requires.
+func (a *rv) fArg(i int, src reg, single bool) {
+	if single {
+		a.i(0xF0000053 | a.r(src)<<15 | uint32(10+i)<<7) // fmv.w.x
+		return
+	}
+	a.toF(uint32(10+i), src)
+}
+
+func (a *rv) fRet(dst reg) { a.fromF(dst, 10) }
 
 func (a *rv) toF(f uint32, r reg)   { a.i(0xF2000053 | a.r(r)<<15 | f<<7) } // fmv.d.x
 func (a *rv) fromF(r reg, f uint32) { a.i(0xE2000053 | f<<15 | a.r(r)<<7) } // fmv.x.d
@@ -319,3 +352,7 @@ func (a *rv) brTagged(x reg, l label) {
 func (a *rv) call(l label)             { a.far(xRA, l, 0) }
 func (a *rv) callOff(l label, off int) { a.far(xRA, l, off) }
 func (a *rv) callReg(r reg)            { a.i(cvI(0x67, 0, xRA, a.r(r), 0)) }
+func (a *rv) syscall() {
+	a.i(cvI(0x13, 0, 17, a.r(rEnv), 0)) // mv a7, env
+	a.i(0x00000073)                     // ecall
+}

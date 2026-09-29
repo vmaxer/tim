@@ -32,6 +32,17 @@ const (
 	aluXor
 	aluShl
 	aluShr // logical
+	aluSar // arithmetic, only for shiftImm
+)
+
+// Conversions between the bits of doubles, floats and 64-bit integers.
+type cvt uint8
+
+const (
+	cvtF64I64 cvt = iota // truncating
+	cvtI64F64
+	cvtF64F32 // the float's bits in the low 32 bits
+	cvtF32F64
 )
 
 type fop uint8
@@ -101,6 +112,9 @@ type asm interface {
 	op(o alu, dst, a, b reg)
 	shiftImm(o alu, dst, a reg, n uint8)
 	fop(o fop, dst, a, b reg) // doubles held as bits in integer registers
+	convert(o cvt, dst, src reg)
+	fArg(i int, src reg, single bool) // move bits into the i-th floating-point argument register of C
+	fRet(dst reg)                     // move the bits of C's floating-point result
 
 	jmp(l label)
 	br(c cond, a, b reg, l label)
@@ -112,6 +126,9 @@ type asm interface {
 	call(l label)
 	callOff(l label, off int) // call l+off
 	callReg(r reg)
+	// syscall traps to Linux: the number in rEnv, the arguments in
+	// rArg0..rArg0+5, the result in rA.
+	syscall()
 
 	align(n int)
 	emit(b []byte) // raw bytes such as constants

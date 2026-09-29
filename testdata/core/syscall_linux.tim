@@ -1,0 +1,10 @@
+// Linux system calls, inline: numbers differ by architecture
+nr = {"amd64-linux": {write: 1, getpid: 39, getppid: 110}}[platform()] or! {write: 64, getpid: 172, getppid: 173}
+print("buffered output comes first, ")
+msg = "then write(2)\n"
+println(syscall(nr.write, 1, msg, #msg) == #msg)
+println(syscall(nr.getpid) > 1, syscall(nr.getppid) > 0, syscall(nr.write, 1, 0, 1))
+buf = alloc(8)
+write_u32(buf, 0, 0x0a216968) // "hi!\n"
+syscall(nr.write, 1, buf, 4)
+println(platform() == "amd64-linux" or platform() == "arm64-linux" or platform() == "riscv64-linux")

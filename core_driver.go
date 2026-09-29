@@ -123,7 +123,7 @@ func compileSource(src []byte, path, out string, p Platform) (err error) {
 		return err
 	}
 	addPrelude(prog)
-	c, err := Check(prog, path, string(src))
+	c, err := Check(prog, path, string(src), p.OS)
 	// A program may span the .tim files of its directory: take definitions
 	// of undefined names from them until nothing more resolves.
 	for range 8 {
@@ -131,7 +131,7 @@ func compileSource(src []byte, path, out string, p Platform) (err error) {
 		if !errors.As(err, &ce) || !ce.OnlyUndefined || !addSiblingDefs(prog, path, ce.Undefined) {
 			break
 		}
-		c, err = Check(prog, path, string(src))
+		c, err = Check(prog, path, string(src), p.OS)
 	}
 	if err != nil {
 		ce := err.(*CheckError)
@@ -184,7 +184,7 @@ type coreWriter func(path string, arch Arch, code []byte, entry int, cimps []cIm
 
 // coreTargetFor returns what the core needs for a platform, or a nil asm.
 func coreTargetFor(p Platform) (coreTarget, asm, coreWriter) {
-	t := coreTarget{os: p.OS}
+	t := coreTarget{os: p.OS, arch: p.Arch}
 	switch {
 	case p.OS == OSLinux && p.Arch == ArchX86_64:
 		t.blob, t.syms, t.layout = rtLinuxAMD64, rtLinuxAMD64Syms, elfLayout

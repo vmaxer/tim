@@ -102,8 +102,9 @@ func parseCDecl(d string) (*CFunctionSignature, string) {
 	return sig, name
 }
 
-// cKind maps a C type to how its values convert.
-func cKind(t string) uint8 {
+// cKind maps a C type to how its values convert on os, where long is 32
+// bits on Windows.
+func cKind(t string, os OS) uint8 {
 	t = " " + strings.NewReplacer("*", " * ", "\t", " ").Replace(t) + " "
 	for _, q := range []string{" const ", " volatile ", " restrict ", " __restrict ", " struct ", " enum ", " signed "} {
 		t = strings.ReplaceAll(t, q, " ")
@@ -116,6 +117,14 @@ func cKind(t string) uint8 {
 			return cCstr
 		}
 		return cPtr
+	}
+	if os == OSWindows {
+		switch base {
+		case "long", "long int":
+			return cI32
+		case "unsigned long", "unsigned long int":
+			return cU32
+		}
 	}
 	switch base {
 	case "void":
@@ -150,16 +159,16 @@ func cKind(t string) uint8 {
 }
 
 // signature turns a parsed declaration into argument conversions.
-func (l *cLib) function(name string) *cFunc {
+func (l *cLib) function(name string, os OS) *cFunc {
 	f := &cFunc{lib: l, name: name, ret: cI64}
 	sig := l.funcs[name]
 	if sig == nil {
 		return f
 	}
 	f.known = true
-	f.ret = cKind(sig.ReturnType)
+	f.ret = cKind(sig.ReturnType, os)
 	for _, p := range sig.Params {
-		k := cKind(p.Type)
+		k := cKind(p.Type, os)
 		if k == cDyn {
 			f.variadic = true
 			break

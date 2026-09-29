@@ -196,10 +196,7 @@ func (x *x86) op(o alu, dst, a, b reg) {
 
 func (x *x86) shiftImm(o alu, dst, a reg, n uint8) {
 	x.mov(dst, a)
-	ext := byte(4)
-	if o == aluShr {
-		ext = 5
-	}
+	ext := map[alu]byte{aluShl: 4, aluShr: 5, aluSar: 7}[o]
 	d := x.r(dst)
 	x.b(rex(true, 0, d), 0xC1, 0xC0|ext<<3|d&7, n)
 }
@@ -233,6 +230,29 @@ func (x *x86) fop(o fop, dst, a, b reg) {
 	x.b(0xF2, 0x0F, map[fop]byte{fAdd: 0x58, fSub: 0x5C, fMul: 0x59, fDiv: 0x5E}[o], 0xC1)
 	x.fromX(dst, 0)
 }
+
+func (x *x86) convert(o cvt, dst, src reg) {
+	s, d := x.r(src), x.r(dst)
+	switch o {
+	case cvtF64I64:
+		x.toX(0, src)
+		x.b(0xF2, rex(true, d, 0), 0x0F, 0x2C, 0xC0|(d&7)<<3) // cvttsd2si d, xmm0
+	case cvtI64F64:
+		x.b(0xF2, rex(true, 0, s), 0x0F, 0x2A, 0xC0|s&7) // cvtsi2sd xmm0, s
+		x.fromX(dst, 0)
+	case cvtF64F32:
+		x.toX(0, src)
+		x.b(0xF2, 0x0F, 0x5A, 0xC0)                       // cvtsd2ss xmm0, xmm0
+		x.b(0x66, rex(false, 0, d), 0x0F, 0x7E, 0xC0|d&7) // movd d, xmm0
+	case cvtF32F64:
+		x.b(0x66, rex(false, 0, s), 0x0F, 0x6E, 0xC0|s&7) // movd xmm0, s
+		x.b(0xF3, 0x0F, 0x5A, 0xC0)                       // cvtss2sd xmm0, xmm0
+		x.fromX(dst, 0)
+	}
+}
+
+func (x *x86) fArg(i int, src reg, _ bool) { x.toX(byte(i), src) }
+func (x *x86) fRet(dst reg)                { x.fromX(dst, 0) }
 
 func (x *x86) jmp(l label) {
 	x.b(0xE9)
@@ -303,6 +323,12 @@ func (x *x86) call(l label) {
 func (x *x86) callOff(l label, off int) {
 	x.b(0xE8)
 	x.rel32(l, off)
+}
+
+func (x *x86) syscall() {
+	x.mov(rA, rEnv)
+	x.b(0x49, 0x89, 0xCA) // mov r10, rcx: the kernel's fourth argument
+	x.b(0x0F, 0x05)
 }
 
 func (x *x86) callReg(r reg) {

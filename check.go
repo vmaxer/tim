@@ -67,25 +67,25 @@ type Fun struct {
 
 // Checked is the result of checking a program.
 type Checked struct {
-	Program     *Program
-	Top         *Fun
-	Funcs       []*Fun
-	Globals     []*Var
-	Uses        map[*IdentExpr]*Var
-	Defs        map[Statement][]*Var // bindings made by AssignStmt, MultipleAssignStmt and LoopStmt
-	Updates     map[Statement]*Var   // the variable updated by an update statement
-	Callees     map[*CallExpr]*Var   // calls through a variable; absent for builtins
-	Fns         map[*LambdaExpr]*Fun
-	Deferred    map[*DeferStmt]*Fun // the deferred expression as a function of no arguments
-	Types       map[Expression]Type
-	CCalls      map[*CallExpr]*cFunc           // calls to C functions
-	CConsts     map[*NamespacedIdentExpr]int64 // C constants
-	Structs     map[Expression]*CStructDecl    // expressions that are cstructs
-	Ctors       map[*CallExpr]*CStructDecl     // cstruct constructors
-	Fields      map[Expression]*CStructField   // cstruct field reads
-	FieldSets   map[*FieldUpdateStmt]*CStructField
-	Elems       map[Expression]*CStructDecl // lists whose elements are cstructs
-	Rewrites    map[Expression]Expression   // operators on cstructs, as method calls
+	Program   *Program
+	Top       *Fun
+	Funcs     []*Fun
+	Globals   []*Var
+	Uses      map[*IdentExpr]*Var
+	Defs      map[Statement][]*Var // bindings made by AssignStmt, MultipleAssignStmt and LoopStmt
+	Updates   map[Statement]*Var   // the variable updated by an update statement
+	Callees   map[*CallExpr]*Var   // calls through a variable; absent for builtins
+	Fns       map[*LambdaExpr]*Fun
+	Deferred  map[*DeferStmt]*Fun // the deferred expression as a function of no arguments
+	Types     map[Expression]Type
+	CCalls    map[*CallExpr]*cFunc           // calls to C functions
+	CConsts   map[*NamespacedIdentExpr]int64 // C constants
+	Structs   map[Expression]*CStructDecl    // expressions that are cstructs
+	Ctors     map[*CallExpr]*CStructDecl     // cstruct constructors
+	Fields    map[Expression]*CStructField   // cstruct field reads
+	FieldSets map[*FieldUpdateStmt]*CStructField
+	Elems     map[Expression]*CStructDecl // lists whose elements are cstructs
+	Rewrites  map[Expression]Expression   // operators on cstructs, as method calls
 }
 
 type scope struct {
@@ -95,13 +95,14 @@ type scope struct {
 }
 
 type checker struct {
-	c      *Checked
-	file   string
-	errs   *ErrorCollector
-	sc     *scope
-	fn     *Fun
-	loops  int
-	cimps  map[string]*cLib // C libraries by namespace
+	os    OS // the target, for the sizes of C types
+	c     *Checked
+	file  string
+	errs  *ErrorCollector
+	sc    *scope
+	fn    *Fun
+	loops int
+	cimps map[string]*cLib // C libraries by namespace
 }
 
 // CheckError lists everything wrong with a program.
@@ -114,9 +115,10 @@ type CheckError struct {
 func (e *CheckError) Error() string { return e.Plain }
 
 // Check analyses a parsed program and returns a *CheckError when it is invalid.
-func Check(prog *Program, file, src string) (*Checked, error) {
+func Check(prog *Program, file, src string, os OS) (*Checked, error) {
 	top := &Fun{Name: "<top>"}
 	k := &checker{
+		os: os,
 		c: &Checked{
 			Program: prog, Top: top, Funcs: []*Fun{top},
 			Uses: map[*IdentExpr]*Var{}, Defs: map[Statement][]*Var{}, Updates: map[Statement]*Var{},
@@ -126,10 +128,10 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 			Fields: map[Expression]*CStructField{}, FieldSets: map[*FieldUpdateStmt]*CStructField{},
 			Elems: map[Expression]*CStructDecl{}, Rewrites: map[Expression]Expression{},
 		},
-		file:   file,
-		errs:   NewErrorCollector(20),
-		fn:     top,
-		cimps:  map[string]*cLib{"c": libcLib, "C": libcLib},
+		file:  file,
+		errs:  NewErrorCollector(20),
+		fn:    top,
+		cimps: map[string]*cLib{"c": libcLib, "C": libcLib},
 	}
 	k.errs.SetSourceCode(src)
 	k.sc = &scope{fn: top, names: map[string]*Var{}}
@@ -561,7 +563,7 @@ var opNames = map[string]string{"-": "subtract", "*": "multiply", "/": "divide",
 
 var builtinTypes = map[string]Type{
 	"str": TStr, "upper": TStr, "lower": TStr, "trim": TStr, "join": TStr, "replace": TStr, "chr": TStr,
-	"type": TStr, "readln": TStr, "read_file": TStr, "_error_code_extract": TStr,
+	"type": TStr, "readln": TStr, "read_file": TStr, "_error_code_extract": TStr, "platform": TStr,
 	"split": TList, "keys": TList, "values": TList, "sort": TList, "bytes": TList, "runes": TList,
 	"map": TList, "filter": TList, "zip": TList, "enumerate": TList, "args": TList,
 	"abs": TNum, "floor": TNum, "ceil": TNum, "round": TNum, "trunc": TNum, "sqrt": TNum, "exp": TNum,
@@ -1060,6 +1062,9 @@ func (k *checker) call(e *CallExpr) Type {
 		}
 		return TAny
 	}
+	if name == "syscall" && k.os != OSLinux {
+		k.errorf(e.Pos, "syscall is for Linux, whose system calls are stable; on %s call the C library", k.os)
+	}
 	if len(e.Args) < b.min || b.max >= 0 && len(e.Args) > b.max {
 		want := plural(b.min, "argument")
 		switch {
@@ -1082,7 +1087,7 @@ func (k *checker) call(e *CallExpr) Type {
 // cCall checks a call of a C function.
 func (k *checker) cCall(e *CallExpr, lib *cLib, name string) Type {
 	k.exprs(e.Args)
-	f := lib.function(name)
+	f := lib.function(name, k.os)
 	k.c.CCalls[e] = f
 	if !f.known {
 		return TAny
