@@ -1,3 +1,0 @@
-println("Test1")
-x := 42
-println("Test2")

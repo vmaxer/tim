@@ -13,13 +13,12 @@ func TestBooleanTypeLexing(t *testing.T) {
 	}{
 		{"yes keyword", "yes", TOKEN_YES},
 		{"no keyword", "no", TOKEN_NO},
-		{"bool type", "bool", TOKEN_BOOL},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			lexer := &Lexer{input: tt.input}
-			token := lexer.NextToken()
+			toks, _ := Lex(tt.input)
+			token := toks[0]
 			if token.Type != tt.expected {
 				t.Errorf("Expected token type %v, got %v", tt.expected, token.Type)
 			}
@@ -40,7 +39,7 @@ func TestBooleanTypeParsing(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parser := NewParser(tt.code)
+			parser := NewParserWithFilename(tt.code, "test.tim")
 			program := parser.ParseProgram()
 			if program == nil {
 				t.Fatal("ParseProgram returned nil")
@@ -80,7 +79,7 @@ func TestBooleanTypeCompilation(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			parser := NewParser(tt.code)
+			parser := NewParserWithFilename(tt.code, "test.tim")
 			program := parser.ParseProgram()
 			if program == nil {
 				t.Fatal("ParseProgram returned nil")
@@ -91,34 +90,6 @@ func TestBooleanTypeCompilation(t *testing.T) {
 				t.Fatal("No statements parsed")
 			}
 		})
-	}
-}
-
-// TestBooleanTypeInference tests that getExprType correctly identifies booleans
-func TestBooleanTypeInference(t *testing.T) {
-	platform := Platform{
-		Arch: ArchX86_64,
-		OS:   OSLinux,
-	}
-
-	compiler := &TimCompiler{
-		platform: platform,
-		varTypes: make(map[string]string),
-	}
-
-	// Check type inference
-	yesExpr := &BooleanExpr{Value: true}
-	noExpr := &BooleanExpr{Value: false}
-
-	yesType := compiler.getExprType(yesExpr)
-	noType := compiler.getExprType(noExpr)
-
-	if yesType != "bool" {
-		t.Errorf("Expected 'bool' type for yes, got '%s'", yesType)
-	}
-
-	if noType != "bool" {
-		t.Errorf("Expected 'bool' type for no, got '%s'", noType)
 	}
 }
 

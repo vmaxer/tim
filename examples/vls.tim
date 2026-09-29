@@ -46,7 +46,7 @@ main = {
             break
         }
 
-        first := peek8(entry as cptr, D_NAME_OFFSET)
+        first := read_u8(entry as cptr, D_NAME_OFFSET)
         first == 46 {
             continue
         }
@@ -54,7 +54,7 @@ main = {
         name_ptr := (entry as num) + D_NAME_OFFSET
         c.printf("%s" as cstring, name_ptr as cptr)
 
-        dt := peek8(entry as cptr, D_TYPE_OFFSET)
+        dt := read_u8(entry as cptr, D_TYPE_OFFSET)
         if dt == DT_DIR {
             c.printf("/\n" as cstring)
         }

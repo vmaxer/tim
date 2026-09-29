@@ -1,7 +1,7 @@
 // Ackermann function - Tests deep recursion and multiple recursive calls
 // This is a classic benchmark for testing recursion depth and memoization
 
-ack = (m, n) {
+ack = (m, n) -> {
     | m == 0 => n + 1
     | n == 0 => ack(m - 1, 1)
     ~> ack(m - 1, ack(m, n - 1))

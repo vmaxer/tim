@@ -41,7 +41,7 @@ println(calculate(5, 3))
 			name: "recursive_lambda",
 			source: `factorial := (n, acc) -> n == 0 {
     => acc
-    ~> factorial(n-1, n*acc) ! 100
+    ~> factorial(n-1, n*acc)
 }
 println(factorial(5, 1))
 `,

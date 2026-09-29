@@ -2,18 +2,18 @@
 // Tests: recursion, pattern matching, arithmetic
 
 // Recursive factorial
-fact = (n) {
+fact = (n) -> {
     | n <= 1 => 1
     ~> n * fact(n - 1)
 }
 
 // Tail-recursive factorial using helper
-fact_tail_helper = (n, acc) {
+fact_tail_helper = (n, acc) -> {
     | n <= 1 => acc
     ~> fact_tail_helper(n - 1, n * acc)
 }
 
-fact_tail = (n) {
+fact_tail = (n) -> {
     fact_tail_helper(n, 1)
 }
 

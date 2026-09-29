@@ -13,8 +13,8 @@ func TestIfLexing(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		lexer := &Lexer{input: tt.input}
-		token := lexer.NextToken()
+		toks, _ := Lex(tt.input)
+		token := toks[0]
 		if token.Type != tt.expected {
 			t.Fatalf("expected token %v, got %v", tt.expected, token.Type)
 		}
@@ -22,7 +22,7 @@ func TestIfLexing(t *testing.T) {
 }
 
 func TestIfParsing(t *testing.T) {
-	parser := NewParser(`main = {
+	parser := NewParserWithFilename(`main = {
 if 1 {
     println(1)
 } elif 0 {
@@ -30,7 +30,7 @@ if 1 {
 } else {
     println(3)
 }
-}`)
+}`, "test.tim")
 	program := parser.ParseProgram()
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 top-level statement, got %d", len(program.Statements))

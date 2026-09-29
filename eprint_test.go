@@ -60,16 +60,16 @@ println("completed")
 			wantExit:   0,
 		},
 		{
-			name:       "exitln exits",
-			code:       `exitln("fatal error")`,
+			name:       "exitf exits",
+			code:       `exitf("fatal %s\n", "error")`,
 			wantStdout: "",
 			wantStderr: "fatal error\n",
 			wantExit:   1,
 		},
 		{
-			name: "exitln does not continue",
+			name: "exitf does not continue",
 			code: `
-exitln("error")
+exitf("error\n")
 println("should not see this")
 `,
 			wantStdout: "",
@@ -162,7 +162,7 @@ func compileTestCode(t *testing.T, code string) string {
 		OS:   osType,
 		Arch: archType,
 	}
-	if err := CompileTimWithOptions(srcFile, exePath, platform, 0, false, false); err != nil {
+	if err := CompileTim(srcFile, exePath, platform); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
 	}
 

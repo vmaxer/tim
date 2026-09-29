@@ -1,0 +1,47 @@
+keep := []
+total := 0
+@ frame in 0..<200 {
+    arena {
+        junk = [str(i) + "x" @ i in 0..<5000]
+        total += #junk
+        frame % 50 == 0 { push(keep, f"frame {frame}: {junk[42]}") }
+    }
+}
+println(total, keep)
+r = arena { [1, 2, [3, "four"]] }
+println(r)
+f(n) = arena {
+    xs = [i * i @ i in 0..<n]
+    n > 3 { ret xs[3] }
+    -1
+}
+println(f(10), f(2))
+m := {a: 1}
+counter := 0
+bump() = { counter <- counter + 1; counter }
+@ i in 0..<3 { arena { m["k" + str(i)] <- [i, "v"]; bump() } }
+println(m, counter)
+@ i in 0..<10 { arena { i == 5 { break }; s = str(i) } }
+nested = arena { a = [1]; b = arena { [a, [2]] }; [b, "x"] }
+println(nested)
+// a closure made in an arena, and a cell it updates, outlive it
+hits := 0
+g = arena { name = "g" + str(1); () -> { hits <- hits + 1; name } }
+println(g(), g(), hits)
+// a long arena collects itself and keeps what escapes
+kept := []
+arena {
+    @ i in 0..<600000 {
+        s = str(i)
+        i % 100000 == 0 { push(kept, s) }
+    }
+}
+println(kept)
+// the write barrier of a captured variable
+collect() = {
+    acc := []
+    add = x -> arena { acc <- acc + [str(x) + "!"]; 0 }
+    @ i in 0..<5 { add(i); arena { junk = [str(k) + "?" @ k in 0..<3000] } }
+    acc
+}
+println(collect())

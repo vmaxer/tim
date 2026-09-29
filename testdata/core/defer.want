@@ -1,0 +1,14 @@
+Start
+bottom
+cleanup 1
+leave 1
+cleanup 2
+leave 2
+cleanup 3
+leave 3
+2
+g done
+early
+x is 2
+Deferred last
+[exit 0]

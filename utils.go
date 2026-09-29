@@ -1,31 +1,9 @@
-// Completion: 100% - Utility module complete
 package main
 
 import (
-	"hash/fnv"
 	"sort"
 	"strings"
 )
-
-// utils.go - Utility helper functions
-//
-// This file contains general-purpose utility functions used throughout
-// the compiler for string operations, hashing, and similarity matching.
-
-// hashStringKey hashes a string identifier to a uint64 for use as a map key.
-// Uses FNV-1a hash algorithm for deterministic, collision-resistant hashing.
-// Currently limited to 30-bit hash due to compiler integer literal limitations.
-// Sets bit 30 to distinguish symbolic keys from typical numeric indices.
-func hashStringKey(s string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(s))
-	// Use FNV-1a 32-bit variant for now, mask to 30 bits (0x3FFFFFFF)
-	// Then set bit 30 (0x40000000) to distinguish symbolic keys
-	// This gives us range 0x40000000 to 0x7FFFFFFF (1073741824 to 2147483647)
-	h32 := fnv.New32a()
-	h32.Write([]byte(s))
-	return uint64((h32.Sum32() & 0x3FFFFFFF) | 0x40000000)
-}
 
 // levenshteinDistance calculates the edit distance between two strings.
 // Adjacent transpositions count as one edit (Damerau-Levenshtein), so the
@@ -82,11 +60,13 @@ func findSimilarIdentifiers(name string, availableVars map[string]int, maxSugges
 	}
 
 	var suggestions []suggestion
-	threshold := 3 // Maximum edit distance for suggestions
+	// Allow about one edit per three characters, so short names only match
+	// near-identical ones.
+	threshold := min(3, (len(name)+1)/3)
 
 	for varName := range availableVars {
 		dist := levenshteinDistance(name, varName)
-		if dist <= threshold && dist > 0 {
+		if dist <= threshold && dist > 0 && dist < len(varName) {
 			suggestions = append(suggestions, suggestion{varName, dist})
 		}
 	}
@@ -105,43 +85,6 @@ func findSimilarIdentifiers(name string, availableVars map[string]int, maxSugges
 		result = append(result, suggestions[i].name)
 	}
 	return result
-}
-
-// isUppercase checks if an identifier is all uppercase (constant naming convention)
-func isUppercase(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for _, ch := range s {
-		if ch >= 'a' && ch <= 'z' {
-			return false
-		}
-	}
-	return true
-}
-
-func isAllUppercase(s string) bool {
-	if len(s) == 0 {
-		return false
-	}
-	for _, ch := range s {
-		if ch >= 'a' && ch <= 'z' {
-			return false
-		}
-		if ch >= 'A' && ch <= 'Z' {
-			continue
-		}
-		if ch >= '0' && ch <= '9' {
-			continue
-		}
-		if ch == '_' {
-			continue
-		}
-		return false
-	}
-	// Must start with uppercase letter
-	firstCh := rune(s[0])
-	return firstCh >= 'A' && firstCh <= 'Z'
 }
 
 // deriveAliasFromSource extracts a suitable alias from an import source

@@ -1,3 +1,0 @@
-x := 42
-s := x as string
-println(s)

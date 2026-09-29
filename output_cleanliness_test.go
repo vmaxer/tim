@@ -43,7 +43,7 @@ func TestDefaultBuildProducesCleanStderr(t *testing.T) {
 		captured <- string(data)
 	}()
 
-	compileErr := CompileTimWithOptions(src, exe, platform, 0, false, false)
+	compileErr := CompileTim(src, exe, platform)
 
 	_ = w.Close()
 	os.Stderr = origStderr

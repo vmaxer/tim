@@ -1,4 +1,3 @@
-// Completion: 100% - Error handling complete, clear and helpful messages
 package main
 
 import (
@@ -60,21 +59,6 @@ const (
 	CategoryInternal
 )
 
-func (c ErrorCategory) String() string {
-	switch c {
-	case CategorySyntax:
-		return "syntax"
-	case CategorySemantic:
-		return "semantic"
-	case CategoryCodegen:
-		return "codegen"
-	case CategoryInternal:
-		return "internal"
-	default:
-		return "unknown"
-	}
-}
-
 // SourceLocation represents a position in source code
 type SourceLocation struct {
 	File   string
@@ -104,11 +88,6 @@ type CompilerError struct {
 	Message  string
 	Location SourceLocation
 	Context  ErrorContext
-}
-
-// Error implements the error interface
-func (e CompilerError) Error() string {
-	return fmt.Sprintf("%s: %s", e.Location, e.Message)
 }
 
 // Format returns a nicely formatted error message with context
@@ -238,15 +217,6 @@ func (ec *ErrorCollector) AddError(err CompilerError) {
 	}
 }
 
-// AddWarning adds a warning
-func (ec *ErrorCollector) AddWarning(warn CompilerError) {
-	warn.Level = LevelWarning
-	if warn.Context.SourceLine == "" && ec.sourceCode != "" {
-		warn.Context.SourceLine = ec.getSourceLine(warn.Location.Line)
-	}
-	ec.warnings = append(ec.warnings, warn)
-}
-
 // getSourceLine extracts a specific line from source code
 func (ec *ErrorCollector) getSourceLine(lineNum int) string {
 	if ec.sourceCode == "" || lineNum <= 0 {
@@ -263,26 +233,6 @@ func (ec *ErrorCollector) getSourceLine(lineNum int) string {
 // HasErrors returns true if any errors were collected
 func (ec *ErrorCollector) HasErrors() bool {
 	return len(ec.errors) > 0
-}
-
-// HasFatalError returns true if any fatal errors were collected
-func (ec *ErrorCollector) HasFatalError() bool {
-	for _, err := range ec.errors {
-		if err.Level == LevelFatal {
-			return true
-		}
-	}
-	return false
-}
-
-// ErrorCount returns the number of errors
-func (ec *ErrorCollector) ErrorCount() int {
-	return len(ec.errors)
-}
-
-// WarningCount returns the number of warnings
-func (ec *ErrorCollector) WarningCount() int {
-	return len(ec.warnings)
 }
 
 // ShouldStop returns true if we've hit the error limit
@@ -310,79 +260,21 @@ func (ec *ErrorCollector) Report(useColor bool) string {
 		sb.WriteString(warn.Format(useColor))
 	}
 
-	// Summary
-	if len(ec.errors) > 0 || len(ec.warnings) > 0 {
-		sb.WriteString("\n")
-		if len(ec.errors) > 0 {
-			if useColor {
-				sb.WriteString("\033[1;31m")
-			}
-			sb.WriteString(fmt.Sprintf("%d error(s)", len(ec.errors)))
-			if useColor {
-				sb.WriteString("\033[0m")
-			}
-		}
+	if n := len(ec.errors) + len(ec.warnings); n > 1 {
+		summary := fmt.Sprintf("%d errors", len(ec.errors))
 		if len(ec.warnings) > 0 {
-			if len(ec.errors) > 0 {
-				sb.WriteString(", ")
-			}
-			if useColor {
-				sb.WriteString("\033[1;33m")
-			}
-			sb.WriteString(fmt.Sprintf("%d warning(s)", len(ec.warnings)))
-			if useColor {
-				sb.WriteString("\033[0m")
-			}
+			summary = fmt.Sprintf("%d errors and %d warnings", len(ec.errors), len(ec.warnings))
 		}
-		sb.WriteString(" found\n")
+		if useColor {
+			summary = "\033[1;31m" + summary + "\033[0m"
+		}
+		sb.WriteString("\n" + summary + "\n")
 	}
 
 	return sb.String()
 }
 
-// Clear resets the error collector
-func (ec *ErrorCollector) Clear() {
-	ec.errors = make([]CompilerError, 0)
-	ec.warnings = make([]CompilerError, 0)
-}
-
 // Helper functions for creating common errors
-
-// UndefinedVariableError creates an error for undefined variables
-func UndefinedVariableError(name string, loc SourceLocation) CompilerError {
-	return CompilerError{
-		Level:    LevelError,
-		Category: CategorySemantic,
-		Message:  fmt.Sprintf("undefined variable '%s'", name),
-		Location: loc,
-		Context: ErrorContext{
-			HelpText: "Variables must be declared before use",
-		},
-	}
-}
-
-// TypeMismatchError creates an error for type mismatches
-func TypeMismatchError(expected, actual string, loc SourceLocation) CompilerError {
-	return CompilerError{
-		Level:    LevelError,
-		Category: CategorySemantic,
-		Message:  fmt.Sprintf("type mismatch: expected %s, got %s", expected, actual),
-		Location: loc,
-	}
-}
-
-// ImmutableUpdateError creates an error for updating immutable variables
-func ImmutableUpdateError(name string, loc SourceLocation) CompilerError {
-	return CompilerError{
-		Level:    LevelError,
-		Category: CategorySemantic,
-		Message:  fmt.Sprintf("cannot update immutable variable '%s'", name),
-		Location: loc,
-		Context: ErrorContext{
-			Suggestion: fmt.Sprintf("declare '%s' as mutable with ':='", name),
-		},
-	}
-}
 
 // SyntaxError creates a syntax error
 func SyntaxError(message string, loc SourceLocation) CompilerError {
@@ -391,28 +283,5 @@ func SyntaxError(message string, loc SourceLocation) CompilerError {
 		Category: CategorySyntax,
 		Message:  message,
 		Location: loc,
-	}
-}
-
-// UnexpectedTokenError creates an error for unexpected tokens
-func UnexpectedTokenError(expected, got string, loc SourceLocation) CompilerError {
-	return CompilerError{
-		Level:    LevelError,
-		Category: CategorySyntax,
-		Message:  fmt.Sprintf("expected %s, got %s", expected, got),
-		Location: loc,
-	}
-}
-
-// FatalError creates a fatal internal error
-func FatalError(message string, loc SourceLocation) CompilerError {
-	return CompilerError{
-		Level:    LevelFatal,
-		Category: CategoryInternal,
-		Message:  message,
-		Location: loc,
-		Context: ErrorContext{
-			HelpText: "This is an internal compiler error. Please report this bug.",
-		},
 	}
 }

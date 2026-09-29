@@ -102,7 +102,7 @@ println("Main")
 		{
 			name: "defer with function",
 			source: `
-cleanup := -> {
+cleanup := () -> {
     println("Cleaning up")
 }
 defer cleanup()
@@ -135,7 +135,7 @@ func TestMatchExpressionsExtended(t *testing.T) {
 			source: `
 x := 42
 result := x {
-    42 -> 1
+    42 => 1
     ~> 0
 }
 println(result)
@@ -147,7 +147,7 @@ println(result)
 			source: `
 y := 99
 result := y {
-    42 -> 1
+    42 => 1
     ~> 0
 }
 println(result)

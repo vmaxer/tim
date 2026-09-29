@@ -300,7 +300,7 @@ func TestSDL3ExampleCompiles(t *testing.T) {
 				OS:   osType,
 				Arch: archType,
 			}
-			if err := CompileTimWithOptions(srcFile, exePath, platform, 0, false, false); err != nil {
+			if err := CompileTim(srcFile, exePath, platform); err != nil {
 				t.Fatalf("Compilation failed: %v", err)
 			}
 
@@ -331,7 +331,7 @@ func TestSDL3ExampleCompiles(t *testing.T) {
 			OS:   osType,
 			Arch: archType,
 		}
-		if err := CompileTimWithOptions(srcFile, exePath, platform, 0, false, false); err != nil {
+		if err := CompileTim(srcFile, exePath, platform); err != nil {
 			t.Fatalf("Compilation failed: %v", err)
 		}
 

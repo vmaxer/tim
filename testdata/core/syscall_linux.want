@@ -1,0 +1,6 @@
+buffered output comes first, then write(2)
+1
+1 1 -14
+hi!
+1
+[exit 0]

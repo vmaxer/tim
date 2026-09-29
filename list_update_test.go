@@ -100,7 +100,7 @@ println(arr[3])
 // TestAppendFunction tests the append() builtin function
 func TestAppendFunction(t *testing.T) {
 	source := `list1 := [1, 2, 3]
-list2 := append(list1, 4)
+list2 := list1 + [4]
 println(list2[0])
 println(list2[1])
 println(list2[2])

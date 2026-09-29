@@ -1,4 +1,3 @@
-// Completion: 98% - All AST nodes implemented, comprehensive coverage
 package main
 
 import (
@@ -7,26 +6,21 @@ import (
 	"strings"
 )
 
+// Pos is a 1-based source position.
+type Pos struct{ Line, Col int }
+
+func (p Pos) String() string { return fmt.Sprintf("%d:%d", p.Line, p.Col) }
+
 // AST Nodes
 type Node interface {
 	String() string
 }
 
 type Program struct {
-	Statements         []Statement
-	ExportMode         string                  // "*" for export all without prefix, "" for require prefix
-	ExportedFuncs      []string                // Specific functions to export (only if ExportMode is not "*")
-	FunctionNamespaces map[string]string       // function name -> namespace (for imports)
-	CStructs           map[string]*CStructDecl // cstruct name -> declaration
-}
-
-func (p *Program) String() string {
-	var out strings.Builder
-	for _, stmt := range p.Statements {
-		out.WriteString(stmt.String())
-		out.WriteString("\n")
-	}
-	return out.String()
+	Statements    []Statement
+	ExportMode    string                  // "*" for export all without prefix, "" for require prefix
+	ExportedFuncs []string                // Specific functions to export (only if ExportMode is not "*")
+	CStructs      map[string]*CStructDecl // cstruct name -> declaration
 }
 
 type Statement interface {
@@ -35,16 +29,17 @@ type Statement interface {
 }
 
 type AssignStmt struct {
+	Pos            Pos
 	Name           string
 	Value          Expression
 	Mutable        bool     // true for := or <-, false for =
 	IsUpdate       bool     // true for <-, false for = and :=
-	IsReuseMutable bool     // true when = is used to update existing mutable variable
 	Precision      string   // Legacy type annotation: "b64", "f32", etc. (empty if none)
 	TypeAnnotation *TimType // Type annotation: num, str, cstring, cptr, etc. (nil if none)
 }
 
 type MultipleAssignStmt struct {
+	Pos      Pos
 	Names    []string   // Variable names (left side)
 	Value    Expression // Expression that should evaluate to a list (right side)
 	Mutable  bool       // true for := or <-, false for =
@@ -83,6 +78,7 @@ func (a *AssignStmt) String() string {
 func (a *AssignStmt) statementNode() {}
 
 type MapUpdateStmt struct {
+	Pos     Pos
 	MapName string     // Name of the map/list variable
 	Index   Expression // Index expression
 	Value   Expression // New value
@@ -92,13 +88,6 @@ func (m *MapUpdateStmt) String() string {
 	return fmt.Sprintf("%s[%s] <- %s", m.MapName, m.Index.String(), m.Value.String())
 }
 func (m *MapUpdateStmt) statementNode() {}
-
-type UseStmt struct {
-	Path string // Import path: "./file.tim" or "package_name"
-}
-
-func (u *UseStmt) String() string { return "use " + u.Path }
-func (u *UseStmt) statementNode() {}
 
 type ExportStmt struct {
 	Mode      string   // "*" for export all, "" for export specific functions
@@ -241,19 +230,6 @@ func (c *CStructDecl) CalculateStructLayout() {
 	c.Size = currentOffset
 }
 
-// ClassDecl represents a class definition (to be desugared to maps and closures)
-type ClassDecl struct {
-	Name         string                 // Class name
-	ClassVars    map[string]Expression  // Class-level variables (ClassName.var)
-	Methods      map[string]*LambdaExpr // Methods (instance functions)
-	Compositions []string               // Names of behavior maps to compose with <>
-}
-
-func (c *ClassDecl) String() string {
-	return fmt.Sprintf("class %s { ... }", c.Name)
-}
-func (c *ClassDecl) statementNode() {}
-
 type ExpressionStmt struct {
 	Expr Expression
 }
@@ -262,21 +238,20 @@ func (e *ExpressionStmt) String() string { return e.Expr.String() }
 func (e *ExpressionStmt) statementNode() {}
 
 type LoopStmt struct {
+	Pos Pos
 	// No explicit label - determined by nesting depth when created with @
 	Iterator      string     // Variable name (e.g., "i")
 	IteratorType  string     // Optional cstruct type annotation: `@ b as Ball in ...` (empty if none)
 	Iterable      Expression // Expression to iterate over (e.g., range(10))
 	Body          []Statement
-	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
-	NeedsMaxCheck bool        // Whether to emit runtime max iteration checking
-	BaseOffset    int         // Stack offset before loop body (set during collectSymbols)
-	NumThreads    int         // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
-	Reducer       *LambdaExpr // Optional reduction lambda for parallel loops: | a,b | { a + b }
-	Vectorized    bool        // Whether this loop has been marked for SIMD vectorization
-	VectorWidth   int         // Elements per SIMD vector (e.g., 4 for AVX doubles, 8 for AVX floats)
+	MaxIterations int64 // Maximum allowed iterations (math.MaxInt64 for infinite)
+	NeedsMaxCheck bool  // Whether to emit runtime max iteration checking
+	BaseOffset    int   // Stack offset before loop body (set during collectSymbols)
+	NumThreads    int   // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
 }
 
 type WhileStmt struct {
+	Pos           Pos
 	Condition     Expression  // Condition expression (e.g., n < 5)
 	Body          []Statement // Body statements to execute while condition is true
 	MaxIterations int64       // Maximum allowed iterations (required for condition loops)
@@ -296,6 +271,7 @@ type IfBranch struct {
 }
 
 type IfStmt struct {
+	Pos      Pos
 	Branches []IfBranch
 	ElseBody []Statement
 }
@@ -308,36 +284,6 @@ func (i *IfStmt) String() string {
 }
 
 func (i *IfStmt) statementNode() {}
-
-type ReceiveLoopStmt struct {
-	MessageVar string      // Variable name for received message (e.g., "msg")
-	SenderVar  string      // Variable name for sender address (e.g., "from")
-	Address    Expression  // Address expression to bind to (e.g., ":5000")
-	Body       []Statement // Body statements to execute for each message
-	BaseOffset int         // Stack offset before loop body
-}
-
-func (r *ReceiveLoopStmt) String() string {
-	return fmt.Sprintf("@ %s, %s in %s { ... }", r.MessageVar, r.SenderVar, r.Address.String())
-}
-
-func (r *ReceiveLoopStmt) statementNode() {}
-
-type LoopExpr struct {
-	// No explicit label - determined by nesting depth when created with @
-	Iterator      string      // Variable name (e.g., "i")
-	Iterable      Expression  // Expression to iterate over (e.g., range(10))
-	Body          []Statement // Body statements
-	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
-	NeedsMaxCheck bool        // Whether to emit runtime max iteration checking
-	NumThreads    int         // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
-	Reducer       *LambdaExpr // Optional reduction lambda for parallel loops: | a,b | { a + b }
-}
-
-func (l *LoopExpr) String() string {
-	return fmt.Sprintf("@ %s in %s { ... }", l.Iterator, l.Iterable.String())
-}
-func (l *LoopExpr) expressionNode() {}
 
 func (l *LoopStmt) String() string {
 	var out strings.Builder
@@ -368,6 +314,7 @@ func (l *LoopStmt) statementNode() {}
 // ret @N (Label=N) = exit loop N and all inner loops
 // @N (without ret) = continue loop N (IsBreak=false)
 type JumpStmt struct {
+	Pos     Pos
 	IsBreak bool       // true for ret (return/exit loop), false for continue (@N without ret)
 	Label   int        // 0 for function return, N for loop label
 	Value   Expression // Optional value to return
@@ -399,6 +346,7 @@ type Expression interface {
 }
 
 type NumberExpr struct {
+	Pos   Pos
 	Value float64
 	Exact *big.Rat // exact value when it is not a small integer (big integer or rational)
 }
@@ -431,6 +379,7 @@ func (b *BooleanExpr) String() string {
 func (b *BooleanExpr) expressionNode() {}
 
 type StringExpr struct {
+	Pos   Pos
 	Value string
 }
 
@@ -441,20 +390,15 @@ func (s *StringExpr) expressionNode() {}
 // Parts alternates between string literals and expressions
 // Example: f"Hello {name}" -> Parts = [StringExpr("Hello "), IdentExpr("name")]
 type FStringExpr struct {
+	Pos   Pos
 	Parts []Expression // Alternating string literals and expressions
 }
 
 func (f *FStringExpr) String() string  { return "f\"...\"" }
 func (f *FStringExpr) expressionNode() {}
 
-type AddressLiteralExpr struct {
-	Value string // The full address like "&8080" or "&localhost:8080"
-}
-
-func (a *AddressLiteralExpr) String() string  { return a.Value }
-func (a *AddressLiteralExpr) expressionNode() {}
-
 type IdentExpr struct {
+	Pos  Pos
 	Name string
 }
 
@@ -463,6 +407,7 @@ func (i *IdentExpr) expressionNode() {}
 
 // NamespacedIdentExpr represents a namespaced identifier like sdl.SDL_INIT_VIDEO
 type NamespacedIdentExpr struct {
+	Pos       Pos
 	Namespace string // e.g., "sdl"
 	Name      string // e.g., "SDL_INIT_VIDEO"
 }
@@ -470,37 +415,8 @@ type NamespacedIdentExpr struct {
 func (n *NamespacedIdentExpr) String() string  { return n.Namespace + "." + n.Name }
 func (n *NamespacedIdentExpr) expressionNode() {}
 
-// LoopStateExpr represents special loop variables: @first, @last, @counter, @i, @i1, @i2, etc.
-type LoopStateExpr struct {
-	Type      string // "first", "last", "counter", "i"
-	LoopLevel int    // 0 for @i (current loop), 1 for @i1 (outermost), 2 for @i2, etc.
-}
-
-func (l *LoopStateExpr) String() string {
-	return "@" + l.Type
-}
-func (l *LoopStateExpr) expressionNode() {}
-
-// JumpExpr represents a label jump used as an expression (e.g., in match blocks)
-type JumpExpr struct {
-	Label   int        // Target label (0 = outer scope, N = loop label)
-	Value   Expression // Optional value to return (for @0 value syntax)
-	IsBreak bool       // true for ret @N (exit loop), false for @N (continue loop)
-}
-
-func (j *JumpExpr) String() string {
-	prefix := "@"
-	if j.IsBreak {
-		prefix = "ret @"
-	}
-	if j.Value != nil {
-		return fmt.Sprintf("%s%d %s", prefix, j.Label, j.Value.String())
-	}
-	return fmt.Sprintf("%s%d", prefix, j.Label)
-}
-func (j *JumpExpr) expressionNode() {}
-
 type BinaryExpr struct {
+	Pos      Pos
 	Left     Expression
 	Operator string
 	Right    Expression
@@ -511,27 +427,9 @@ func (b *BinaryExpr) String() string {
 }
 func (b *BinaryExpr) expressionNode() {}
 
-// FMAExpr represents a Fused Multiply-Add pattern: a * b + c or a * b - c
-// This is recognized by the optimizer and can be compiled to FMA instructions (VFMADD/VFMSUB)
-type FMAExpr struct {
-	A        Expression // First multiplicand
-	B        Expression // Second multiplicand
-	C        Expression // Addend/subtrahend
-	IsSub    bool       // true for FMSUB (a * b - c), false for FMADD (a * b + c)
-	IsNegMul bool       // true for FNMADD (-(a * b) + c), not currently detected
-}
-
-func (f *FMAExpr) String() string {
-	op := "+"
-	if f.IsSub {
-		op = "-"
-	}
-	return fmt.Sprintf("fma(%s * %s %s %s)", f.A.String(), f.B.String(), op, f.C.String())
-}
-func (f *FMAExpr) expressionNode() {}
-
 // UnaryExpr represents a unary operation: not, -, #, ++expr, --expr
 type UnaryExpr struct {
+	Pos      Pos
 	Operator string
 	Operand  Expression
 }
@@ -541,28 +439,8 @@ func (u *UnaryExpr) String() string {
 }
 func (u *UnaryExpr) expressionNode() {}
 
-// PostfixExpr: expr++, expr-- (increment/decrement after evaluation)
-type PostfixExpr struct {
-	Operator string // "++", "--"
-	Operand  Expression
-}
-
-func (p *PostfixExpr) String() string {
-	return "(" + p.Operand.String() + p.Operator + ")"
-}
-func (p *PostfixExpr) expressionNode() {}
-
-// MoveExpr: expr! (move semantics - transfers ownership)
-type MoveExpr struct {
-	Expr Expression // The expression being moved (typically an IdentExpr)
-}
-
-func (m *MoveExpr) String() string {
-	return m.Expr.String() + "!"
-}
-func (m *MoveExpr) expressionNode() {}
-
 type InExpr struct {
+	Pos       Pos
 	Value     Expression // Value to search for
 	Container Expression // List or map to search in
 }
@@ -573,12 +451,12 @@ func (i *InExpr) String() string {
 func (i *InExpr) expressionNode() {}
 
 type MatchClause struct {
-	Guard        Expression
-	Result       Expression
-	IsValueMatch bool // True if this is a value match (0 -> ...), false if guard (| x > 0 -> ...)
+	Guard  Expression
+	Result Expression
 }
 
 type MatchExpr struct {
+	Pos             Pos
 	Condition       Expression
 	Clauses         []*MatchClause
 	DefaultExpr     Expression
@@ -623,12 +501,11 @@ func (b *BlockExpr) String() string {
 func (b *BlockExpr) expressionNode() {}
 
 type CallExpr struct {
-	Function            string
-	Args                []Expression
-	MaxRecursionDepth   int64 // Maximum recursion depth (math.MaxInt64 for infinite)
-	NeedsRecursionCheck bool  // Whether to emit runtime recursion depth checking
-	IsCFFI              bool  // Whether this is a C FFI call (c.malloc, c.free, etc.)
-	RawBitcast          bool  // Whether to use raw bitcast for return value (call()! syntax)
+	Pos        Pos
+	Function   string
+	Args       []Expression
+	IsCFFI     bool // Whether this is a C FFI call (c.malloc, c.free, etc.)
+	RawBitcast bool // Whether to use raw bitcast for return value (call()! syntax)
 }
 
 func (c *CallExpr) String() string {
@@ -645,6 +522,7 @@ func (c *CallExpr) String() string {
 func (c *CallExpr) expressionNode() {}
 
 type DirectCallExpr struct {
+	Pos    Pos
 	Callee Expression // The expression being called (e.g., a lambda)
 	Args   []Expression
 }
@@ -659,6 +537,7 @@ func (d *DirectCallExpr) String() string {
 func (d *DirectCallExpr) expressionNode() {}
 
 type ListExpr struct {
+	Pos      Pos
 	Elements []Expression
 }
 
@@ -672,6 +551,7 @@ func (l *ListExpr) String() string {
 func (l *ListExpr) expressionNode() {}
 
 type MapExpr struct {
+	Pos    Pos
 	Keys   []Expression
 	Values []Expression
 }
@@ -686,6 +566,7 @@ func (m *MapExpr) String() string {
 func (m *MapExpr) expressionNode() {}
 
 type IndexExpr struct {
+	Pos   Pos
 	List  Expression
 	Index Expression
 }
@@ -702,6 +583,7 @@ func (i *IndexExpr) expressionNode() {}
 // Different from IndexExpr which accesses map elements by key
 // FieldAccessExpr accesses memory at a fixed offset
 type FieldAccessExpr struct {
+	Pos        Pos
 	Object     Expression // The struct/pointer expression
 	FieldName  string     // Name of the field
 	StructName string     // Name of the C struct type (if known)
@@ -718,6 +600,7 @@ func (f *FieldAccessExpr) expressionNode() {}
 
 // SliceExpr: list[start:end:step] or string[start:end:step] (Python-style slicing)
 type SliceExpr struct {
+	Pos   Pos
 	List  Expression
 	Start Expression // nil means start from beginning
 	End   Expression // nil means go to end
@@ -744,6 +627,7 @@ func (s *SliceExpr) expressionNode() {}
 
 // RangeExpr represents a range like 0..<10 or 0..=10
 type RangeExpr struct {
+	Pos       Pos
 	Start     Expression
 	End       Expression
 	Inclusive bool // true for ..=, false for ..<
@@ -758,31 +642,14 @@ func (r *RangeExpr) String() string {
 }
 func (r *RangeExpr) expressionNode() {}
 
-type StructLiteralExpr struct {
-	StructName string
-	Fields     map[string]Expression
-}
-
-func (s *StructLiteralExpr) String() string {
-	var fields []string
-	for name, expr := range s.Fields {
-		fields = append(fields, name+": "+expr.String())
-	}
-	return s.StructName + " { " + strings.Join(fields, ", ") + " }"
-}
-func (s *StructLiteralExpr) expressionNode() {}
-
 type LambdaExpr struct {
+	Pos               Pos
 	Params            []string
 	ParamCStructTypes map[string]string   // param name -> cstruct type name from `(a as V)` annotations
 	ParamTypes        map[string]*TimType // Type annotations for parameters (nil if none)
 	VariadicParam     string              // Name of variadic parameter (if any), empty if none
 	ReturnType        *TimType            // Return type annotation (nil if none)
 	Body              Expression
-	IsPure            bool              // Automatically detected: true if function has no side effects
-	CapturedVars      []string          // Variables captured from outer scope (for closures)
-	CapturedVarTypes  map[string]string // Types of captured variables (for correct codegen)
-	IsNestedLambda    bool              // True if this lambda is defined inside another lambda
 }
 
 func (l *LambdaExpr) String() string {
@@ -790,149 +657,8 @@ func (l *LambdaExpr) String() string {
 }
 func (l *LambdaExpr) expressionNode() {}
 
-// Pattern represents a pattern match clause parameter
-type Pattern interface {
-	Node
-	patternNode()
-}
-
-// LiteralPattern matches a specific literal value
-type LiteralPattern struct {
-	Value Expression // NumberExpr, StringExpr, or BoolExpr
-}
-
-func (lp *LiteralPattern) String() string { return lp.Value.String() }
-func (lp *LiteralPattern) patternNode()   {}
-
-// VarPattern binds the argument to a variable
-type VarPattern struct {
-	Name string // Variable name to bind
-}
-
-func (vp *VarPattern) String() string { return vp.Name }
-func (vp *VarPattern) patternNode()   {}
-
-// WildcardPattern matches any value without binding
-type WildcardPattern struct{}
-
-func (wp *WildcardPattern) String() string { return "_" }
-func (wp *WildcardPattern) patternNode()   {}
-
-// PatternClause represents one pattern case: (pattern1, pattern2, ...) -> body
-type PatternClause struct {
-	Patterns []Pattern
-	Body     Expression
-}
-
-func (pc *PatternClause) String() string {
-	pats := make([]string, len(pc.Patterns))
-	for i, p := range pc.Patterns {
-		pats[i] = p.String()
-	}
-	return "(" + strings.Join(pats, ", ") + ") -> " + pc.Body.String()
-}
-
-// PatternLambdaExpr: lambda with pattern matching on parameters
-// Example: factorial := (0) -> 1 | (n) -> n * factorial(n-1)
-type PatternLambdaExpr struct {
-	Clauses        []*PatternClause
-	IsPure         bool
-	CapturedVars   []string
-	IsNestedLambda bool
-}
-
-func (pl *PatternLambdaExpr) String() string {
-	clauses := make([]string, len(pl.Clauses))
-	for i, c := range pl.Clauses {
-		clauses[i] = c.String()
-	}
-	return strings.Join(clauses, " | ")
-}
-func (pl *PatternLambdaExpr) expressionNode() {}
-
-// MultiLambdaExpr: multiple lambda dispatch based on argument count
-// Example: f = (x) -> x, (x, y) -> x + y
-type MultiLambdaExpr struct {
-	Lambdas []*LambdaExpr
-}
-
-func (m *MultiLambdaExpr) String() string {
-	parts := make([]string, len(m.Lambdas))
-	for i, lambda := range m.Lambdas {
-		parts[i] = lambda.String()
-	}
-	return strings.Join(parts, ", ")
-}
-func (m *MultiLambdaExpr) expressionNode() {}
-
-type ParallelExpr struct {
-	List      Expression // The list/data to operate on
-	Operation Expression // The lambda or function to apply
-}
-
-func (p *ParallelExpr) String() string {
-	return p.List.String() + " || " + p.Operation.String()
-}
-func (p *ParallelExpr) expressionNode() {}
-
-type PipeExpr struct {
-	Left  Expression // Input to the pipe
-	Right Expression // Operation to apply
-}
-
-func (p *PipeExpr) String() string {
-	return p.Left.String() + " | " + p.Right.String()
-}
-func (p *PipeExpr) expressionNode() {}
-
-type ComposeExpr struct {
-	Left  Expression // Outer function (applied second)
-	Right Expression // Inner function (applied first)
-}
-
-func (c *ComposeExpr) String() string {
-	return c.Left.String() + " <> " + c.Right.String()
-}
-func (c *ComposeExpr) expressionNode() {}
-
-type BackgroundExpr struct {
-	Expr Expression // Expression to execute in background process
-}
-
-func (b *BackgroundExpr) String() string {
-	return b.Expr.String() + " &"
-}
-func (b *BackgroundExpr) expressionNode() {}
-
-type SendExpr struct {
-	Target  Expression // Port or address to send to (e.g., &8080)
-	Message Expression // Message to send (typically string)
-}
-
-func (s *SendExpr) String() string {
-	return s.Target.String() + " <- " + s.Message.String()
-}
-func (s *SendExpr) expressionNode() {}
-
-type ReceiveExpr struct {
-	Source Expression // Port or address to receive from (e.g., &8080)
-}
-
-func (r *ReceiveExpr) String() string {
-	return "<= " + r.Source.String()
-}
-func (r *ReceiveExpr) expressionNode() {}
-
-type LengthExpr struct {
-	Operand Expression
-}
-
-func (l *LengthExpr) String() string {
-	return "#" + l.Operand.String()
-}
-func (l *LengthExpr) expressionNode() {}
-
 type CastExpr struct {
+	Pos        Pos
 	Expr       Expression
 	Type       string // "i8", "i32", "u64", "f32", "f64", "cstr", "ptr", "number", "string", "list"
 	RawBitcast bool   // true for as!, false for as (numeric conversion)
@@ -945,135 +671,6 @@ func (c *CastExpr) String() string {
 	return c.Expr.String() + " as " + c.Type
 }
 func (c *CastExpr) expressionNode() {}
-
-type UnsafeExpr struct {
-	X86_64Block   []Statement       // x86_64 architecture block
-	ARM64Block    []Statement       // arm64 architecture block
-	RISCV64Block  []Statement       // riscv64 architecture block
-	X86_64Return  *UnsafeReturnStmt // optional return value for x86_64
-	ARM64Return   *UnsafeReturnStmt // optional return value for arm64
-	RISCV64Return *UnsafeReturnStmt // optional return value for riscv64
-}
-
-func (u *UnsafeExpr) String() string {
-	return fmt.Sprintf("unsafe { x86_64: %d stmts } { arm64: %d stmts } { riscv64: %d stmts }",
-		len(u.X86_64Block), len(u.ARM64Block), len(u.RISCV64Block))
-}
-func (u *UnsafeExpr) expressionNode() {}
-
-type RegisterExpr struct {
-	Name string // Register name (e.g., "rax", "xmm0", "x0", "a0")
-}
-
-func (r *RegisterExpr) String() string {
-	return r.Name
-}
-func (r *RegisterExpr) expressionNode() {}
-
-type RegisterAssignStmt struct {
-	Register string // Register name (e.g., "rax", "x0", "a0") or memory address like "[rax]"
-	Value    any    // Either Expression, string (register), *RegisterOp, or *MemoryLoad
-}
-
-func (r *RegisterAssignStmt) String() string {
-	switch v := r.Value.(type) {
-	case Expression:
-		return r.Register + " <- " + v.String()
-	case string:
-		return r.Register + " <- " + v
-	case *RegisterOp:
-		return r.Register + " <- " + v.String()
-	case *MemoryLoad:
-		return r.Register + " <- " + v.String()
-	default:
-		return r.Register + " <- <unknown>"
-	}
-}
-func (r *RegisterAssignStmt) statementNode() {}
-
-type UnsafeReturnStmt struct {
-	Register string // Register to return (e.g., "rax", "xmm0")
-	AsType   string // Optional type cast (e.g., "cstr", "pointer", empty for Tim value)
-}
-
-func (u *UnsafeReturnStmt) String() string {
-	if u.AsType != "" {
-		return fmt.Sprintf("%s as %s", u.Register, u.AsType)
-	}
-	return u.Register
-}
-func (u *UnsafeReturnStmt) statementNode() {}
-
-type RegisterOp struct {
-	Left     string // Register name or empty for unary
-	Operator string // +, -, *, /, %, &, |, ^, <<, >>, ~
-	Right    any    // Register name (string) or immediate (NumberExpr)
-}
-
-func (r *RegisterOp) String() string {
-	if r.Left == "" {
-		// Unary operation
-		switch v := r.Right.(type) {
-		case string:
-			return r.Operator + v
-		default:
-			return r.Operator + "<unknown>"
-		}
-	}
-	// Binary operation
-	switch v := r.Right.(type) {
-	case Expression:
-		return r.Left + " " + r.Operator + " " + v.String()
-	case string:
-		return r.Left + " " + r.Operator + " " + v
-	default:
-		return r.Left + " " + r.Operator + " <unknown>"
-	}
-}
-
-type MemoryLoad struct {
-	Size    string // "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64" (empty = u64)
-	Address string // Register containing address (e.g., "rax", "rbx")
-	Offset  int64  // Optional offset (e.g., [rax + 16])
-}
-
-func (m *MemoryLoad) String() string {
-	sizeStr := ""
-	if m.Size != "" && m.Size != "u64" {
-		sizeStr = m.Size + " "
-	}
-	offsetStr := ""
-	if m.Offset != 0 {
-		offsetStr = fmt.Sprintf(" + %d", m.Offset)
-	}
-	return sizeStr + "[" + m.Address + offsetStr + "]"
-}
-
-type MemoryStore struct {
-	Size    string // "uint8", "uint16", "uint32", "uint64" (empty = uint64)
-	Address string // Register containing address (e.g., "rax", "rbx")
-	Offset  int64  // Optional offset (e.g., [rax + 16])
-	Value   any    // Value to store (register name string or *NumberExpr)
-}
-
-func (m *MemoryStore) String() string {
-	sizeStr := ""
-	if m.Size != "" && m.Size != "uint64" {
-		sizeStr = " as " + m.Size
-	}
-	offsetStr := ""
-	if m.Offset != 0 {
-		offsetStr = fmt.Sprintf(" + %d", m.Offset)
-	}
-	return "[" + m.Address + offsetStr + "] <- " + fmt.Sprint(m.Value) + sizeStr
-}
-
-func (m *MemoryStore) statementNode() {}
-
-type SyscallStmt struct{}
-
-func (s *SyscallStmt) String() string { return "syscall" }
-func (s *SyscallStmt) statementNode() {}
 
 // ArenaStmt represents an arena memory block: arena { ... }
 // All allocations within the block are freed when the arena exits
@@ -1093,34 +690,6 @@ func (a *ArenaStmt) String() string {
 	return out.String()
 }
 func (a *ArenaStmt) statementNode() {}
-
-// WithStmt represents a subject-injection block: with <subject> { f(); g(x) }
-// The subject is prepended as the first argument of every direct call statement
-// in the body (done at parse time), so `with ren { clear(); draw(t) }` becomes
-// `clear(ren); draw(ren, t)`. It has no runtime scoping semantics of its own —
-// the body statements run in the enclosing scope, in order. Subject is retained
-// for String()/debugging; Body already holds the injected statements.
-type WithStmt struct {
-	Subject Expression  // the value prepended as first arg (e.g. `ren`)
-	Body    []Statement // body statements, with Subject already injected
-}
-
-func (w *WithStmt) String() string {
-	var out strings.Builder
-	out.WriteString("with ")
-	if w.Subject != nil {
-		out.WriteString(w.Subject.String())
-	}
-	out.WriteString(" {\n")
-	for _, stmt := range w.Body {
-		out.WriteString("  ")
-		out.WriteString(stmt.String())
-		out.WriteString("\n")
-	}
-	out.WriteString("}")
-	return out.String()
-}
-func (w *WithStmt) statementNode() {}
 
 // ArenaExpr represents an arena block used as an expression
 type ArenaExpr struct {
@@ -1164,46 +733,35 @@ func (v *VectorExpr) expressionNode() {}
 // DeferStmt represents a deferred expression: defer expr
 // Executed at the end of the current scope in LIFO order
 type DeferStmt struct {
+	Pos  Pos
 	Call Expression // Expression to execute at scope exit (typically a function call)
 }
 
 func (d *DeferStmt) String() string { return "defer " + d.Call.String() }
 func (d *DeferStmt) statementNode() {}
 
-// SpawnStmt represents a spawned process: spawn expr [ | params | block ]
-// Creates a new process via fork() and optionally waits for result
-type SpawnStmt struct {
-	Expr   Expression // Expression to execute in child process
-	Params []string   // Optional: variable names for pipe destructuring
-	Block  *BlockExpr // Optional: block to execute with result (implies wait)
+// FieldUpdateStmt is obj.field <- value.
+type FieldUpdateStmt struct {
+	Pos    Pos
+	Object Expression
+	Field  string
+	Value  Expression
 }
 
-func (s *SpawnStmt) String() string {
-	var result strings.Builder
-	result.WriteString("spawn ")
-	result.WriteString(s.Expr.String())
-	if s.Block != nil {
-		result.WriteString(" | ")
-		for i, param := range s.Params {
-			if i > 0 {
-				result.WriteString(", ")
-			}
-			result.WriteString(param)
-		}
-		result.WriteString(" | ")
-		result.WriteString(s.Block.String())
-	}
-	return result.String()
+func (f *FieldUpdateStmt) String() string {
+	return f.Object.String() + "." + f.Field + " <- " + f.Value.String()
 }
-func (s *SpawnStmt) statementNode() {}
+func (f *FieldUpdateStmt) statementNode() {}
 
-// AliasStmt represents a keyword alias: alias for=@
-// Creates alternative syntax for existing keywords (useful for language packs)
-type AliasStmt struct {
-	NewName    string    // New keyword name (e.g., "for")
-	TargetName string    // Target keyword/token (e.g., "@")
-	Target     TokenType // Resolved target token type
+// IndexUpdateStmt is target[index] <- value where target is not a plain variable.
+type IndexUpdateStmt struct {
+	Pos    Pos
+	Target Expression
+	Index  Expression
+	Value  Expression
 }
 
-func (a *AliasStmt) String() string { return "alias " + a.NewName + "=" + a.TargetName }
-func (a *AliasStmt) statementNode() {}
+func (u *IndexUpdateStmt) String() string {
+	return u.Target.String() + "[" + u.Index.String() + "] <- " + u.Value.String()
+}
+func (u *IndexUpdateStmt) statementNode() {}

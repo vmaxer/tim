@@ -1,4 +1,3 @@
-// Completion: 100% - Utility module complete
 package main
 
 import (
@@ -8,41 +7,6 @@ import (
 	"path/filepath"
 	"strings"
 )
-
-// FunctionRepository maps function names to Git repository URLs
-// When the compiler encounters an unknown function, it looks it up here
-// and automatically fetches the repository containing the implementation.
-//
-// Math functions (abs, min, max, sqrt, pow, sin, cos, tan, asin, acos, atan,
-// atan2, log, log10, exp, floor, ceil, round) are implemented directly in the
-// compiler as hardware FPU/SSE instructions, see compileCall in codegen.go.
-//
-// Graphics functions (InitWindow, CloseWindow, DrawRectangle, ...) are linked
-// directly against the system raylib shared library via the C FFI mechanism.
-//
-// This map is intentionally empty by default. Users may still register their
-// own function-to-repository mappings via the TIM_FUNCTIONNAME environment
-// variable, see GetFunctionRepository.
-var FunctionRepository = map[string]string{}
-
-// GetFunctionRepository returns the repository URL for a function
-// Checks environment variable TIM_FUNCTIONNAME first, then falls back to FunctionRepository map
-// Example: TIM_PRINTLN=github.com/example/tim_alternative_core overrides the default
-func GetFunctionRepository(funcName string) (string, bool) {
-	// Check for environment variable override
-	// Convert function name to uppercase for env var: println -> PRINTLN
-	envVarName := "TIM_" + strings.ToUpper(funcName)
-	if repoURL := os.Getenv(envVarName); repoURL != "" {
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "Using environment override for %s: %s=%s\n", funcName, envVarName, repoURL)
-		}
-		return repoURL, true
-	}
-
-	// Fall back to FunctionRepository map
-	repoURL, ok := FunctionRepository[funcName]
-	return repoURL, ok
-}
 
 // GetCachePath returns the cache directory for tim dependencies
 // Respects XDG_CACHE_HOME environment variable
@@ -462,59 +426,4 @@ func remoteBranchExists(repoPath, branchName string) bool {
 	cmd := exec.Command("git", "-C", repoPath, "show-ref", "--verify", "refs/remotes/"+branchName)
 	err := cmd.Run()
 	return err == nil
-}
-
-// FindTimFiles returns all .tim files in a directory (recursively)
-func FindTimFiles(dir string) ([]string, error) {
-	var files []string
-
-	err := filepath.Walk(dir, func(path string, info os.FileInfo, err error) error {
-		if err != nil {
-			return err
-		}
-
-		// Skip hidden directories (like .git)
-		if info.IsDir() && strings.HasPrefix(info.Name(), ".") && path != dir {
-			return filepath.SkipDir
-		}
-
-		// Add .tim files
-		if !info.IsDir() && strings.HasSuffix(path, ".tim") {
-			files = append(files, path)
-		}
-
-		return nil
-	})
-
-	return files, err
-}
-
-// ResolveFunction looks up a function name and returns its repository URL
-// Returns empty string if function is not in the repository map
-// Checks environment variable TIM_FUNCTIONNAME first via GetFunctionRepository
-func ResolveFunction(funcName string) string {
-	if repoURL, ok := GetFunctionRepository(funcName); ok {
-		return repoURL
-	}
-	return ""
-}
-
-// ResolveDependencies takes a list of unknown functions and returns
-// unique repository URLs that need to be cloned
-func ResolveDependencies(unknownFunctions []string) []string {
-	repoSet := make(map[string]bool)
-
-	for _, funcName := range unknownFunctions {
-		if repoURL := ResolveFunction(funcName); repoURL != "" {
-			repoSet[repoURL] = true
-		}
-	}
-
-	// Convert set to slice
-	repos := make([]string, 0, len(repoSet))
-	for repo := range repoSet {
-		repos = append(repos, repo)
-	}
-
-	return repos
 }

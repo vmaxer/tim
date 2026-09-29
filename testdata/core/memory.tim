@@ -1,0 +1,14 @@
+keep := {}
+@ i in 0..<50000 { keep[f"k{i}"] <- [i, str(i)] }
+total := 0
+@ round in 0..<40 {
+  xs := [f"x{j}" @ j in 0..<20000]
+  total <- total + #xs
+}
+bad := 0
+@ i in 0..<50000 {
+  v = keep[f"k{i}"]
+  v[0] != i or v[1] != str(i) { bad <- bad + 1 }
+}
+println(total, bad)
+main() = 7

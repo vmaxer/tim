@@ -1,0 +1,3 @@
+square(x) = x * x
+hyp(a, b) = sqrt(square(a) + square(b))
+unit = 1

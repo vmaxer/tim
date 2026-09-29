@@ -1,0 +1,96 @@
+# Tim builtin functions
+
+Every program can call these. A program may define a function with the same
+name, which then takes precedence. Functions that fail return an error value.
+
+## Output and the process
+
+| Function | Description |
+|---|---|
+| `print(v...)` | print values separated by spaces |
+| `println(v...)` | print values separated by spaces, then a newline |
+| `printf(fmt, v...)` | print with a format: `%d %x %X %f %.2f %e %g %s %v %q %c %b %%`, with widths like `%5d` and `%-8s` |
+| `eprint(v...)`, `eprintln(v...)`, `eprintf(fmt, v...)` | the same, to stderr |
+| `exit(code)` | end the program; an error exits with 1 |
+| `exitf(fmt, v...)` | `eprintf`, then exit with 1: `x or! { exitf("failed: %s\n", why) }` |
+| `args()` | the command-line arguments as a list of strings |
+| `env(name)` | an environment variable, or an error |
+| `platform()` | the target, like `"amd64-linux"` or `"arm64-darwin"`, known when compiling |
+
+## Files and input
+
+| Function | Description |
+|---|---|
+| `readln()` | a line from stdin without its newline, or an error at the end of input |
+| `read_file(path)` | a whole file as a string, or an error |
+| `write_file(path, s)` | write a string, returning its length or an error |
+
+## Conversions
+
+| Function | Description |
+|---|---|
+| `str(v)` | a value as a string, as `println` shows it |
+| `num(s)` | parse `42`, `-1_000`, `0.5`, `1e-9`, `0xff`, `0b101`; exact; an error otherwise |
+| `float(x)` | a number as float64 |
+| `type(v)` | `"num"`, `"str"`, `"list"`, `"map"`, `"fn"`, `"error"` or `"ptr"` |
+| `error(v)` | an error value with the given code or message |
+| `chr(n)`, `ord(s)` | a code point as UTF-8, and the first code point of a string |
+| `bytes(s)`, `runes(s)` | a string's bytes, or its code points, as a list |
+
+Casts: `x as str`, `x as num`, `x as float64`, `x as int64` (truncates), `x as bool`.
+
+## Numbers
+
+| Function | Description |
+|---|---|
+| `abs floor ceil round trunc` | exact on exact numbers; `round` rounds halves away from zero |
+| `sqrt exp log log10 sin cos tan asin acos atan` | float64 |
+| `atan2(y, x)`, `pow(x, y)` | `pow` is `x ** y` |
+| `min(v...)`, `max(v...)` | of the arguments, or of one list |
+| `gcd(a, b)` | the greatest common divisor of two integers |
+| `random()` | a float64 in [0, 1) |
+| `bit(x, n)`, `rotl(x, n)`, `rotr(x, n)` | bit n of x, and 64-bit rotations |
+| `popcount(x)`, `clz(x)`, `ctz(x)` | the 1 bits, leading zero bits and trailing zero bits of a 64-bit integer |
+
+## Strings
+
+| Function | Description |
+|---|---|
+| `upper(s)`, `lower(s)`, `trim(s)` | ASCII case and surrounding whitespace |
+| `split(s, sep)`, `join(xs, sep)` | `split(s, "")` splits into characters |
+| `replace(s, old, new)` | every occurrence |
+| `starts_with(s, p)`, `ends_with(s, p)` | 1 or 0 |
+| `find(s, sub)` | the byte index of `sub`, or -1; also finds an element in a list |
+| `reverse(s)` | by code point |
+
+`#s` is the length in bytes, `s[i]` a byte, `s[a:b]` a substring, `+` joins
+and `*` repeats.
+
+## Lists and maps
+
+| Function | Description |
+|---|---|
+| `push(xs, v)`, `pop(xs)` | append to, or remove and return the last element of, a mutable list |
+| `keys(m)`, `values(m)` | in insertion order |
+| `remove(c, k)` | remove and return a map entry or a list element |
+| `sort(xs)`, `sort(xs, key)` | a stable sorted copy |
+| `reverse(xs)`, `sum(xs)` | |
+| `map(xs, f)`, `filter(xs, f)`, `fold(xs, init, f)` | `fold(xs, 0, (acc, x) -> acc + x)` |
+| `any(xs, f)`, `all(xs, f)` | 1 or 0 |
+| `zip(a, b)`, `enumerate(xs)` | lists of pairs |
+
+`#xs`, `xs[i]` (negative from the end), `xs[a:b]`, `x in xs`, `a + b`,
+`xs * n`; `m[k]`, `m.name`, `k in m`.
+
+## Memory and C
+
+| Function | Description |
+|---|---|
+| `cstr(p)` | copy the C string at a `ptr` into a string |
+| `alloc(n)` | `n` zeroed bytes on the garbage-collected heap, as a `ptr`, kept while the program references it |
+| `read_i8 read_u8 read_i16 read_u16 read_i32 read_u32 read_i64 read_u64 read_f32 read_f64 read_ptr` | `read_u8(p, i)` reads a value of that C type at byte offset `i` |
+| `write_i8 write_u8 write_i16 write_u16 write_i32 write_u32 write_i64 write_u64 write_f32 write_f64 write_ptr` | `write_u8(p, i, v)` writes one |
+| `syscall(n, a...)` | Linux system call `n` with up to six arguments, one instruction: numbers pass as integers, strings and `ptr`s as addresses; the result is the kernel's, a negative errno on failure |
+
+`p + n` offsets a `ptr` by `n` bytes and `x as ptr` makes one from an address.
+C functions are called through their library: `c.malloc(16)`, `sdl.SDL_Init(0)`.

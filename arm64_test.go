@@ -1,6 +1,7 @@
 package main
 
 import (
+	"debug/macho"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -57,21 +58,14 @@ func TestARM64BasicCompilation(t *testing.T) {
 				t.Logf("Output file permissions: %o (chmod not effective on this OS)", info.Mode())
 			}
 
-			// Verify it's a Mach-O file with ARM64 architecture
-			fileInfo, err := IdentifyFile(outFile)
+			f, err := macho.Open(outFile)
 			if err != nil {
-				t.Fatalf("Failed to identify file: %v", err)
+				t.Fatalf("not Mach-O: %v", err)
 			}
-
-			t.Logf("File type: %s", fileInfo.String())
-			if !fileInfo.IsMachO() {
-				t.Errorf("Expected Mach-O file, got: %s", fileInfo.String())
+			defer f.Close()
+			if f.Cpu != macho.CpuArm64 {
+				t.Errorf("cpu %v, want arm64", f.Cpu)
 			}
-			if !fileInfo.IsARM64() {
-				t.Errorf("Expected ARM64 architecture, got: %s", fileInfo.String())
-			}
-
-			t.Logf("Successfully compiled %s: %s", tt.name, fileInfo.String())
 		})
 	}
 }

@@ -17,17 +17,17 @@ func TestParserDiagnostics(t *testing.T) {
 		{
 			name:    "missing operand after plus",
 			code:    "main = { x = 1 + }\n",
-			wantErr: "expected expression after '+'",
+			wantErr: "expected an expression after '+'",
 		},
 		{
 			name:    "missing operand after star",
 			code:    "main = { x = 2 * }\n",
-			wantErr: "expected expression after '*'",
+			wantErr: "expected an expression after '*'",
 		},
 		{
 			name:    "missing comparison operand",
 			code:    "main = { x = 3 < }\n",
-			wantErr: "expected expression after '<'",
+			wantErr: "expected an expression after '<'",
 		},
 		{
 			name:    "unterminated string points at opening quote",
@@ -42,13 +42,13 @@ func TestParserDiagnostics(t *testing.T) {
 		{
 			name:     "undefined function suggests similar name",
 			code:     "main = { prinltn(42) }\n",
-			wantErr:  "undefined function: prinltn",
+			wantErr:  "undefined function 'prinltn'",
 			wantErr2: "println",
 		},
 		{
 			name:     "undefined user function suggests defined one",
 			code:     "helper = x -> x * 2\nmain = { println(helpr(3)) }\n",
-			wantErr:  "undefined function: helpr",
+			wantErr:  "undefined function 'helpr'",
 			wantErr2: "helper",
 		},
 	}

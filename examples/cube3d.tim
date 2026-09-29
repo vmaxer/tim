@@ -2,8 +2,8 @@ import sdl3 as sdl
 import gl as gl
 
 cstruct SDL_Event {
-    type as uint32,
-    timestamp as uint64
+    type: uint32,
+    timestamp: uint64
 }
 
 width = 800
@@ -152,7 +152,7 @@ arena {
 
         sdl.SDL_GL_SwapWindow(window)
 
-        frame++
+        frame += 1
         if frame >= max_frames {
             running <- 0
         }

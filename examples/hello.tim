@@ -1,5 +1,5 @@
 // Build and run with:
-// tim build add.tim hello.tim -o hello && ./hello
+// tim hello.tim && ./hello   (add comes from add.tim next to it)
 
 println("Hello, World!")
 

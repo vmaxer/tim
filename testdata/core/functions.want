@@ -1,0 +1,9 @@
+3
+[11, 12, 13]
+11 11
+0 6 ["1", "2", "3"] [2, 4]
+1 0 ["a", "b", "c"] [3, 2, 1]
+6765
+1 1
+error: cannot call a num 2 error: function takes 2 arguments but got 1
+[exit 0]

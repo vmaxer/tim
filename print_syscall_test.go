@@ -169,7 +169,7 @@ println(100 / 10)
 		{
 			name: "print in loop",
 			code: `
-@ i in 0..2 {
+@ i in 0..=2 {
     println(i)
 }
 `,
@@ -178,7 +178,7 @@ println(100 / 10)
 		{
 			name: "print f-string in loop",
 			code: `
-@ i in 0..2 {
+@ i in 0..=2 {
     println(f"Count: {i}")
 }
 `,
@@ -334,7 +334,7 @@ func compileTestBinary(t *testing.T, code string) string {
 		OS:   osType,
 		Arch: archType,
 	}
-	if err := CompileTimWithOptions(srcFile, binPath, platform, 0, false, false); err != nil {
+	if err := CompileTim(srcFile, binPath, platform); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
 	}
 

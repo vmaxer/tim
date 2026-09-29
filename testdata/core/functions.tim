@@ -1,0 +1,27 @@
+counter = () -> {
+    c := 0
+    () -> {
+        c <- c + 1
+        c
+    }
+}
+k = counter()
+k()
+k()
+println(k())
+adders = [x -> x + n @ n in 1..=3]
+println([f(10) @ f in adders])
+compose(f, g) = x -> f(g(x))
+inc = x -> x + 1
+double = x -> x * 2
+println(compose(inc, double)(5), 5 |> double |> inc)
+sum(xs...) = fold(xs, 0, (a, b) -> a + b)
+println(sum(), sum(1, 2, 3), map([1, 2, 3], str), filter([1, 2, 3, 4], x -> x % 2 == 0))
+println(any([1, 2], x -> x > 1), all([1, 2], x -> x > 1), sort(["b", "a", "c"]), sort([3, 1, 2], x -> -x))
+fib = n -> n < 2 { => n ~> fib(n - 1) + fib(n - 2) }
+println(fib(20))
+even(n) = n == 0 { => yes ~> odd(n - 1) }
+odd(n) = n == 0 { => no ~> even(n - 1) }
+println(even(10), odd(7))
+call(g, x) = g(x)
+println(call(42, 1), call(inc, 1), call(compose, 1))

@@ -2,26 +2,26 @@
 // Simplified to avoid list building which has known issues
 
 // Check if n is divisible by any number from 2 to sqrt(n)
-is_prime_helper = (n, d) {
+is_prime_helper = (n, d) -> {
     | d * d > n => 1
     | n % d == 0 => 0
     ~> is_prime_helper(n, d + 1)
 }
 
-is_prime = (n) {
+is_prime = (n) -> {
     | n < 2 => 0
     | n == 2 => 1
     ~> is_prime_helper(n, 2)
 }
 
 // Count primes up to n
-count_primes_helper = (current, limit, count) {
+count_primes_helper = (current, limit, count) -> {
     | current > limit => count
     | is_prime(current) == 1 => count_primes_helper(current + 1, limit, count + 1)
     ~> count_primes_helper(current + 1, limit, count)
 }
 
-count_primes = (n) {
+count_primes = (n) -> {
     count_primes_helper(2, n, 0)
 }
 

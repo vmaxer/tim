@@ -1,0 +1,1123 @@
+package main
+
+import (
+	"fmt"
+	"path/filepath"
+	"strings"
+)
+
+// check.go resolves every name to a symbol (global, local, parameter or
+// closure capture), enforces mutability, infers the static types it can, and
+// reports errors with positions before any code is generated.
+
+type SymKind uint8
+
+const (
+	SymGlobal SymKind = iota
+	SymLocal
+	SymParam
+	SymCapture
+	SymBuiltin // a builtin function used as a value
+)
+
+type Type uint8
+
+const (
+	TAny Type = iota
+	TNum
+	TStr
+	TList
+	TMap
+	TFn
+	TPtr
+)
+
+var typeNames = [...]string{"any", "num", "str", "list", "map", "fn", "ptr"}
+
+func (t Type) String() string { return typeNames[t] }
+
+type Var struct {
+	Name    string
+	Kind    SymKind
+	Mutable bool
+	Boxed   bool // a mutable variable captured by a closure: it lives in a heap cell
+	Index   int  // global number, local slot, parameter number or capture number
+	Fn      *Fun // the function whose frame or closure holds it (nil for globals)
+	Outer   *Var // for captures: the symbol captured from the enclosing function
+	Func    *Fun // the function literal it is bound to, when known
+	Type    Type
+	Struct  *CStructDecl // the cstruct it points to, when known
+	Elem    *CStructDecl // for a list: the cstruct of its elements, when known
+	Pos     Pos
+}
+
+// Fun is a function literal, or the top level of the program.
+type Fun struct {
+	Name        string
+	Lambda      *LambdaExpr
+	Parent      *Fun
+	Params      []*Var
+	Variadic    *Var
+	Locals      []*Var
+	Captures    []*Var
+	Defers      bool         // the function has defer statements
+	Returns     *CStructDecl // the cstruct every result points to, when known
+	ReturnsElem *CStructDecl // the cstruct of the elements of every result list
+}
+
+// Checked is the result of checking a program.
+type Checked struct {
+	Program   *Program
+	Top       *Fun
+	Funcs     []*Fun
+	Globals   []*Var
+	Uses      map[*IdentExpr]*Var
+	Defs      map[Statement][]*Var // bindings made by AssignStmt, MultipleAssignStmt and LoopStmt
+	Updates   map[Statement]*Var   // the variable updated by an update statement
+	Callees   map[*CallExpr]*Var   // calls through a variable; absent for builtins
+	Fns       map[*LambdaExpr]*Fun
+	Deferred  map[*DeferStmt]*Fun // the deferred expression as a function of no arguments
+	Types     map[Expression]Type
+	CCalls    map[*CallExpr]*cFunc           // calls to C functions
+	CConsts   map[*NamespacedIdentExpr]int64 // C constants
+	Structs   map[Expression]*CStructDecl    // expressions that are cstructs
+	Ctors     map[*CallExpr]*CStructDecl     // cstruct constructors
+	Fields    map[Expression]*CStructField   // cstruct field reads
+	FieldSets map[*FieldUpdateStmt]*CStructField
+	Elems     map[Expression]*CStructDecl // lists whose elements are cstructs
+	Rewrites  map[Expression]Expression   // operators on cstructs, as method calls
+}
+
+type scope struct {
+	parent *scope
+	fn     *Fun
+	names  map[string]*Var
+}
+
+type checker struct {
+	os    OS // the target, for the sizes of C types
+	c     *Checked
+	file  string
+	errs  *ErrorCollector
+	sc    *scope
+	fn    *Fun
+	loops int
+	cimps map[string]*cLib // C libraries by namespace
+}
+
+// CheckError lists everything wrong with a program.
+type CheckError struct {
+	Plain, Color  string
+	OnlyUndefined bool     // every error is an undefined name, which a sibling file or import may define
+	Undefined     []string // the undefined names
+}
+
+func (e *CheckError) Error() string { return e.Plain }
+
+// Check analyses a parsed program and returns a *CheckError when it is invalid.
+func Check(prog *Program, file, src string, os OS) (*Checked, error) {
+	top := &Fun{Name: "<top>"}
+	k := &checker{
+		os: os,
+		c: &Checked{
+			Program: prog, Top: top, Funcs: []*Fun{top},
+			Uses: map[*IdentExpr]*Var{}, Defs: map[Statement][]*Var{}, Updates: map[Statement]*Var{},
+			Callees: map[*CallExpr]*Var{}, Fns: map[*LambdaExpr]*Fun{}, Deferred: map[*DeferStmt]*Fun{}, Types: map[Expression]Type{},
+			CCalls: map[*CallExpr]*cFunc{}, CConsts: map[*NamespacedIdentExpr]int64{},
+			Structs: map[Expression]*CStructDecl{}, Ctors: map[*CallExpr]*CStructDecl{},
+			Fields: map[Expression]*CStructField{}, FieldSets: map[*FieldUpdateStmt]*CStructField{},
+			Elems: map[Expression]*CStructDecl{}, Rewrites: map[Expression]Expression{},
+		},
+		file:  file,
+		errs:  NewErrorCollector(20),
+		fn:    top,
+		cimps: map[string]*cLib{"c": libcLib, "C": libcLib},
+	}
+	k.errs.SetSourceCode(src)
+	k.sc = &scope{fn: top, names: map[string]*Var{}}
+	k.predeclare(prog.Statements)
+	for _, s := range prog.Statements {
+		k.stmt(s)
+	}
+	if k.errs.HasErrors() {
+		ce := &CheckError{Plain: strings.TrimSpace(k.errs.Report(false)), Color: k.errs.Report(true), OnlyUndefined: true}
+		for _, e := range k.errs.errors {
+			if !strings.HasPrefix(e.Message, "undefined ") {
+				ce.OnlyUndefined = false
+			} else if _, name, ok := strings.Cut(e.Message, "'"); ok {
+				ce.Undefined = append(ce.Undefined, name[:strings.IndexByte(name, '\'')])
+			}
+		}
+		return nil, ce
+	}
+	return k.c, nil
+}
+
+func (k *checker) errorf(pos Pos, format string, args ...any) {
+	k.errs.AddError(CompilerError{Level: LevelError, Category: CategorySemantic, Message: fmt.Sprintf(format, args...),
+		Location: SourceLocation{File: k.file, Line: pos.Line, Column: pos.Col, Length: 1}})
+}
+
+// predeclare makes every top-level binding visible to all functions, so
+// top-level functions and globals may be used before they are defined.
+func (k *checker) predeclare(stmts []Statement) {
+	for _, s := range stmts {
+		var names []string
+		var pos Pos
+		mutable := false
+		switch s := s.(type) {
+		case *AssignStmt:
+			if s.IsUpdate {
+				continue
+			}
+			names, pos, mutable = []string{s.Name}, s.Pos, s.Mutable
+		case *MultipleAssignStmt:
+			if s.IsUpdate {
+				continue
+			}
+			names, pos, mutable = s.Names, s.Pos, s.Mutable
+		case *CImportStmt:
+			name := s.Library
+			if s.SoPath != "" {
+				name = s.SoPath
+			}
+			k.cimps[s.Alias] = loadCLib(name, filepath.Dir(k.file))
+		}
+		for _, n := range names {
+			if prev, ok := k.sc.names[n]; ok {
+				k.errorf(pos, "'%s' is already defined at line %d; bind a new name, or use := and <- for a variable that changes", n, prev.Pos.Line)
+				continue
+			}
+			sym := &Var{Name: n, Kind: SymGlobal, Mutable: mutable, Index: len(k.c.Globals), Pos: pos}
+			k.c.Globals = append(k.c.Globals, sym)
+			k.sc.names[n] = sym
+		}
+	}
+}
+
+func (k *checker) push() { k.sc = &scope{parent: k.sc, fn: k.fn, names: map[string]*Var{}} }
+func (k *checker) pop()  { k.sc = k.sc.parent }
+
+// define binds a new name in the current block.
+func (k *checker) define(name string, mutable bool, pos Pos) *Var {
+	if k.sc.parent == nil {
+		if sym, ok := k.sc.names[name]; ok && sym.Kind == SymGlobal {
+			return sym // predeclared
+		}
+	}
+	if prev, ok := k.sc.names[name]; ok {
+		k.errorf(pos, "'%s' is already defined in this block at line %d; bind a new name, or use := and <- for a variable that changes", name, prev.Pos.Line)
+		return prev
+	}
+	sym := &Var{Name: name, Kind: SymLocal, Mutable: mutable, Fn: k.fn, Index: len(k.fn.Locals), Pos: pos}
+	k.fn.Locals = append(k.fn.Locals, sym)
+	k.sc.names[name] = sym
+	return sym
+}
+
+// lookup resolves a name, creating closure captures as needed.
+func (k *checker) lookup(name string) *Var {
+	for s := k.sc; s != nil; s = s.parent {
+		if sym, ok := s.names[name]; ok {
+			return k.capture(k.fn, sym)
+		}
+	}
+	return nil
+}
+
+func (k *checker) capture(fn *Fun, sym *Var) *Var {
+	if sym.Kind == SymGlobal || sym.Fn == fn {
+		return sym
+	}
+	outer := k.capture(fn.Parent, sym)
+	for _, c := range fn.Captures {
+		if c.Outer == outer {
+			return c
+		}
+	}
+	root := outer
+	for root.Kind == SymCapture {
+		root = root.Outer
+	}
+	if root.Mutable {
+		root.Boxed = true
+	}
+	c := &Var{Name: sym.Name, Kind: SymCapture, Mutable: sym.Mutable, Fn: fn, Outer: outer, Index: len(fn.Captures), Struct: sym.Struct, Elem: sym.Elem,
+		Func: sym.Func, Type: sym.Type, Pos: sym.Pos}
+	fn.Captures = append(fn.Captures, c)
+	return c
+}
+
+// names lists everything visible, for "did you mean" suggestions.
+func (k *checker) names() map[string]int {
+	all := map[string]int{}
+	for s := k.sc; s != nil; s = s.parent {
+		for n := range s.names {
+			all[n] = 1
+		}
+	}
+	for n := range builtins {
+		all[n] = 1
+	}
+	return all
+}
+
+func (k *checker) undefined(pos Pos, what, name string) {
+	msg := fmt.Sprintf("undefined %s '%s'", what, name)
+	if hint, ok := foreignHints[name]; ok {
+		k.errorf(pos, "%s; %s", msg, hint)
+		return
+	}
+	if sugg := findSimilarIdentifiers(name, k.names(), 1); len(sugg) > 0 {
+		msg += "; did you mean " + strings.Join(quoteAll(sugg), " or ") + "?"
+	}
+	k.errorf(pos, "%s", msg)
+}
+
+// foreignHints answer names people bring from other languages.
+var foreignHints = map[string]string{
+	"len":     "the length of x is #x",
+	"length":  "the length of x is #x",
+	"size":    "the length of x is #x",
+	"append":  "use push(xs, v), or xs + [v] for a new list",
+	"int":     "use x as int64 or trunc(x)",
+	"float64": "use x as float64 or float(x)",
+	"string":  "use str(x) or x as str",
+	"input":   "use readln()",
+	"range":   "use a..<b or a..=b",
+	"nil":     "Tim has no nil; use 0, an error or an empty value",
+	"null":    "Tim has no null; use 0, an error or an empty value",
+	"true":    "use yes",
+	"false":   "use no",
+	"print_r": "use println(x)",
+}
+
+func quoteAll(xs []string) []string {
+	out := make([]string, len(xs))
+	for i, x := range xs {
+		out[i] = "'" + x + "'"
+	}
+	return out
+}
+
+// Statements.
+
+func (k *checker) block(stmts []Statement) {
+	k.push()
+	for _, s := range stmts {
+		k.stmt(s)
+	}
+	k.pop()
+}
+
+func (k *checker) stmt(s Statement) {
+	switch s := s.(type) {
+	case *ExpressionStmt:
+		k.expr(s.Expr)
+	case *AssignStmt:
+		k.assign(s)
+	case *MultipleAssignStmt:
+		t := k.expr(s.Value)
+		if t != TAny && t != TList {
+			k.errorf(s.Pos, "cannot unpack a %s into %d names; the right side must be a list", t, len(s.Names))
+		}
+		if s.IsUpdate {
+			var syms []*Var
+			for _, n := range s.Names {
+				syms = append(syms, k.updateTarget(s.Pos, n))
+			}
+			k.c.Defs[s] = syms
+			return
+		}
+		var syms []*Var
+		for _, n := range s.Names {
+			syms = append(syms, k.define(n, s.Mutable, s.Pos))
+		}
+		k.c.Defs[s] = syms
+	case *MapUpdateStmt:
+		k.expr(s.Index)
+		k.expr(s.Value)
+		if sym := k.modifyTarget(s.Pos, s.MapName); sym != nil {
+			k.c.Updates[s] = sym
+			if sym.Struct != nil {
+				k.errorf(s.Pos, "a cstruct has named fields: write %s.%s <- v instead of indexing", s.MapName, sym.Struct.Fields[0].Name)
+			}
+		}
+	case *IndexUpdateStmt:
+		k.expr(s.Target)
+		k.expr(s.Index)
+		k.expr(s.Value)
+		k.requireMutableRoot(s.Pos, s.Target)
+		if st := k.c.Structs[s.Target]; st != nil {
+			k.errorf(s.Pos, "a cstruct has named fields: write x.%s <- v instead of indexing", st.Fields[0].Name)
+		}
+	case *FieldUpdateStmt:
+		k.expr(s.Object)
+		k.expr(s.Value)
+		k.requireMutableRoot(s.Pos, s.Object)
+		if st := k.c.Structs[s.Object]; st != nil {
+			k.c.FieldSets[s] = k.field(s.Pos, st, s.Field)
+		} else if k.c.Types[s.Object] == TPtr {
+			k.errorf(s.Pos, "cannot tell which cstruct this is; write (x as T).%s", s.Field)
+		}
+	case *LoopStmt:
+		t := k.expr(s.Iterable)
+		if t == TNum || t == TFn {
+			k.errorf(s.Pos, "cannot loop over a %s; loop over a range like 0..<n, a list, a string or a map", t)
+		}
+		k.push()
+		it := k.define(s.Iterator, false, s.Pos)
+		if st := k.c.Elems[s.Iterable]; st != nil {
+			it.Struct = st
+		}
+		if s.IteratorType != "" && !castNumTypes[s.IteratorType] {
+			it.Struct = k.structNamed(s.Pos, s.IteratorType)
+		}
+		if _, isRange := s.Iterable.(*RangeExpr); isRange {
+			it.Type = TNum
+		}
+		k.c.Defs[s] = []*Var{it}
+		k.loops++
+		k.block(s.Body)
+		k.loops--
+		k.pop()
+	case *WhileStmt:
+		k.expr(s.Condition)
+		k.loops++
+		k.block(s.Body)
+		k.loops--
+	case *IfStmt:
+		for _, b := range s.Branches {
+			k.expr(b.Condition)
+			k.block(b.Body)
+		}
+		k.block(s.ElseBody)
+	case *JumpStmt:
+		if s.Value != nil {
+			k.expr(s.Value)
+		}
+	case *DeferStmt:
+		k.fn.Defers = true
+		k.c.Deferred[s] = k.lambda(&LambdaExpr{Pos: s.Pos, Body: s.Call}, "")
+	case *ArenaStmt:
+		k.block(s.Body)
+	case *CStructDecl:
+	case *CImportStmt:
+	case *ExportStmt:
+	default:
+		panic(fmt.Sprintf("check: unexpected %T", s))
+	}
+}
+
+func (k *checker) assign(s *AssignStmt) {
+	if s.IsUpdate {
+		t := k.expr(s.Value)
+		if sym := k.updateTarget(s.Pos, s.Name); sym != nil {
+			k.c.Updates[s] = sym
+			if sym.Type != t {
+				sym.Type = TAny
+			}
+		}
+		return
+	}
+
+	lambda, isFn := s.Value.(*LambdaExpr)
+	var sym *Var
+	if isFn {
+		// Define first so the function can call itself.
+		sym = k.define(s.Name, s.Mutable, s.Pos)
+		sym.Func = k.lambda(lambda, s.Name)
+		sym.Type = TFn
+		k.c.Types[lambda] = TFn
+		for _, c := range sym.Func.Captures {
+			if c.Outer == sym {
+				sym.Boxed = true // the closure must see its own value, set after it is made
+			}
+		}
+	} else {
+		k.checkLoopShadow(s)
+		t := k.expr(s.Value)
+		sym = k.define(s.Name, s.Mutable, s.Pos)
+		sym.Type = t
+		sym.Struct = k.c.Structs[s.Value]
+		sym.Elem = k.c.Elems[s.Value]
+	}
+	k.c.Defs[s] = []*Var{sym}
+}
+
+// checkLoopShadow rejects `x = x + 1` in a loop body when x belongs to an
+// outer block: the new x would vanish at the end of each iteration.
+func (k *checker) checkLoopShadow(s *AssignStmt) {
+	if k.loops == 0 || s.Mutable {
+		return
+	}
+	for sc := k.sc.parent; sc != nil; sc = sc.parent {
+		prev, ok := sc.names[s.Name]
+		if !ok {
+			continue
+		}
+		reads := false
+		walkNodes(s.Value, func(n any) {
+			if id, ok := n.(*IdentExpr); ok && id.Name == s.Name {
+				reads = true
+			}
+		})
+		if reads {
+			how := fmt.Sprintf("bind it with ':=' at line %d and write '%s <- ...'", prev.Pos.Line, s.Name)
+			if prev.Mutable {
+				how = fmt.Sprintf("write '%s <- ...'", s.Name)
+			}
+			k.errorf(s.Pos, "'%s = ...' here makes a new '%s' that disappears at the end of the block; to update '%s', %s", s.Name, s.Name, s.Name, how)
+		}
+		return
+	}
+}
+
+func (k *checker) updateTarget(pos Pos, name string) *Var {
+	sym := k.lookup(name)
+	if sym == nil {
+		k.undefined(pos, "variable", name)
+		return nil
+	}
+	if !sym.Mutable {
+		k.errorf(pos, "cannot update '%s': it was bound with '=' at line %d; bind it with ':=' to let it change", name, sym.Pos.Line)
+	}
+	return sym
+}
+
+func (k *checker) modifyTarget(pos Pos, name string) *Var {
+	sym := k.lookup(name)
+	if sym == nil {
+		k.undefined(pos, "variable", name)
+		return nil
+	}
+	if !sym.Mutable {
+		k.errorf(pos, "cannot modify '%s': it was bound with '=' at line %d; bind it with ':=' to let it change", name, sym.Pos.Line)
+	}
+	return sym
+}
+
+func (k *checker) requireMutableRoot(pos Pos, e Expression) {
+	for {
+		switch x := e.(type) {
+		case *IndexExpr:
+			e = x.List
+			continue
+		case *FieldAccessExpr:
+			e = x.Object
+			continue
+		case *IdentExpr:
+			if sym := k.c.Uses[x]; sym != nil && !sym.Mutable {
+				k.errorf(pos, "cannot modify '%s': it was bound with '=' at line %d; bind it with ':=' to let it change", x.Name, sym.Pos.Line)
+			}
+		}
+		return
+	}
+}
+
+// lambda checks a function literal and returns its Fun.
+func (k *checker) lambda(l *LambdaExpr, name string) *Fun {
+	if name == "" {
+		name = fmt.Sprintf("lambda@%s", l.Pos)
+	}
+	fn := &Fun{Name: name, Lambda: l, Parent: k.fn}
+	k.c.Fns[l] = fn
+	k.c.Funcs = append(k.c.Funcs, fn)
+	savedFn, savedLoops := k.fn, k.loops
+	k.fn, k.loops = fn, 0
+	k.push()
+	param := func(n string) *Var {
+		if _, dup := k.sc.names[n]; dup {
+			k.errorf(l.Pos, "parameter '%s' appears twice", n)
+		}
+		sym := &Var{Name: n, Kind: SymParam, Fn: fn, Index: len(fn.Params), Pos: l.Pos}
+		if t, ok := l.ParamCStructTypes[n]; ok {
+			sym.Struct = k.structNamed(l.Pos, t)
+		}
+		k.sc.names[n] = sym
+		return sym
+	}
+	for _, p := range l.Params {
+		fn.Params = append(fn.Params, param(p))
+	}
+	if l.VariadicParam != "" {
+		fn.Variadic = param(l.VariadicParam)
+		fn.Variadic.Type = TList
+	}
+	k.expr(l.Body)
+	fn.Returns = k.c.Structs[l.Body]
+	fn.ReturnsElem = k.c.Elems[l.Body]
+	k.pop()
+	k.fn, k.loops = savedFn, savedLoops
+	return fn
+}
+
+// Expressions.
+
+var numericOps = map[string]bool{"-": true, "*": true, "/": true, "%": true, "**": true,
+	"|b": true, "&b": true, "^b": true, "<<b": true, ">>b": true, "?b": true, "<<<b": true, ">>>b": true}
+
+var opNames = map[string]string{"-": "subtract", "*": "multiply", "/": "divide", "%": "take the remainder of",
+	"**": "raise", "|b": "or", "&b": "and", "^b": "xor", "<<b": "shift", ">>b": "shift", "?b": "test bits of",
+	"<<<b": "rotate", ">>>b": "rotate"}
+
+var builtinTypes = map[string]Type{
+	"str": TStr, "upper": TStr, "lower": TStr, "trim": TStr, "join": TStr, "replace": TStr, "chr": TStr,
+	"type": TStr, "readln": TStr, "read_file": TStr, "_error_code_extract": TStr, "platform": TStr,
+	"split": TList, "keys": TList, "values": TList, "sort": TList, "bytes": TList, "runes": TList,
+	"map": TList, "filter": TList, "zip": TList, "enumerate": TList, "args": TList,
+	"abs": TNum, "floor": TNum, "ceil": TNum, "round": TNum, "trunc": TNum, "sqrt": TNum, "exp": TNum,
+	"log": TNum, "log10": TNum, "sin": TNum, "cos": TNum, "tan": TNum, "asin": TNum, "acos": TNum,
+	"atan": TNum, "atan2": TNum, "pow": TNum, "gcd": TNum, "random": TNum, "float": TNum, "ord": TNum,
+	"starts_with": TNum, "ends_with": TNum, "find": TNum, "any": TNum, "all": TNum,
+}
+
+func (k *checker) exprs(es []Expression) {
+	for _, e := range es {
+		k.expr(e)
+	}
+}
+
+func (k *checker) expr(e Expression) Type {
+	t := k.infer(e)
+	if el := k.derivedElem(e); el != nil {
+		k.c.Elems[e] = el
+	}
+	if rw := k.c.Rewrites[e]; rw != nil {
+		if st := k.c.Structs[rw]; st != nil {
+			k.c.Structs[e] = st
+		}
+	}
+	if ix, ok := e.(*IndexExpr); ok {
+		if el := k.c.Elems[ix.List]; el != nil {
+			k.c.Structs[e] = el
+		}
+	}
+	if st := k.derivedStruct(e); st != nil {
+		k.c.Structs[e] = st
+		t = TPtr
+	}
+	if t != TAny {
+		k.c.Types[e] = t
+	}
+	return t
+}
+
+// derivedElem is the cstruct of the elements of a list expression.
+func (k *checker) derivedElem(e Expression) *CStructDecl {
+	switch e := e.(type) {
+	case *IdentExpr:
+		if v := k.c.Uses[e]; v != nil {
+			return v.Elem
+		}
+	case *CallExpr:
+		if v := k.c.Callees[e]; v != nil && v.Func != nil && !v.Mutable {
+			return v.Func.ReturnsElem
+		}
+	case *BlockExpr:
+		if n := len(e.Statements); n > 0 {
+			if es, ok := e.Statements[n-1].(*ExpressionStmt); ok {
+				return k.c.Elems[es.Expr]
+			}
+		}
+	}
+	return k.c.Elems[e]
+}
+
+// derivedStruct is the cstruct an expression has through its parts.
+func (k *checker) derivedStruct(e Expression) *CStructDecl {
+	switch e := e.(type) {
+	case *IdentExpr:
+		if v := k.c.Uses[e]; v != nil {
+			return v.Struct
+		}
+	case *BlockExpr:
+		return k.stmtsStruct(e.Statements)
+	case *MatchExpr:
+		st := k.c.Structs[e.DefaultExpr]
+		for _, c := range e.Clauses {
+			if k.c.Structs[c.Result] != st {
+				return nil
+			}
+		}
+		return st
+	}
+	return k.c.Structs[e]
+}
+
+// stmtsStruct is the cstruct a block's value has, through a final if.
+func (k *checker) stmtsStruct(ss []Statement) *CStructDecl {
+	if len(ss) == 0 {
+		return nil
+	}
+	switch s := ss[len(ss)-1].(type) {
+	case *ExpressionStmt:
+		return k.c.Structs[s.Expr]
+	case *IfStmt:
+		st := k.stmtsStruct(s.ElseBody)
+		for _, b := range s.Branches {
+			if k.stmtsStruct(b.Body) != st {
+				return nil
+			}
+		}
+		return st
+	}
+	return nil
+}
+
+func (k *checker) structNamed(pos Pos, name string) *CStructDecl {
+	if st := k.c.Program.CStructs[name]; st != nil {
+		return st
+	}
+	k.errorf(pos, "unknown cstruct '%s'", name)
+	return nil
+}
+
+func (k *checker) field(pos Pos, st *CStructDecl, name string) *CStructField {
+	for i := range st.Fields {
+		if st.Fields[i].Name == name {
+			return &st.Fields[i]
+		}
+	}
+	var names []string
+	for _, f := range st.Fields {
+		names = append(names, f.Name)
+	}
+	k.errorf(pos, "cstruct %s has no field '%s'; its fields are %s", st.Name, name, strings.Join(names, ", "))
+	return nil
+}
+
+// castNumTypes are the types `as` converts to a number.
+var castNumTypes = map[string]bool{"num": true, "number": true, "float64": true, "float32": true, "int8": true,
+	"int16": true, "int32": true, "int64": true, "uint8": true, "uint16": true, "uint32": true, "uint64": true,
+	"bool": true, "f64": true, "f32": true, "i32": true, "i64": true, "u8": true}
+
+// fieldType is how a field reads.
+func fieldType(f *CStructField) Type {
+	switch f.Type {
+	case "cstr":
+		return TStr
+	case "ptr":
+		return TPtr
+	}
+	return TNum
+}
+
+func (k *checker) infer(e Expression) Type {
+	switch e := e.(type) {
+	case nil:
+		return TAny
+	case *NumberExpr, *BooleanExpr, *RandomExpr:
+		return TNum
+	case *StringExpr:
+		return TStr
+	case *FStringExpr:
+		k.exprs(e.Parts)
+		return TStr
+	case *ListExpr:
+		k.exprs(e.Elements)
+		if len(e.Elements) > 0 {
+			st := k.c.Structs[e.Elements[0]]
+			for _, x := range e.Elements {
+				if k.c.Structs[x] != st {
+					st = nil
+				}
+			}
+			if st != nil {
+				k.c.Elems[e] = st
+			}
+		}
+		return TList
+	case *MapExpr:
+		for i := range e.Keys {
+			k.expr(e.Keys[i])
+			k.expr(e.Values[i])
+		}
+		return TMap
+	case *IdentExpr:
+		sym := k.lookup(e.Name)
+		if sym == nil {
+			if _, ok := builtins[e.Name]; ok {
+				sym = &Var{Name: e.Name, Kind: SymBuiltin, Type: TFn, Pos: e.Pos}
+			} else {
+				k.undefined(e.Pos, "variable", e.Name)
+				return TAny
+			}
+		}
+		k.c.Uses[e] = sym
+		if sym.Mutable {
+			return TAny
+		}
+		return sym.Type
+	case *BinaryExpr:
+		return k.binary(e)
+	case *UnaryExpr:
+		t := k.expr(e.Operand)
+		switch e.Operator {
+		case "-", "~b":
+			if t != TAny && t != TNum {
+				k.errorf(e.Pos, "cannot negate a %s", t)
+			}
+			return TNum
+		case "#":
+			if t == TNum || t == TFn {
+				k.errorf(e.Pos, "'#' needs a string, list or map, not a %s", t)
+			}
+			return TNum
+		}
+		return TNum
+	case *InExpr:
+		k.expr(e.Value)
+		if t := k.expr(e.Container); t == TNum || t == TFn {
+			k.errorf(e.Pos, "'in' needs a string, list, map or range on the right, not a %s", t)
+		}
+		return TNum
+	case *RangeExpr:
+		for _, x := range []Expression{e.Start, e.End} {
+			if t := k.expr(x); t != TAny && t != TNum {
+				k.errorf(e.Pos, "a range needs numbers, not a %s", t)
+			}
+		}
+		return TList
+	case *CastExpr:
+		k.expr(e.Expr)
+		switch e.Type {
+		case "str", "string":
+			return TStr
+		case "num", "number", "float64", "float32", "int8", "int16", "int32", "int64",
+			"uint8", "uint16", "uint32", "uint64", "bool":
+			return TNum
+		case "ptr", "pointer", "cptr", "cstring":
+			return TPtr
+		case "float", "double":
+			return TNum
+		case "cstr":
+			return TStr
+		}
+		if st := k.c.Program.CStructs[e.Type]; st != nil {
+			k.c.Structs[e] = st
+			return TPtr
+		}
+		k.errorf(e.Pos, "cannot cast to %s: not a type or cstruct", e.Type)
+		return TAny
+	case *IndexExpr:
+		t := k.expr(e.List)
+		if st := k.c.Structs[e.List]; st != nil {
+			k.errorf(e.Pos, "a cstruct has named fields: write x.%s instead of indexing", st.Fields[0].Name)
+		}
+		k.expr(e.Index)
+		if t == TNum || t == TFn {
+			k.errorf(e.Pos, "cannot index a %s", t)
+		}
+		if t == TStr {
+			return TNum
+		}
+		return TAny
+	case *SliceExpr:
+		t := k.expr(e.List)
+		k.expr(e.Start)
+		k.expr(e.End)
+		if e.Step != nil {
+			k.expr(e.Step)
+		}
+		if t == TNum || t == TFn || t == TMap {
+			k.errorf(e.Pos, "cannot slice a %s", t)
+		}
+		return t
+	case *FieldAccessExpr:
+		t := k.expr(e.Object)
+		if st := k.c.Structs[e.Object]; st != nil {
+			f := k.field(e.Pos, st, e.FieldName)
+			if f == nil {
+				return TAny
+			}
+			k.c.Fields[e] = f
+			if f.StructName != "" {
+				k.c.Structs[e] = k.c.Program.CStructs[f.StructName]
+			}
+			return fieldType(f)
+		}
+		if t == TPtr {
+			k.errorf(e.Pos, "cannot tell which cstruct this is; write (x as T).%s", e.FieldName)
+		}
+		if t == TNum || t == TStr || t == TList || t == TFn {
+			k.errorf(e.Pos, "a %s has no field '%s'", t, e.FieldName)
+		}
+		return TAny
+	case *CallExpr:
+		return k.call(e)
+	case *DirectCallExpr:
+		if t := k.expr(e.Callee); t != TAny && t != TFn {
+			k.errorf(e.Pos, "cannot call a %s", t)
+		}
+		k.exprs(e.Args)
+		return TAny
+	case *LambdaExpr:
+		k.lambda(e, "")
+		return TFn
+	case *BlockExpr:
+		k.push()
+		var t Type
+		for i, s := range e.Statements {
+			k.stmt(s)
+			if es, ok := s.(*ExpressionStmt); ok && i == len(e.Statements)-1 {
+				t = k.c.Types[es.Expr]
+			}
+		}
+		k.pop()
+		return t
+	case *MatchExpr:
+		k.expr(e.Condition)
+		var ts []Type
+		for _, c := range e.Clauses {
+			k.expr(c.Guard)
+			ts = append(ts, k.expr(c.Result))
+		}
+		ts = append(ts, k.expr(e.DefaultExpr))
+		for _, t := range ts[1:] {
+			if t != ts[0] {
+				return TAny
+			}
+		}
+		return ts[0]
+	case *ArenaExpr:
+		k.block(e.Body)
+		return TAny
+	case *NamespacedIdentExpr:
+		lib := k.cimps[e.Namespace]
+		if lib == nil {
+			// a module's global
+			id := &IdentExpr{Pos: e.Pos, Name: e.Namespace + "." + e.Name}
+			k.c.Rewrites[e] = id
+			return k.expr(id)
+		}
+		v, ok := lib.consts[e.Name]
+		if !ok {
+			msg := fmt.Sprintf("%s has no constant '%s'", e.Namespace, e.Name)
+			names := map[string]int{}
+			for n := range lib.consts {
+				names[n] = 1
+			}
+			if s := findSimilarIdentifiers(e.Name, names, 1); len(s) > 0 {
+				msg += "; did you mean '" + s[0] + "'?"
+			}
+			k.errorf(e.Pos, "%s", msg)
+			return TNum
+		}
+		k.c.CConsts[e] = v
+		return TNum
+	}
+	panic(fmt.Sprintf("check: unexpected %T", e))
+}
+
+// structOp rewrites an arithmetic operator on cstructs into a call of the
+// struct's method: add, sub, mul, or scale for a number.
+func (k *checker) structOp(e *BinaryExpr) (Type, bool) {
+	ls, rs := k.c.Structs[e.Left], k.c.Structs[e.Right]
+	if ls == nil && rs == nil {
+		return 0, false
+	}
+	var st *CStructDecl
+	var method string
+	var args []Expression
+	switch {
+	case ls != nil && rs != nil && ls == rs && (e.Operator == "+" || e.Operator == "-" || e.Operator == "*"):
+		st, method, args = ls, map[string]string{"+": "add", "-": "sub", "*": "mul"}[e.Operator], []Expression{e.Left, e.Right}
+	case ls != nil && rs == nil && e.Operator == "*":
+		st, method, args = ls, "scale", []Expression{e.Left, e.Right}
+	case ls == nil && rs != nil && e.Operator == "*":
+		st, method, args = rs, "scale", []Expression{e.Right, e.Left}
+	case ls != nil && rs == nil && e.Operator == "/":
+		st, method, args = ls, "scale", []Expression{e.Left, &BinaryExpr{Pos: e.Pos, Left: &NumberExpr{Value: 1}, Operator: "/", Right: e.Right}}
+	default:
+		return 0, false
+	}
+	name := st.Name + "_" + method
+	if k.lookup(name) == nil {
+		k.errorf(e.Pos, "'%s' on a %s needs the method %s.%s", e.Operator, st.Name, st.Name, method)
+		return TAny, true
+	}
+	call := &CallExpr{Pos: e.Pos, Function: name, Args: args}
+	t := k.expr(call)
+	k.c.Rewrites[e] = call
+	return t, true
+}
+
+func (k *checker) binary(e *BinaryExpr) Type {
+	l, r := k.expr(e.Left), k.expr(e.Right)
+	if t, ok := k.structOp(e); ok {
+		return t
+	}
+	switch op := e.Operator; {
+	case l == TPtr && (op == "+" || op == "-") && (r == TNum || r == TAny):
+		return TPtr
+	case l == TPtr && r == TPtr && op == "-":
+		return TNum
+	case op == "+":
+		switch {
+		case l == TAny || r == TAny:
+			if l == r || l == TAny && r == TAny {
+				return TAny
+			}
+			if l == TAny {
+				return r
+			}
+			return l
+		case l == r && (l == TNum || l == TStr || l == TList):
+			return l
+		case l == TStr || r == TStr:
+			k.errorf(e.Pos, "cannot add a %s and a %s; use an f-string like f\"{a}{b}\" or str()", l, r)
+		default:
+			k.errorf(e.Pos, "cannot add a %s and a %s", l, r)
+		}
+		return TAny
+	case op == "*" && (l == TList || l == TStr) && (r == TNum || r == TAny):
+		return l
+	case numericOps[op]:
+		for _, t := range []Type{l, r} {
+			if t != TAny && t != TNum {
+				k.errorf(e.Pos, "cannot %s a %s; '%s' needs numbers", opNames[op], t, strings.TrimSuffix(op, "b"))
+				break
+			}
+		}
+		return TNum
+	case op == "or!":
+		if l == r {
+			return l
+		}
+		return TAny
+	case op == "and" || op == "or":
+		return TNum
+	case op == "<" || op == "<=" || op == ">" || op == ">=":
+		if l != TAny && r != TAny && l != r {
+			k.errorf(e.Pos, "cannot compare a %s with a %s", l, r)
+		}
+		return TNum
+	}
+	return TNum
+}
+
+func (k *checker) call(e *CallExpr) Type {
+	name := e.Function
+	if recv, method, ok := strings.Cut(name, "."); ok && k.lookup(name) == nil {
+		if lib := k.cimps[recv]; lib != nil && k.lookup(recv) == nil {
+			return k.cCall(e, lib, method)
+		}
+		if sym := k.lookup(recv); sym != nil {
+			// x.f(args) calls f(x, args), or the method T.f when x is a cstruct T.
+			e.Function = method
+			if sym.Struct != nil && k.lookup(sym.Struct.Name+"_"+method) != nil {
+				e.Function = sym.Struct.Name + "_" + method
+			}
+			e.Args = append([]Expression{&IdentExpr{Pos: e.Pos, Name: recv}}, e.Args...)
+			return k.call(e)
+		}
+		k.undefined(e.Pos, "function", name)
+		k.exprs(e.Args)
+		return TAny
+	}
+	if e.IsCFFI {
+		return k.cCall(e, libcLib, name)
+	}
+	k.exprs(e.Args)
+	if st := k.c.Program.CStructs[name]; st != nil && k.lookup(name) == nil {
+		if len(e.Args) > len(st.Fields) {
+			k.errorf(e.Pos, "cstruct %s has %s, but %d %s given", name, plural(len(st.Fields), "field"), len(e.Args), wasWere(len(e.Args)))
+		}
+		k.c.Ctors[e] = st
+		k.c.Structs[e] = st
+		return TPtr
+	}
+	if len(e.Args) > 0 && k.lookup(name) == nil {
+		// obj.f(args) on an expression: the method T.f when obj is a cstruct T
+		if st := k.c.Structs[e.Args[0]]; st != nil && k.lookup(st.Name+"_"+name) != nil {
+			name = st.Name + "_" + name
+			e.Function = name
+		}
+	}
+	if sym := k.lookup(name); sym != nil {
+		k.c.Callees[e] = sym
+		if f := sym.Func; f != nil && f.Returns != nil && !sym.Mutable {
+			k.c.Structs[e] = f.Returns
+		}
+		if t := sym.Type; t != TAny && t != TFn && !sym.Mutable {
+			k.errorf(e.Pos, "cannot call '%s': it is a %s", name, t)
+		}
+		if f := sym.Func; f != nil && !sym.Mutable {
+			if f.Variadic == nil && len(e.Args) != len(f.Params) || f.Variadic != nil && len(e.Args) < len(f.Params) {
+				k.errorf(e.Pos, "'%s' takes %s, but %d %s given", name, plural(len(f.Params), "argument"), len(e.Args), wasWere(len(e.Args)))
+			}
+		}
+		return TAny
+	}
+	if name == "_error_code_extract" {
+		return TStr
+	}
+	b, ok := builtins[name]
+	if !ok {
+		if hint, ok := removedBuiltins[name]; ok {
+			k.errorf(e.Pos, "%s was removed in Tim 2: %s", name, hint)
+		} else {
+			k.undefined(e.Pos, "function", name)
+		}
+		return TAny
+	}
+	if name == "syscall" && k.os != OSLinux {
+		k.errorf(e.Pos, "syscall is for Linux, whose system calls are stable; on %s call the C library", k.os)
+	}
+	if len(e.Args) < b.min || b.max >= 0 && len(e.Args) > b.max {
+		want := plural(b.min, "argument")
+		switch {
+		case b.max < 0:
+			want = "at least " + want
+		case b.max != b.min:
+			want = fmt.Sprintf("%d to %d arguments", b.min, b.max)
+		}
+		k.errorf(e.Pos, "'%s' takes %s, but %d %s given", name, want, len(e.Args), wasWere(len(e.Args)))
+	}
+	if t, ok := builtinTypes[name]; ok {
+		return t
+	}
+	if (name == "min" || name == "max") && len(e.Args) > 1 {
+		return TNum
+	}
+	return TAny
+}
+
+// cCall checks a call of a C function.
+func (k *checker) cCall(e *CallExpr, lib *cLib, name string) Type {
+	k.exprs(e.Args)
+	f := lib.function(name, k.os)
+	k.c.CCalls[e] = f
+	if !f.known {
+		return TAny
+	}
+	if len(e.Args) < f.fixed || !f.variadic && len(e.Args) > f.fixed {
+		want := plural(f.fixed, "argument")
+		if f.variadic {
+			want = "at least " + want
+		}
+		k.errorf(e.Pos, "C function '%s' takes %s, but %d %s given", name, want, len(e.Args), wasWere(len(e.Args)))
+	}
+	switch f.ret {
+	case cPtr, cCstr:
+		return TPtr
+	case cDyn:
+		return TAny
+	}
+	return TNum
+}
+
+func plural(n int, word string) string {
+	if n == 1 {
+		return "1 " + word
+	}
+	return fmt.Sprintf("%d %ss", n, word)
+}
+
+func wasWere(n int) string {
+	if n == 1 {
+		return "was"
+	}
+	return "were"
+}

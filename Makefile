@@ -5,16 +5,12 @@ SOURCES := $(wildcard *.go)
 
 GO ?= go
 MODULE_FILES := go.mod $(wildcard go.sum)
-GOFLAGS ?= -mod=vendor -v
+GOFLAGS ?=
 
-# macOS, FreeBSD and Linux detection
 UNAME_S := $(shell uname -s)
 ifeq ($(UNAME_S),Darwin)
   PREFIX ?= /usr/local
   MAKE ?= make
-else ifeq ($(UNAME_S),FreeBSD)
-  PREFIX ?= /usr/local
-  MAKE ?= gmake
 else
   PREFIX ?= /usr
   MAKE ?= make
@@ -35,10 +31,10 @@ install: $(PROGRAM)
 
 test:
 	@echo "Running tests..."
-	$(GO) test -failfast -timeout 1m ./...
+	$(GO) test -timeout 10m ./...
 
 cover:
-	$(GO) test -mod=vendor -coverprofile=coverage.out -coverpkg=./... ./...
+	$(GO) test -coverprofile=coverage.out -coverpkg=./... ./...
 	$(GO) tool cover -func=coverage.out
 
 clean:

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"runtime"
 	"testing"
 )
 
@@ -23,14 +22,9 @@ func TestPrintfWithStringLiteral(t *testing.T) {
 			expected: "Test: hello\n",
 		},
 		{
-			name: "number with %g format",
-			code: `printf("Number: %.15g\n", 42)`,
-			expected: func() string {
-				if runtime.GOOS == "windows" {
-					return "Number: 42\n"
-				}
-				return "Number: 42.000000000000000\n"
-			}(),
+			name:     "number with %g format",
+			code:     `printf("Number: %.15g\n", 42)`,
+			expected: "Number: 42\n",
 		},
 		{
 			name:     "boolean with %b format",

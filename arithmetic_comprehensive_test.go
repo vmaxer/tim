@@ -62,21 +62,6 @@ func TestArithmeticOperations(t *testing.T) {
 			source:   "x := 16 ** 0.5\nprintln(x)\n",
 			expected: "4\n",
 		},
-		{
-			name:     "caret_as_power",
-			source:   "x := 2 ^ 3\nprintln(x)\n",
-			expected: "8\n",
-		},
-		{
-			name:     "caret_precedence",
-			source:   "x := 2 + 3 ^ 2\nprintln(x)\n",
-			expected: "11\n",
-		},
-		{
-			name:     "caret_vs_double_star",
-			source:   "a := 5 ^ 2\nb := 5 ** 2\nprintln(a)\nprintln(b)\n",
-			expected: "25\n25\n",
-		},
 	}
 
 	for _, tt := range tests {
@@ -244,42 +229,42 @@ func TestBitwiseOperations(t *testing.T) {
 	}{
 		{
 			name: "bitwise_and",
-			source: `x := 12 &b 10
+			source: `x := 12 & 10
 println(x)
 `,
 			expected: "8\n",
 		},
 		{
 			name: "bitwise_or",
-			source: `x := 12 |b 10
+			source: `x := 12 | 10
 println(x)
 `,
 			expected: "14\n",
 		},
 		{
 			name: "bitwise_xor",
-			source: `x := 12 ^b 10
+			source: `x := 12 ^ 10
 println(x)
 `,
 			expected: "6\n",
 		},
 		{
 			name: "bitwise_not",
-			source: `x := ~b 0
+			source: `x := ~ 0
 println(x)
 `,
 			expected: "-1\n",
 		},
 		{
 			name: "shift_left",
-			source: `x := 5 <<b 2
+			source: `x := 5 << 2
 println(x)
 `,
 			expected: "20\n",
 		},
 		{
 			name: "shift_right",
-			source: `x := 20 >>b 2
+			source: `x := 20 >> 2
 println(x)
 `,
 			expected: "5\n",
