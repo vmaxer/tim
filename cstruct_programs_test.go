@@ -1,9 +1,6 @@
 package main
 
 import (
-	"os"
-	"os/exec"
-	"path/filepath"
 	"testing"
 )
 
@@ -219,54 +216,4 @@ main = {
 }
 `
 	testInlineTim(t, "cstruct_method_on_local_in_if_arm", source, "1.35\n0.30000000000000004\n1.1400000000000001\n")
-}
-
-func TestExistingCStructPrograms(t *testing.T) {
-	tests := []string{
-		"cstruct_test",
-		"cstruct_syntax_test",
-		"cstruct_helpers_test",
-		"cstruct_modifiers_test",
-		"cstruct_arena_test",
-	}
-
-	for _, name := range tests {
-		t.Run(name, func(t *testing.T) {
-			srcPath := filepath.Join("testprograms", name+".tim")
-			resultPath := filepath.Join("testprograms", name+".result")
-
-			if _, err := os.Stat(srcPath); os.IsNotExist(err) {
-				t.Skipf("Source file %s not found", srcPath)
-				return
-			}
-
-			var expected string
-			if data, err := os.ReadFile(resultPath); err == nil {
-				expected = string(data)
-			}
-
-			tmpDir := t.TempDir()
-			exePath := filepath.Join(tmpDir, name)
-
-			platform := GetDefaultPlatform()
-			if err := CompileTim(srcPath, exePath, platform); err != nil {
-				t.Fatalf("Compilation failed: %v", err)
-			}
-
-			output, err := runWithTimeout(exePath, 5)
-			if err != nil {
-				if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() < 0 {
-					t.Fatalf("Execution failed: %v", err)
-				}
-			}
-
-			if expected != "" {
-				actual := string(output)
-				if actual != expected {
-					t.Errorf("Output mismatch:\nExpected:\n%s\nActual:\n%s",
-						expected, actual)
-				}
-			}
-		})
-	}
 }

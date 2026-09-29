@@ -1,7 +1,0 @@
-cstruct Point {
-    x: int32,
-    y: int32
-}
-
-// Should just compile and do nothing
-println("cstruct defined")

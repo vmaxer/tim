@@ -92,7 +92,7 @@ func TestCrossArch(t *testing.T) {
 					if err := os.WriteFile(src, []byte(p.code), 0o644); err != nil {
 						t.Fatal(err)
 					}
-					if err := CompileTimWithOptions(src, exe, Platform{Arch: target.arch, OS: OSLinux}, 0, false, false); err != nil {
+					if err := CompileTim(src, exe, Platform{Arch: target.arch, OS: OSLinux}); err != nil {
 						t.Fatalf("compilation failed: %v", err)
 					}
 					cmd := exec.Command(qemu, exe)

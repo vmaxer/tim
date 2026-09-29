@@ -17,9 +17,15 @@ println(0.1 + 0.2 == 0.3, 7 / 2)        // 1 3.5
 
 ```sh
 go install github.com/vmaxer/tim@latest
-tim hello.tim -o hello && ./hello
-tim --os windows --arch arm64 hello.tim -o hello.exe
+tim hello.tim && ./hello                  # build
+tim run hello.tim a b                     # build and run with arguments
+tim -c 'println(2 ** 100)'                # run a one-liner
+tim --target arm64-windows hello.tim      # cross-compile: hello.exe
+tim test                                  # run the test functions of *_test.tim
 ```
+
+A file that starts with `#!/usr/bin/env tim` runs as a script. `tim help`
+lists the targets and flags.
 
 ## The language in a minute
 
@@ -37,7 +43,9 @@ tim --os windows --arch arm64 hello.tim -o hello.exe
 - **Errors are values.** `10 / 0` and `xs[99]` are errors that print as
   `error: division by zero`; `x or! default` replaces an error, `v.error`
   reads its code and `err "code"` returns one.
-- **Memory** is garbage collected.
+- **Memory** is garbage collected, and `arena { }` makes a region: allocation
+  inside is a pointer bump and leaving frees it at once, keeping only what
+  escapes. One arena per game frame or per request makes garbage free.
 - **C interop.** `import sdl3 as sdl` makes C functions callable as `sdl.SDL_Init(...)`.
 
 The full grammar and semantics are in [GRAMMAR.md](GRAMMAR.md) and the
@@ -55,8 +63,8 @@ and everything else calls the runtime, `runtime/rt.c`, a freestanding C
 library with exact arithmetic, UTF-8 strings, lists, maps and a garbage
 collector, embedded in each executable as a position-independent blob.
 
-Programs that use C libraries, cstructs, `unsafe` or `defer` are compiled by
-the older backends (`codegen.go`, `arm64_codegen.go`, `riscv64_codegen.go`).
+C functions are called through the platform ABI by the runtime (`rt_ffi`),
+with signatures read from the library's headers (`cffi.go`, `core_ffi.go`).
 
 ## Development
 
@@ -64,7 +72,6 @@ the older backends (`codegen.go`, `arm64_codegen.go`, `riscv64_codegen.go`).
 go test ./...                              # includes cross-architecture tests when qemu is installed
 TIM_UPDATE=1 go test -run TestCorePrograms # rewrite testdata/core/*.want
 sh runtime/build.sh                        # rebuild the runtime blobs (clang, ld.lld)
-TIM_LEGACY=1 tim prog.tim                  # force the legacy backends
 ```
 
 License: The Unlicense.

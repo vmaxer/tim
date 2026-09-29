@@ -279,8 +279,12 @@ f"{s} has {#s} bytes"
   arithmetic on an error propagates it. `v.error` is the error's code as a string
   (`""` for a non-error), `v or! d` substitutes `d`, and `err "code"` returns an
   error from the current function. Printing an error prints `error: <message>`.
-- **Memory.** Values live on a garbage-collected heap. `arena { ... }` runs its
-  block; it is kept for programs written for manual arenas.
+- **Memory.** Values live on a garbage-collected heap. Inside `arena { ... }`,
+  allocation is a pointer bump in a region of its own, and leaving the block
+  frees the region at once, so a game frame or a server request that
+  allocates freely costs nothing to clean up. It is safe: a value that
+  outlives the block, because the block returns it or stores it somewhere
+  older, is kept. Arenas nest.
 
 ## 6. C interop
 
@@ -356,6 +360,7 @@ when the program ends, last first, as they do when a function returns.
 | ENet `&8080`, `<-` send, `<=` receive    | removed from the language                    |
 | `class`, `with`, `alias`, `spawn`        | removed: use functions, maps and cstructs    |
 | `unsafe` register blocks, `vec2`/`vec4`  | removed: C functions, `read_*`/`write_*`     |
+| `malloc`, `free`, `arena_create`         | `arena { }`, `alloc(n)`, or `c.malloc`       |
 | `shadow`                                 | inner blocks shadow freely                   |
 | `@first` `@last` `@counter` `@i`         | removed                                      |
 | condition loops require `! N`            | `! N` is optional everywhere                 |

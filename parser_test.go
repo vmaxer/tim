@@ -18,7 +18,7 @@ func parseString(t *testing.T, src string) (prog *Program, errMsg string) {
 			}(), "error: "))
 		}
 	}()
-	p := NewParser(src)
+	p := NewParserWithFilename(src, "test.tim")
 	p.errors.SetSourceCode("")
 	var statements []Statement
 	p.skipEnds()

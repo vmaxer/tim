@@ -31,17 +31,6 @@ type Parser struct {
 // parseBailout unwinds the parser to the enclosing statement after an error.
 type parseBailout struct{}
 
-// compilerError aborts code generation with a message (recovered by the compile driver).
-func compilerError(format string, args ...any) {
-	msg := fmt.Sprintf(format, args...)
-	if VerboseMode {
-		fmt.Fprintln(os.Stderr, "Error:", msg)
-	}
-	panic(fmt.Errorf("%s", msg))
-}
-
-func NewParser(input string) *Parser { return NewParserWithFilename(input, "<input>") }
-
 func NewParserWithFilename(input, filename string) *Parser {
 	toks, lexErr := Lex(input)
 	p := &Parser{
@@ -63,13 +52,6 @@ func NewParserWithFilename(input, filename string) *Parser {
 
 // ParseProgram parses a whole file, reporting every syntax error it finds.
 func (p *Parser) ParseProgram() *Program {
-	program := p.ParseProgramRaw()
-	uniquifyLocalFunctions(program)
-	return optimizeProgram(program)
-}
-
-// ParseProgramRaw parses a file without the legacy AST optimizations.
-func (p *Parser) ParseProgramRaw() *Program {
 	program := &Program{}
 	if p.lexErr != nil {
 		p.errors.AddError(SyntaxError(p.lexErr.Msg, SourceLocation{File: p.filename, Line: p.lexErr.Line, Column: p.lexErr.Column, Length: 1}))
@@ -81,7 +63,7 @@ func (p *Parser) ParseProgramRaw() *Program {
 	}
 	if p.errors.HasErrors() {
 		if !p.quiet {
-			fmt.Fprintln(os.Stderr, p.errors.Report(true))
+			fmt.Fprintln(os.Stderr, strings.TrimRight(p.errors.Report(colorful()), "\n"))
 		}
 		panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
 	}
@@ -274,7 +256,7 @@ func (p *Parser) statement() Statement {
 		return &DeferStmt{Call: p.expr()}
 	case TOKEN_ARENA:
 		p.advance()
-		return &ArenaStmt{Body: p.blockStmts()}
+		return &ArenaStmt{Body: p.scopedBlockStmts()}
 	case TOKEN_IF:
 		return p.ifStmt()
 	case TOKEN_ELIF, TOKEN_ELSE:
@@ -1069,14 +1051,6 @@ func (p *Parser) product() Expression {
 	return p.binary(p.cast, map[TokenType]string{TOKEN_STAR: "*", TOKEN_SLASH: "/", TOKEN_PERCENT: "%"})
 }
 
-var castTypes = map[string]bool{
-	"int8": true, "int16": true, "int32": true, "int64": true,
-	"uint8": true, "uint16": true, "uint32": true, "uint64": true,
-	"float32": true, "float64": true, "cstr": true, "cstring": true, "cptr": true, "ptr": true,
-	"num": true, "str": true, "list": true, "map": true, "bool": true, "cbool": true,
-	"cint": true, "clong": true, "cfloat": true, "cdouble": true,
-}
-
 func (p *Parser) cast() Expression {
 	e := p.unary()
 	for p.at(TOKEN_AS) {
@@ -1390,9 +1364,7 @@ func (p *Parser) mapLiteral() Expression {
 			var key Expression
 			switch t := p.advance(); t.Type {
 			case TOKEN_IDENT:
-				key = &NumberExpr{Value: float64(hashStringKey(t.Value))}
-				m.Names = append(m.Names, make([]string, len(m.Keys)+1-len(m.Names))...)
-				m.Names[len(m.Keys)] = t.Value
+				key = &StringExpr{Value: t.Value}
 			case TOKEN_STRING:
 				key = &StringExpr{Value: t.Value}
 			case TOKEN_NUMBER:
@@ -1629,158 +1601,11 @@ func (p *Parser) subExpression(src string, at Token) Expression {
 	return e
 }
 
-// unsafe parses `unsafe [T] {x86_64} {arm64} {riscv64} [as T]`.
+// unsafe reports that unsafe blocks are gone.
 func (p *Parser) unsafe() Expression {
 	p.fail("'unsafe' was removed in Tim 2: call C through c.name(...), and read and write memory with read_u8 ... write_f64")
-	p.advance()
-	ret := "uint64"
-	if p.at(TOKEN_IDENT) && castTypes[p.cur().Value] {
-		ret = p.advance().Value
-	}
-	var blocks [3][]Statement
-	for i := range blocks {
-		blocks[i] = p.unsafeBlock()
-	}
-	if p.accept(TOKEN_AS) {
-		ret = p.expect(TOKEN_IDENT, "a type").Value
-	}
-	return &UnsafeExpr{
-		X86_64Block: blocks[0], ARM64Block: blocks[1], RISCV64Block: blocks[2],
-		X86_64Return:  &UnsafeReturnStmt{Register: "rax", AsType: ret},
-		ARM64Return:   &UnsafeReturnStmt{Register: "x0", AsType: ret},
-		RISCV64Return: &UnsafeReturnStmt{Register: "a0", AsType: ret},
-	}
+	return nil
 }
-
-var unsafeOps = map[TokenType]string{
-	TOKEN_PLUS: "+", TOKEN_MINUS: "-", TOKEN_STAR: "*", TOKEN_SLASH: "/", TOKEN_PERCENT: "%",
-	TOKEN_AMP: "&", TOKEN_PIPE: "|", TOKEN_CARET: "^b", TOKEN_SHL: "<<", TOKEN_SHR: ">>",
-}
-
-func (p *Parser) unsafeBlock() []Statement {
-	p.expect(TOKEN_LBRACE, "'{' for an architecture block")
-	var stmts []Statement
-	p.skipEnds()
-	for !p.accept(TOKEN_RBRACE) {
-		switch {
-		case p.at(TOKEN_IDENT) && p.cur().Value == "syscall":
-			p.advance()
-			stmts = append(stmts, &SyscallStmt{})
-		case p.at(TOKEN_LBRACKET):
-			reg, off := p.unsafeAddress()
-			p.expect(TOKEN_UPDATE, "'<-'")
-			var value any
-			if p.at(TOKEN_NUMBER) {
-				value = p.unsafeNumber()
-			} else {
-				value = p.expect(TOKEN_IDENT, "a register or number").Value
-			}
-			size := "uint64"
-			if p.accept(TOKEN_AS) {
-				size = p.expect(TOKEN_IDENT, "a type").Value
-			}
-			stmts = append(stmts, &MemoryStore{Size: size, Address: reg, Offset: off, Value: value})
-		default:
-			reg := p.expect(TOKEN_IDENT, "a register, memory address or 'syscall'").Value
-			p.expect(TOKEN_UPDATE, "'<-'")
-			stmts = append(stmts, &RegisterAssignStmt{Register: reg, Value: p.unsafeValue()})
-		}
-		p.endStatement()
-	}
-	return stmts
-}
-
-func (p *Parser) unsafeNumber() *NumberExpr {
-	n, err := parseNumber(p.advance().Value)
-	if err != nil {
-		p.i--
-		p.fail("%v", err)
-	}
-	return n
-}
-
-func (p *Parser) unsafeAddress() (string, int64) {
-	p.expect(TOKEN_LBRACKET, "'['")
-	reg := p.expect(TOKEN_IDENT, "a register").Value
-	var off int64
-	if p.at(TOKEN_PLUS) || p.at(TOKEN_MINUS) {
-		neg := p.advance().Type == TOKEN_MINUS
-		off = int64(p.unsafeNumber().Value)
-		if neg {
-			off = -off
-		}
-	}
-	p.expect(TOKEN_RBRACKET, "']'")
-	return reg, off
-}
-
-func (p *Parser) unsafeValue() any {
-	if p.at(TOKEN_LBRACKET) {
-		reg, off := p.unsafeAddress()
-		size := "uint64"
-		if p.accept(TOKEN_AS) {
-			size = p.expect(TOKEN_IDENT, "a type").Value
-		}
-		return &MemoryLoad{Size: size, Address: reg, Offset: off}
-	}
-	if p.accept(TOKEN_TILDE) {
-		return &RegisterOp{Operator: "~b", Right: p.expect(TOKEN_IDENT, "a register").Value}
-	}
-	var left string
-	var imm *NumberExpr
-	if p.at(TOKEN_NUMBER) {
-		imm = p.unsafeNumber()
-	} else {
-		left = p.expect(TOKEN_IDENT, "a register, variable or number").Value
-	}
-	if p.accept(TOKEN_AS) {
-		t := p.expect(TOKEN_IDENT, "a type").Value
-		if imm != nil {
-			return &CastExpr{Expr: imm, Type: t}
-		}
-		return &CastExpr{Expr: &IdentExpr{Name: left}, Type: t}
-	}
-	if op, ok := unsafeOps[p.cur().Type]; ok {
-		if imm != nil {
-			p.fail("the left operand of a register operation must be a register")
-		}
-		p.advance()
-		var right any
-		if p.at(TOKEN_NUMBER) {
-			right = p.unsafeNumber()
-		} else {
-			right = p.expect(TOKEN_IDENT, "a register or number").Value
-		}
-		return &RegisterOp{Left: left, Operator: op, Right: right}
-	}
-	if imm != nil {
-		return imm
-	}
-	if isRegisterName(left) {
-		return left
-	}
-	return &IdentExpr{Name: left}
-}
-
-var registerNames = map[string]bool{}
-
-func init() {
-	for _, group := range []string{
-		"rax rbx rcx rdx rsi rdi rbp rsp r8 r9 r10 r11 r12 r13 r14 r15 eax ebx ecx edx esi edi ebp esp " +
-			"ax bx cx dx si di bp sp al bl cl dl sil dil bpl spl stack",
-		"xmm0 xmm1 xmm2 xmm3 xmm4 xmm5 xmm6 xmm7 xmm8 xmm9 xmm10 xmm11 xmm12 xmm13 xmm14 xmm15",
-		"x0 x1 x2 x3 x4 x5 x6 x7 x8 x9 x10 x11 x12 x13 x14 x15 x16 x17 x18 x19 x20 x21 x22 x23 x24 x25 " +
-			"x26 x27 x28 x29 x30 xzr lr w0 w1 w2 w3 w4 w5 w6 w7 v0 v1 v2 v3 v4 v5 v6 v7",
-		"a0 a1 a2 a3 a4 a5 a6 a7 t0 t1 t2 t3 t4 t5 t6 s0 s1 s2 s3 s4 s5 s6 s7 s8 s9 s10 s11 ra gp tp " +
-			"fa0 fa1 fa2 fa3 fa4 fa5 fa6 fa7",
-	} {
-		for _, r := range strings.Fields(group) {
-			registerNames[r] = true
-		}
-	}
-}
-
-func isRegisterName(name string) bool { return registerNames[name] }
 
 // hasCall reports whether evaluating e may call a function, so it must not be
 // evaluated more than once.

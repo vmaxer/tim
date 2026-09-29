@@ -86,79 +86,41 @@ func addPrelude(prog *Program) {
 		return
 	}
 	p := NewParserWithFilename(strings.Join(src, "\n"), "<prelude>")
-	extra := p.ParseProgramRaw()
+	extra := p.ParseProgram()
 	prog.Statements = append(prog.Statements, extra.Statements...)
 }
 
 // CompileTim compiles the program in inputPath to an executable.
-func CompileTim(inputPath string, outputPath string, platform Platform) error {
-	return CompileTimWithOptions(inputPath, outputPath, platform, 0, VerboseMode, false)
-}
-
-// CompileTimWithOptions compiles with the given verbosity; depsOnly lists the
-// program's imports instead of compiling it.
-func CompileTimWithOptions(inputPath string, outputPath string, platform Platform, _ float64, verbose bool, depsOnly bool) error {
-	if verbose {
-		old := VerboseMode
-		VerboseMode = true
-		defer func() { VerboseMode = old }()
-	}
+func CompileTim(inputPath, outputPath string, p Platform) error {
 	path, err := filepath.Abs(inputPath)
 	if err != nil {
 		return err
 	}
 	src, err := os.ReadFile(path)
 	if err != nil {
-		return fmt.Errorf("failed to read %s: %v", inputPath, err)
+		return err
 	}
-	if depsOnly {
-		prog := parseQuietly(string(src), path)
-		if prog == nil {
-			return fmt.Errorf("%s does not parse", inputPath)
-		}
-		for _, s := range prog.Statements {
-			switch s := s.(type) {
-			case *ImportStmt:
-				fmt.Printf("%s as %s\n", s.URL, s.Alias)
-			case *CImportStmt:
-				fmt.Printf("C %s as %s\n", s.Library, s.Alias)
-			}
-		}
-		return nil
-	}
-	handled, err := tryCore(src, path, outputPath, platform)
-	if !handled && err == nil {
-		err = fmt.Errorf("%s: cannot compile for %s", inputPath, platform.FullString())
-	}
-	return err
+	return compileSource(src, path, outputPath, p)
 }
 
-// tryCore compiles with the core code generator. It returns handled=false
-// when it cannot compile the program for the platform.
-func tryCore(src []byte, path, out string, p Platform) (handled bool, err error) {
-	why := ""
-	defer func() {
-		if VerboseMode && !handled {
-			fmt.Fprintf(os.Stderr, "tim: %s\n", why)
-		}
-	}()
+// compileSource compiles src, the program in path, to out.
+func compileSource(src []byte, path, out string, p Platform) (err error) {
 	t, a, write := coreTargetFor(p)
 	if a == nil {
-		why = "platform " + p.FullString()
-		return false, nil
+		return fmt.Errorf("cannot compile for %s", p.FullString())
 	}
 	defer func() {
 		if r := recover(); r != nil {
 			if e, ok := r.(error); ok && errors.Is(e, ErrAlreadyReported) {
-				handled, err = true, e
+				err = e
 				return
 			}
 			panic(r)
 		}
 	}()
-	prog := NewParserWithFilename(string(src), path).ParseProgramRaw()
+	prog := NewParserWithFilename(string(src), path).ParseProgram()
 	if err := loadModules(prog, path, p); err != nil {
-		return true, err
+		return err
 	}
 	addPrelude(prog)
 	c, err := Check(prog, path, string(src))
@@ -173,17 +135,49 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 	}
 	if err != nil {
 		ce := err.(*CheckError)
-		fmt.Fprint(os.Stderr, ce.Color)
-		return true, newReportedError(ce.Plain)
-	}
-	if len(c.Unsupported) > 0 {
-		return true, fmt.Errorf("%s uses what Tim 2 does not support: %s", filepath.Base(path), strings.Join(c.Unsupported, ", "))
+		if colorful() {
+			fmt.Fprintln(os.Stderr, strings.TrimRight(ce.Color, "\n"))
+		} else {
+			fmt.Fprintln(os.Stderr, ce.Plain)
+		}
+		return newReportedError(ce.Plain)
 	}
 	code, entry, cimps, err := compileCore(c, a, t)
 	if err != nil {
-		return true, fmt.Errorf("internal compiler error: %v", err)
+		return fmt.Errorf("internal compiler error: %v", err)
 	}
-	return true, write(out, p.Arch, code, entry, cimps)
+	if VerboseMode {
+		fmt.Fprintf(os.Stderr, "tim: %s: %d bytes of code for %s\n", out, len(code), p.FullString())
+	}
+	return write(out, p.Arch, code, entry, cimps)
+}
+
+// imports lists the imports of the program in path.
+func imports(path string) ([]string, error) {
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	prog := parseQuietly(string(src), path)
+	if prog == nil {
+		return nil, fmt.Errorf("%s does not parse", path)
+	}
+	var out []string
+	for _, s := range prog.Statements {
+		switch s := s.(type) {
+		case *ImportStmt:
+			out = append(out, s.URL+" as "+s.Alias)
+		case *CImportStmt:
+			out = append(out, "C "+s.Library+" as "+s.Alias)
+		}
+	}
+	return out, nil
+}
+
+// colorful reports whether diagnostics go to a terminal that wants color.
+func colorful() bool {
+	info, err := os.Stderr.Stat()
+	return err == nil && info.Mode()&os.ModeCharDevice != 0 && os.Getenv("NO_COLOR") == "" && os.Getenv("TERM") != "dumb"
 }
 
 type coreWriter func(path string, arch Arch, code []byte, entry int, cimps []cImport) error
@@ -278,7 +272,7 @@ func parseQuietly(src, path string) (prog *Program) {
 	}()
 	p := NewParserWithFilename(src, path)
 	p.quiet = true
-	return p.ParseProgramRaw()
+	return p.ParseProgram()
 }
 
 // loadModules replaces each Tim import with the module's definitions:
@@ -310,7 +304,7 @@ func loadModules(prog *Program, path string, p Platform) error {
 			if err != nil {
 				return err
 			}
-			mod := NewParserWithFilename(string(text), f).ParseProgramRaw()
+			mod := NewParserWithFilename(string(text), f).ParseProgram()
 			prefix := imp.Alias + "."
 			if imp.Alias == "*" || mod.ExportMode == "*" {
 				prefix = ""

@@ -162,7 +162,7 @@ func compileTestCode(t *testing.T, code string) string {
 		OS:   osType,
 		Arch: archType,
 	}
-	if err := CompileTimWithOptions(srcFile, exePath, platform, 0, false, false); err != nil {
+	if err := CompileTim(srcFile, exePath, platform); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
 	}
 

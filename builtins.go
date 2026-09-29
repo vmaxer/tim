@@ -89,24 +89,28 @@ var builtins = map[string]builtin{
 var memKinds = map[string]uint8{"i8": cI8, "u8": cU8, "i16": cI16, "u16": cU16, "i32": cI32, "u32": cU32,
 	"i64": cI64, "u64": cU64, "f32": cF32, "f64": cF64, "ptr": cPtr}
 
-// legacyBuiltins are low-level functions only the legacy code generators
-// provide (raw memory, arenas, atomics, processes); programs that use them
-// are compiled by the legacy backends.
-var legacyBuiltins = map[string]bool{
-	"__tim_map_update": true, "and": true, "append": true, "approx": true,
-	"arena_alloc": true, "arena_create": true, "arena_destroy": true, "arena_reset": true,
-	"atomic_add": true, "atomic_cas": true, "atomic_load": true, "atomic_store": true, "call": true,
-	"calloc": true, "chan": true, "close": true,
-	"dlclose": true, "dlopen": true, "dlsym": true, "exitln": true, "float32": true,
-	"float64": true, "fork": true, "free": true, "getpid": true, "head": true, "int16": true,
-	"int32": true, "int64": true, "int8": true, "is_finite": true, "is_inf": true, "is_nan": true,
-	"is_neg_inf": true, "is_pos_inf": true, "load": true, "malloc": true, "mmap": true,
-	"munmap": true, "or": true, "peek32": true, "peek8": true, "printa": true,
-	"proc_exit": true, "realloc": true, "result_value": true, "safe_divide": true,
-	"safe_divide_result": true, "safe_ln": true, "safe_ln_result": true, "safe_sqrt": true,
-	"safe_sqrt_result": true, "sizeof_f32": true, "sizeof_f64": true, "sizeof_i16": true,
-	"sizeof_i32": true, "sizeof_i64": true, "sizeof_i8": true, "sizeof_ptr": true, "sizeof_u16": true,
-	"sizeof_u32": true, "sizeof_u64": true, "sizeof_u8": true, "store": true, "syscall": true,
-	"tail": true, "uint16": true, "uint32": true, "uint64": true, "uint8": true, "vadd": true,
-	"vdiv": true, "vdot": true, "vmul": true, "vsub": true, "waitpid": true,
+// removedBuiltins are Tim 1 builtins, with what to use instead.
+var removedBuiltins = map[string]string{
+	"malloc": "use alloc(n), or c.malloc(n)", "calloc": "use alloc(n)", "realloc": "use c.realloc(p, n)",
+	"free":        "memory is garbage collected; use c.free for c.malloc memory",
+	"arena_alloc": "use an arena { } block", "arena_create": "use an arena { } block",
+	"arena_destroy": "use an arena { } block", "arena_reset": "use an arena { } block",
+	"peek8": "use read_u8(p, offset)", "peek32": "use read_u32(p, offset)",
+	"load": "use read_u64(p, offset) and the other read_ functions", "store": "use write_u64(p, offset, v) and the other write_ functions",
+	"int8": "use x as int8", "int16": "use x as int16", "int32": "use x as int32", "int64": "use x as int64",
+	"uint8": "use x as uint8", "uint16": "use x as uint16", "uint32": "use x as uint32", "uint64": "use x as uint64",
+	"float32": "use x as float", "float64": "use float(x)",
+	"head": "use xs[0]", "tail": "use xs[1:]", "append": "use push(xs, x) or xs + [x]",
+	"and": "use the and operator", "or": "use the or operator", "exitln": "use exitf",
+	"is_nan": "x != x is true only for NaN", "is_inf": "compare with 1 / 0.0", "is_finite": "compare with 1 / 0.0",
+	"safe_divide": "division by zero is already an error value: a / b or! 0", "safe_sqrt": "use sqrt(x) or! 0", "safe_ln": "use log(x) or! 0",
+	"getpid": "call C: c.getpid()", "fork": "call C: c.fork()", "waitpid": "call C: c.waitpid(pid, 0, 0)",
+	"mmap": "call C: c.mmap(...)", "munmap": "call C: c.munmap(p, n)", "syscall": "call C functions through import",
+	"dlopen": "import the library: import foo as f", "dlsym": "import the library: import foo as f",
+	"atomic_add": "Tim 2 programs are single-threaded", "atomic_cas": "Tim 2 programs are single-threaded",
+	"atomic_load": "Tim 2 programs are single-threaded", "atomic_store": "Tim 2 programs are single-threaded",
+	"chan":      "Tim 2 programs are single-threaded",
+	"sizeof_i8": "it is 1", "sizeof_u8": "it is 1", "sizeof_i16": "it is 2", "sizeof_u16": "it is 2",
+	"sizeof_i32": "it is 4", "sizeof_u32": "it is 4", "sizeof_f32": "it is 4",
+	"sizeof_i64": "it is 8", "sizeof_u64": "it is 8", "sizeof_f64": "it is 8", "sizeof_ptr": "it is 8",
 }

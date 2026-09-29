@@ -1,4 +1,3 @@
-// Completion: 100% - Type system complete with C FFI integration
 package main
 
 // TimType represents a type in the Tim type system
@@ -66,47 +65,3 @@ func (t *TimType) String() string {
 		return "unknown"
 	}
 }
-
-// IsNative returns true if this is a native Tim type
-func (t *TimType) IsNative() bool {
-	switch t.Kind {
-	case TypeNumber, TypeString, TypeList, TypeMap, TypeBoolean:
-		return true
-	default:
-		return false
-	}
-}
-
-// IsForeign returns true if this is a C foreign type
-func (t *TimType) IsForeign() bool {
-	return !t.IsNative() && t.Kind != TypeUnknown
-}
-
-// IsPointer returns true if this represents a pointer type
-func (t *TimType) IsPointer() bool {
-	return t.Kind == TypeCString || t.Kind == TypeCPointer
-}
-
-// NeedsConversionToC returns true if this type needs conversion when passing to C
-func (t *TimType) NeedsConversionToC() bool {
-	// Tim strings need conversion to C strings
-	return t.Kind == TypeString
-}
-
-// NeedsConversionFromC returns true if this type needs conversion when receiving from C
-func (t *TimType) NeedsConversionFromC() bool {
-	// Currently no conversions needed from C to Tim
-	// (C strings stay as cstrings until explicitly converted)
-	return false
-}
-
-// Native type constructors
-var (
-	TypeNumberValue  = &TimType{Kind: TypeNumber}
-	TypeStringValue  = &TimType{Kind: TypeString}
-	TypeListValue    = &TimType{Kind: TypeList}
-	TypeMapValue     = &TimType{Kind: TypeMap}
-	TypeBooleanValue = &TimType{Kind: TypeBoolean}
-	TypeCStringValue = &TimType{Kind: TypeCString, CType: "char*"}
-	TypeUnknownValue = &TimType{Kind: TypeUnknown}
-)

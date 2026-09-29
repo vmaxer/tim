@@ -1,4 +1,3 @@
-// Completion: 100% - FMA optimization tests
 package main
 
 import (

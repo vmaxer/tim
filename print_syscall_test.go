@@ -334,7 +334,7 @@ func compileTestBinary(t *testing.T, code string) string {
 		OS:   osType,
 		Arch: archType,
 	}
-	if err := CompileTimWithOptions(srcFile, binPath, platform, 0, false, false); err != nil {
+	if err := CompileTim(srcFile, binPath, platform); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
 	}
 

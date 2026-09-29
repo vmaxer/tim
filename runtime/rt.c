@@ -72,7 +72,27 @@ struct OS {
 // first word of every object, which finds an object from an interior pointer.
 typedef struct {
 	u64 *start, *top, *end, *bits;
+	u64 level; // 0: the heap, 1..MAX_DEPTH: an arena region, POOL: an idle region chunk
 } Chunk;
+
+// Arenas. Inside arena { }, objects are bumped into the chunks of a region
+// whose level is the arena's depth, recorded in bits 4-6 of each header. A
+// store of a value into an object older than the region records the object
+// (the write barrier), so leaving the arena traces only the stack, the
+// globals, the recorded objects and the arena's result to find the region's
+// survivors. Chunks without survivors return to a pool at once; the others
+// are promoted to the enclosing arena, or to the heap.
+#define MAX_DEPTH 7
+#define POOL 8
+#define REGION_WORDS (256ull << 10)
+#define LEVEL(h) ((h) >> 4 & 7)
+#define KIND(h) ((h) & 15)
+
+typedef struct {
+	Chunk *cur;
+	u64 words, limit; // words bumped since the last collection of the region
+	u64 rem0;         // where the region's recorded objects start
+} Region;
 
 #define MAX_CHUNKS 1024
 #define CHUNK_WORDS (8ull << 20)
@@ -81,6 +101,11 @@ typedef struct {
 
 typedef struct {
 	const OS *os;
+	u64 depth; // the arena depth; generated code reads it at offset 8
+	u64 overflow, collecting;
+	Region regions[MAX_DEPTH + 1];
+	u64 *rem, nrem, caprem;
+	Chunk *last;
 	Chunk chunks[MAX_CHUNKS];
 	u64 nchunks;
 	Chunk *cur;              // the chunk being filled
@@ -184,10 +209,13 @@ static void clear_start(Chunk *c, u64 *p) {
 static Chunk *chunk_of(R *r, u64 a) {
 	if (a < r->lo || a >= r->hi)
 		return 0;
+	Chunk *c = r->last;
+	if (c && a >= (u64)c->start && a < (u64)c->top)
+		return c;
 	for (u64 i = 0; i < r->nchunks; i++) {
-		Chunk *c = &r->chunks[i];
+		c = &r->chunks[i];
 		if (a >= (u64)c->start && a < (u64)c->top)
-			return c;
+			return r->last = c;
 	}
 	return 0;
 }
@@ -203,8 +231,8 @@ static void free_block(R *r, u64 *p, u64 words) {
 	}
 }
 
-static Chunk *new_chunk(R *r, u64 words) {
-	u64 n = words > CHUNK_WORDS ? (words + 511) & ~511ull : CHUNK_WORDS;
+static Chunk *new_chunk(R *r, u64 words, u64 min) {
+	u64 n = words > min ? (words + 511) & ~511ull : min;
 	if (r->nchunks == MAX_CHUNKS)
 		fatal(r, "out of memory");
 	u64 *p = r->os->pages(r->os, n * 8), *bits = r->os->pages(r->os, n / 8 + 8);
@@ -214,6 +242,7 @@ static Chunk *new_chunk(R *r, u64 words) {
 	c->start = c->top = p;
 	c->end = p + n;
 	c->bits = bits;
+	c->level = 0;
 	if (!r->lo || (u64)p < r->lo)
 		r->lo = (u64)p;
 	if ((u64)c->end > r->hi)
@@ -238,9 +267,14 @@ static u64 *take_big(R *r, u64 words) {
 	return 0;
 }
 
+static u64 *region_alloc(R *r, int kind, u64 words);
+static Chunk *pool_chunk(R *r, u64 words, u64 level);
+
 static u64 *alloc_obj(R *r, int kind, u64 words) {
 	if (words < 2)
 		words = 2;
+	if (r->depth)
+		return region_alloc(r, kind, words);
 	if (r->allocated > r->threshold)
 		gc(r);
 	u64 *p;
@@ -252,7 +286,7 @@ static u64 *alloc_obj(R *r, int kind, u64 words) {
 		r->cur->top += words;
 		set_start(r->cur, p);
 	} else if (!(p = take_big(r, words))) {
-		Chunk *c = new_chunk(r, words);
+		Chunk *c = pool_chunk(r, words, 0);
 		if (words <= CHUNK_WORDS / 4) {
 			Chunk *old = r->cur;
 			if (old && old->end - old->top >= 2) {
@@ -271,6 +305,31 @@ static u64 *alloc_obj(R *r, int kind, u64 words) {
 	r->allocated += words;
 	p[0] = (u64)kind | words << 8;
 	return p;
+}
+
+static void grow_words(R *r, u64 **a, u64 n, u64 *cap) {
+	if (n < *cap)
+		return;
+	u64 c = *cap ? *cap * 2 : 4096;
+	u64 *m = r->os->pages(r->os, c * 8);
+	if (!m)
+		fatal(r, "out of memory");
+	memcpy(m, *a, n * 8);
+	*a = m;
+	*cap = c;
+}
+
+static void remember(R *r, u64 *o) {
+	if (r->nrem > r->regions[r->depth].rem0 && r->rem[r->nrem - 1] == (u64)o)
+		return;
+	grow_words(r, &r->rem, r->nrem, &r->caprem);
+	r->rem[r->nrem++] = (u64)o;
+}
+
+// wb is the write barrier, after a store into the object o.
+static inline void wb(R *r, u64 *o) {
+	if (r->depth && LEVEL(o[0]) < r->depth)
+		remember(r, o);
 }
 
 // raw returns zeroed scratch memory of n bytes.
@@ -1524,11 +1583,13 @@ static void list_reserve(R *r, u64 v, u64 need) {
 	memcpy(a + 1, list_items(v), p[1] * 8);
 	p[2] = cap;
 	p[3] = (u64)a;
+	wb(r, p);
 }
 
 static void list_push(R *r, u64 v, u64 x) {
 	list_reserve(r, v, list_len(v) + 1);
 	list_items(v)[obj(v)[1]++] = x;
+	wb(r, (u64 *)obj(v)[3]);
 }
 
 static u64 list_of(R *r, const u64 *xs, u64 n) {
@@ -1611,12 +1672,14 @@ static void map_grow(R *r, u64 m) {
 		if (oe[2 * i] != TOMB)
 			map_set(r, nm, oe[2 * i], oe[2 * i + 1]);
 	memcpy(p + 1, obj(nm) + 1, 6 * 8);
+	wb(r, p);
 }
 
 static void map_set(R *r, u64 m, u64 k, u64 v) {
 	i64 at = map_find(r, m, k);
 	if (at >= 0) {
 		map_entries(m)[2 * at + 1] = v;
+		wb(r, (u64 *)obj(m)[4]);
 		return;
 	}
 	u64 *p = obj(m);
@@ -1627,6 +1690,7 @@ static void map_set(R *r, u64 m, u64 k, u64 v) {
 	u64 e = p[2]++;
 	map_entries(m)[2 * e] = k;
 	map_entries(m)[2 * e + 1] = v;
+	wb(r, (u64 *)p[4]);
 	p[1]++;
 	u32 *idx = (u32 *)p[5];
 	u64 i = hash_val(k) & p[6];
@@ -2074,6 +2138,7 @@ u64 rt_setindex(R *r, u64 v, u64 key, u64 x) {
 		if (!index_of(r, key, list_len(v), &i))
 			return ERR_IDX;
 		list_items(v)[i] = x;
+		wb(r, (u64 *)obj(v)[3]);
 		return x;
 	case TAG_MAP:
 		map_set(r, v, key, x);
@@ -3100,7 +3165,7 @@ static void mark_addr(R *r, u64 a) {
 	if (!p)
 		return;
 	u64 h = p[0];
-	if ((h & MARK) || (h & 0x7F) == K_FREE || a >= (u64)(p + (h >> 8)))
+	if ((h & MARK) || KIND(h) == K_FREE || a >= (u64)(p + (h >> 8)) || (r->collecting && c->level != r->collecting))
 		return;
 	p[0] = h | MARK;
 	push_mark(r, p);
@@ -3124,7 +3189,7 @@ static void mark_word(R *r, u64 w) {
 
 static void trace(R *r, u64 *p) {
 	u64 w = p[0] >> 8;
-	switch (p[0] & 0x7F) {
+	switch (KIND(p[0])) {
 	case K_LIST:
 		mark_addr(r, p[3]);
 		break;
@@ -3156,49 +3221,242 @@ __attribute__((noinline)) static void scan_stack(R *r) {
 		mark_word(r, *p);
 }
 
+static void to_pool(Chunk *c) {
+	memset(c->bits, 0, ((u64)(c->top - c->start) / 64 + 1) * 8);
+	c->top = c->start;
+	c->level = POOL;
+}
+
+// dead turns a run of dead objects into a free block: on the heap's free
+// lists, or, in a region, space that stays unused until the region is left.
+static void dead(R *r, Chunk *c, u64 *run, u64 words) {
+	if (c->level)
+		run[0] = K_FREE | c->level << 4 | words << 8;
+	else
+		free_block(r, run, words);
+}
+
+// sweep_chunk frees the unmarked objects of c, moves the marked ones to
+// level, and returns the words that stay live.
+static u64 sweep_chunk(R *r, Chunk *c, u64 level) {
+	u64 live = 0, *run = 0;
+	for (u64 *p = c->start; p < c->top;) {
+		u64 h = p[0], w = h >> 8;
+		if (h & MARK) {
+			p[0] = (h & ~(MARK | 0x70)) | level << 4;
+			live += w;
+			if (run) {
+				dead(r, c, run, (u64)(p - run));
+				run = 0;
+			}
+		} else if (!run) {
+			run = p;
+		} else {
+			clear_start(c, p);
+		}
+		p += w;
+	}
+	if (run && (c == r->cur || (c->level && c == r->regions[c->level].cur))) {
+		clear_start(c, run);
+		c->top = run;
+	} else if (run) {
+		dead(r, c, run, (u64)(c->top - run));
+	}
+	return live;
+}
+
 static void sweep(R *r) {
 	u64 live = 0;
 	memset(r->small, 0, sizeof r->small);
 	r->big = 0;
 	for (u64 i = 0; i < r->nchunks; i++) {
 		Chunk *c = &r->chunks[i];
-		u64 *run = 0;
-		for (u64 *p = c->start; p < c->top;) {
-			u64 h = p[0], w = h >> 8;
-			if (h & MARK) {
-				p[0] = h & ~MARK;
-				live += w;
-				if (run) {
-					free_block(r, run, (u64)(p - run));
-					run = 0;
-				}
-			} else if (!run) {
-				run = p;
-			} else {
-				clear_start(c, p);
+		if (c->level == 0) {
+			u64 *p = c->start;
+			while (p < c->top && !(p[0] & MARK))
+				p += p[0] >> 8;
+			if (p == c->top && c != r->cur) {
+				to_pool(c);
+				continue;
 			}
-			p += w;
-		}
-		if (run && c == r->cur) {
-			clear_start(c, run);
-			c->top = run;
-		} else if (run) {
-			free_block(r, run, (u64)(c->top - run));
+			live += sweep_chunk(r, c, 0);
+		} else if (c->level != POOL) {
+			// an arena's objects stay until the arena is left
+			for (u64 *p = c->start; p < c->top; p += p[0] >> 8)
+				p[0] &= ~MARK;
 		}
 	}
 	r->allocated = 0;
 	r->threshold = live > MIN_GC_WORDS ? live : MIN_GC_WORDS;
 }
 
-static void gc(R *r) {
-	__builtin_unwind_init(); // callee-saved registers may hold pointers: spill them
+static void mark_roots(R *r) {
 	scan_stack(r);
 	mark_addr(r, (u64)r->globals);
 	for (u64 i = 0; i < r->nglobals; i++)
 		mark_val(r, r->globals[i]);
+}
+
+static void gc(R *r) {
+	__builtin_unwind_init(); // callee-saved registers may hold pointers: spill them
+	mark_roots(r);
 	while (r->nmarks)
 		trace(r, (u64 *)r->marks[--r->nmarks]);
+	// forget recorded objects that died
+	u64 n = 0;
+	for (u64 i = 0; i < r->nrem; i++) {
+		u64 *o = (u64 *)r->rem[i];
+		if (o[0] & MARK || LEVEL(o[0]))
+			r->rem[n++] = (u64)o;
+	}
+	for (u64 d = 1; d <= MAX_DEPTH; d++)
+		if (r->regions[d].rem0 > n)
+			r->regions[d].rem0 = n;
+	r->nrem = n;
 	sweep(r);
+}
+
+// Arenas
+
+// wb_addr is the write barrier after a store to an address, which may be
+// inside a heap object.
+static void wb_addr(R *r, u64 a) {
+	if (!r->depth)
+		return;
+	Chunk *c = chunk_of(r, a);
+	u64 *p = c ? obj_start(c, (u64 *)a) : 0;
+	if (p)
+		wb(r, p);
+}
+
+// rt_wb is the write barrier of generated code, after a store into a cell.
+u64 rt_wb(R *r, u64 v) {
+	wb(r, obj(v));
+	return 0;
+}
+
+static Chunk *pool_chunk(R *r, u64 words, u64 level) {
+	Chunk *c = 0;
+	for (u64 i = 0; i < r->nchunks; i++) {
+		Chunk *k = &r->chunks[i];
+		if (k->level == POOL && (u64)(k->end - k->start) >= words && (!c || k->end - k->start < c->end - c->start))
+			c = k;
+	}
+	if (!c)
+		c = new_chunk(r, words, level ? REGION_WORDS : CHUNK_WORDS);
+	c->top = c->start;
+	c->level = level;
+	return c;
+}
+
+static u64 region_collect(R *r, u64 d, u64 target, u64 result);
+
+static u64 *region_alloc(R *r, int kind, u64 words) {
+	u64 d = r->depth;
+	Region *g = &r->regions[d];
+	Chunk *c = g->cur;
+	if (!c || c->top + words > c->end) {
+		if (g->words > g->limit) {
+			u64 live = region_collect(r, d, d, 0);
+			g->limit = live * 2 > MIN_GC_WORDS ? live * 2 : MIN_GC_WORDS;
+			g->words = 0;
+		}
+		c = pool_chunk(r, words, d);
+		if (words <= REGION_WORDS / 4 || !g->cur)
+			g->cur = c;
+	}
+	u64 *p = c->top;
+	c->top += words;
+	set_start(c, p);
+	g->words += words;
+	p[0] = (u64)kind | d << 4 | words << 8;
+	return p;
+}
+
+// region_collect finds the survivors of region d: from the roots, the
+// objects recorded by the write barrier and result. It moves them to target
+// and returns the chunks without survivors to the pool.
+static u64 region_collect(R *r, u64 d, u64 target, u64 result) {
+	__builtin_unwind_init();
+	Region *g = &r->regions[d];
+	r->collecting = d;
+	mark_roots(r);
+	mark_val(r, result);
+	for (u64 i = g->rem0; i < r->nrem; i++)
+		trace(r, (u64 *)r->rem[i]);
+	while (r->nmarks)
+		trace(r, (u64 *)r->marks[--r->nmarks]);
+	r->collecting = 0;
+	if (target < d)
+		g->cur = 0;
+	u64 total = 0;
+	for (u64 i = 0; i < r->nchunks; i++) {
+		Chunk *c = &r->chunks[i];
+		if (c->level != d)
+			continue;
+		u64 *p = c->start;
+		while (p < c->top && !(p[0] & MARK))
+			p += p[0] >> 8;
+		if (p == c->top) {
+			if (c == g->cur)
+				g->cur = 0;
+			to_pool(c);
+			continue;
+		}
+		c->level = target;
+		u64 live = sweep_chunk(r, c, target);
+		total += live;
+		if (!target)
+			r->allocated += live;
+	}
+	if (target < d) {
+		// objects older than the enclosing arena may point at the promoted ones
+		u64 n = g->rem0;
+		for (u64 i = g->rem0; i < r->nrem && target; i++)
+			if (LEVEL(((u64 *)r->rem[i])[0]) < target)
+				r->rem[n++] = r->rem[i];
+		r->nrem = n;
+	}
+	return total;
+}
+
+u64 rt_arena_enter(R *r) {
+	if (r->depth == MAX_DEPTH) {
+		r->overflow++;
+		return 0;
+	}
+	Region *g = &r->regions[++r->depth];
+	g->cur = 0;
+	g->words = 0;
+	g->limit = MIN_GC_WORDS;
+	g->rem0 = r->nrem;
+	return 0;
+}
+
+// clear_stack zeroes the stack below the caller, so the collector's frames,
+// which reuse it, do not hold stale pointers that keep garbage alive.
+__attribute__((noinline)) static void clear_stack(void) {
+	volatile u64 pad[1024];
+	for (u64 i = 0; i < 1024; i++)
+		pad[i] = 0;
+}
+
+// rt_arena_exit leaves the innermost arena, whose value is v.
+u64 rt_arena_exit(R *r, u64 v) {
+	if (r->overflow) {
+		r->overflow--;
+		return v;
+	}
+	clear_stack();
+	u64 d = r->depth;
+	region_collect(r, d, d - 1, v);
+	r->depth = d - 1;
+	if (!r->depth && r->allocated > r->threshold) {
+		u64 keep[1] = {v}; // on the stack for the collector
+		gc(r);
+		v = ((volatile u64 *)keep)[0];
+	}
+	return v;
 }
 
 u64 rt_gc(R *r) {
@@ -3457,6 +3715,7 @@ u64 rt_mem_write(R *r, u64 p, u64 off, u64 kind, u64 v) {
 	case C_I32: case C_U32: case C_F32: __builtin_memcpy(a, &x, 4); break;
 	default: __builtin_memcpy(a, &x, 8);
 	}
+	wb_addr(r, (u64)a);
 	return v;
 }
 

@@ -51,9 +51,9 @@ func TestCorePrograms(t *testing.T) {
 				if tg.p.OS == OSWindows {
 					exe += ".exe"
 				}
-				handled, err := tryCore(code, src, exe, tg.p)
-				if !handled || err != nil {
-					t.Fatalf("core did not compile it: handled=%v err=%v", handled, err)
+				err = compileSource(code, src, exe, tg.p)
+				if err != nil {
+					t.Fatal(err)
 				}
 				var cmd *exec.Cmd
 				if tg.qemu != "" {

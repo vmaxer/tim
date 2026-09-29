@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"path/filepath"
-	"sort"
 	"strings"
 )
 
@@ -87,7 +86,6 @@ type Checked struct {
 	FieldSets   map[*FieldUpdateStmt]*CStructField
 	Elems       map[Expression]*CStructDecl // lists whose elements are cstructs
 	Rewrites    map[Expression]Expression   // operators on cstructs, as method calls
-	Unsupported []string                    // features the core code generator does not handle yet
 }
 
 type scope struct {
@@ -104,7 +102,6 @@ type checker struct {
 	fn     *Fun
 	loops  int
 	cimps  map[string]*cLib // C libraries by namespace
-	unsupp map[string]bool
 }
 
 // CheckError lists everything wrong with a program.
@@ -133,7 +130,6 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 		errs:   NewErrorCollector(20),
 		fn:     top,
 		cimps:  map[string]*cLib{"c": libcLib, "C": libcLib},
-		unsupp: map[string]bool{},
 	}
 	k.errs.SetSourceCode(src)
 	k.sc = &scope{fn: top, names: map[string]*Var{}}
@@ -141,13 +137,7 @@ func Check(prog *Program, file, src string) (*Checked, error) {
 	for _, s := range prog.Statements {
 		k.stmt(s)
 	}
-	for f := range k.unsupp {
-		k.c.Unsupported = append(k.c.Unsupported, f)
-	}
-	sort.Strings(k.c.Unsupported)
-	// A program that uses legacy features is checked by the legacy backends,
-	// since errors here may only reflect what this checker cannot model.
-	if k.errs.HasErrors() && len(k.c.Unsupported) == 0 {
+	if k.errs.HasErrors() {
 		ce := &CheckError{Plain: strings.TrimSpace(k.errs.Report(false)), Color: k.errs.Report(true), OnlyUndefined: true}
 		for _, e := range k.errs.errors {
 			if !strings.HasPrefix(e.Message, "undefined ") {
@@ -165,8 +155,6 @@ func (k *checker) errorf(pos Pos, format string, args ...any) {
 	k.errs.AddError(CompilerError{Level: LevelError, Category: CategorySemantic, Message: fmt.Sprintf(format, args...),
 		Location: SourceLocation{File: k.file, Line: pos.Line, Column: pos.Col, Length: 1}})
 }
-
-func (k *checker) unsupported(feature string) { k.unsupp[feature] = true }
 
 // predeclare makes every top-level binding visible to all functions, so
 // top-level functions and globals may be used before they are defined.
@@ -413,11 +401,9 @@ func (k *checker) stmt(s Statement) {
 		k.block(s.Body)
 	case *CStructDecl:
 	case *CImportStmt:
-	case *ImportStmt:
-		k.unsupported("Tim imports")
 	case *ExportStmt:
 	default:
-		k.unsupported(fmt.Sprintf("%T", s))
+		panic(fmt.Sprintf("check: unexpected %T", s))
 	}
 }
 
@@ -810,7 +796,7 @@ func (k *checker) infer(e Expression) Type {
 			k.c.Structs[e] = st
 			return TPtr
 		}
-		k.unsupported("C casts")
+		k.errorf(e.Pos, "cannot cast to %s: not a type or cstruct", e.Type)
 		return TAny
 	case *IndexExpr:
 		t := k.expr(e.List)
@@ -892,12 +878,6 @@ func (k *checker) infer(e Expression) Type {
 			}
 		}
 		return ts[0]
-	case *JumpExpr:
-		k.expr(e.Value)
-		return TAny
-	case *UnsafeExpr:
-		k.unsupported("unsafe")
-		return TAny
 	case *ArenaExpr:
 		k.block(e.Body)
 		return TAny
@@ -924,21 +904,8 @@ func (k *checker) infer(e Expression) Type {
 		}
 		k.c.CConsts[e] = v
 		return TNum
-	case *VectorExpr:
-		k.unsupported("SIMD vectors")
-		k.exprs(e.Components)
-		return TAny
-	case *LengthExpr:
-		k.expr(e.Operand)
-		return TNum
-	case *FMAExpr:
-		k.expr(e.A)
-		k.expr(e.B)
-		k.expr(e.C)
-		return TNum
 	}
-	k.unsupported(fmt.Sprintf("%T", e))
-	return TAny
+	panic(fmt.Sprintf("check: unexpected %T", e))
 }
 
 // structOp rewrites an arithmetic operator on cstructs into a call of the
@@ -1086,8 +1053,8 @@ func (k *checker) call(e *CallExpr) Type {
 	}
 	b, ok := builtins[name]
 	if !ok {
-		if legacyBuiltins[name] || builtinFunctionNames[name] {
-			k.unsupported("legacy builtin " + name)
+		if hint, ok := removedBuiltins[name]; ok {
+			k.errorf(e.Pos, "%s was removed in Tim 2: %s", name, hint)
 		} else {
 			k.undefined(e.Pos, "function", name)
 		}

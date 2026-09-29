@@ -877,7 +877,7 @@ func TestPlainValueMainExitCode(t *testing.T) {
 	}
 	osType, _ := ParseOS(runtime.GOOS)
 	archType, _ := ParseArch(runtime.GOARCH)
-	if err := CompileTimWithOptions(srcFile, exePath, Platform{OS: osType, Arch: archType}, 0, false, false); err != nil {
+	if err := CompileTim(srcFile, exePath, Platform{OS: osType, Arch: archType}); err != nil {
 		t.Fatalf("plain-value main should compile, got: %v", err)
 	}
 
@@ -908,7 +908,7 @@ func compileErr(t *testing.T, code string) error {
 	}
 	osType, _ := ParseOS(runtime.GOOS)
 	archType, _ := ParseArch(runtime.GOARCH)
-	return CompileTimWithOptions(src, filepath.Join(tmpDir, "e"), Platform{OS: osType, Arch: archType}, 0, false, false)
+	return CompileTim(src, filepath.Join(tmpDir, "e"), Platform{OS: osType, Arch: archType})
 }
 
 // TestDiagnosticsNotNoisy guards two user-facing diagnostic clean-ups:

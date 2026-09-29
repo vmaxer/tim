@@ -26,7 +26,7 @@ compile_and_compress() {
   echo "Compiling $name.$platform..."
 
   [ -n "$goarm" ] && GOARM="$goarm" || unset GOARM
-  GOOS="$goos" GOARCH="$goarch" go build -mod=vendor -trimpath -ldflags="-s -w" -a -o "$name.$platform" || {
+  GOOS="$goos" GOARCH="$goarch" go build -trimpath -ldflags="-s -w" -a -o "$name.$platform" || {
     echo "Error: failed to compile for $platform"
     echo "Platform string: $p"
     echo "Environment variables: GOOS=$goos GOARCH=$goarch GOARM=$goarm"

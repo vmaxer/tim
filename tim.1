@@ -1,162 +1,105 @@
-.TH TIM 1 "2026-06-19" "tim 1.0.3" "User Commands"
+.TH TIM 1 "2026-09-29" "tim 2.0.0" "User Commands"
 .SH NAME
-tim \- compile Tim source to native executables
+tim \- compile and run Tim programs
 .SH SYNOPSIS
 .B tim
-.RI [ options ]
-.RI [ file .tim ...]
+.RB [ build ]
+.RI [ flags ]
+.IR file .tim | dir
 .br
-.B tim
-.BR -c " " code
-.RI [ options ]
+.B tim run
+.RI [ flags ]
+.IR file .tim
+.RI [ args ...]
+.br
+.B tim test
+.RI [ flags ]
+.RI [ dir ]
+.br
+.B tim \-c
+.I code
+.RI [ args ...]
 .SH DESCRIPTION
 .B tim
-is the reference compiler for the Tim programming language. It reads Tim
-source files and produces a native executable for the selected target
-platform without relying on external toolchains such as GCC or LLVM. When no
-input files or inline code are provided the compiler emits a dynamically
-linked "Hello, world" binary in the system temporary directory.
-.PP
-Arguments that do not end in
-.BR .tim
-are ignored during compilation. The first source file found is compiled and
-subsequent files are not processed.
-.SH OPTIONS
-The options use Go's flag syntax, so either
-.BR -flag=value
-or
-.B "-flag value"
-forms are accepted.
-.TP
-.BI -arch " " arch
-Set the target CPU architecture. Supported values are
-.BR amd64 ,
-.BR arm64
-and
-.BR riscv64 .
-Defaults to the host architecture.
-.TP
-.BI -os " " os
-Select the target operating system. The compiler currently generates
-executables for
-.BR linux
-and
-.BR darwin .
-Other values are rejected. Defaults to the host operating system.
-.TP
-.BI -target " " arch-os
-Specify the target platform in a single flag, for example
-.BR amd64-linux ,
-.BR arm64-darwin
-or
-.BR riscv64-linux .
-This overrides
-.BR -arch
-and
-.BR -os .
-
-.TP
-.BI -o " " file
-.TP
-.BI -output " " file
-Write the generated executable to
-.I file
-instead of the default. When no output file is given,
-.B tim
-writes into the current directory using the input filename without the
-.BR .tim
-suffix. For inline code the default output path is printed and lives in the
-system temporary directory.
-.TP
-.BI -c " " code
-Compile the string
-.I code
-as if it were the contents of a temporary
+compiles Tim source to a native executable for Linux (amd64, arm64, riscv64),
+Windows (amd64, arm64) or macOS (arm64), with no assembler or linker.
+Given a directory, it compiles the directory's only non-test
 .B .tim
-file. Unless
-.BR -o
-or
-.BR -output
-is supplied the resulting executable is written to the system temporary
-directory and its filename is printed on standard output.
+file, or its
+.BR main.tim .
+Definitions a program uses but does not have are taken from the other
+.B .tim
+files of its directory.
+.PP
+.B run
+compiles to a temporary file and runs it with
+.IR args ,
+exiting with the program's exit code.
+.B test
+compiles each
+.BI * _test.tim
+and
+.BI test_ *.tim
+file with a runner that calls its functions whose names start with
+.BR test ;
+a test fails if it returns an error value, exits with a nonzero code or stops
+at a runtime error.
+A file whose first line starts with
+.B #!
+runs as a script.
+.SH OPTIONS
 .TP
-.B -v
+.BI \-o " file"
+The executable. The default is the source name without
+.BR .tim ,
+with
+.B .exe
+for Windows. An
+.B .exe
+name selects Windows.
 .TP
-.B --verbose
-Enable verbose mode. Compilation progress, generated section sizes and
-dependency handling details are written to standard error.
+.BI \-\-target " arch-os"
+Cross-compile: amd64-linux, arm64-linux, riscv64-linux, amd64-windows,
+arm64-windows or arm64-darwin.
 .TP
-.B -u
+.BI \-\-arch " arch" ", " \-\-os " os"
+The target one part at a time.
 .TP
-.B --update-deps
-Update cached Git repositories used for imported Tim modules before
-compilation. Without this flag existing caches are reused as-is.
+.BI \-c " code"
+Compile and run
+.IR code .
 .TP
-.B -V
+.BR \-w ", " \-\-watch
+With
+.BR run :
+run again whenever a
+.B .tim
+file of the program's directory changes.
 .TP
-.B --version
-Print version information and exit.
+.B \-d
+List the program's imports instead of compiling it.
 .TP
-.B -h
-.TP
-.B --help
-Show a summary of the available options and exit.
-.SH OUTPUT
-On successful compilation and without verbose mode,
-.B tim
-prints the path of the generated executable to standard output whenever the
-output filename was not explicitly provided.
+.B \-v
+Verbose.
 .SH ENVIRONMENT
 .TP
 .B XDG_CACHE_HOME
-If set, the directory used to cache imported Git repositories. The cache is
-stored in
-.I $XDG_CACHE_HOME/tim
-.
+Imported Git repositories are cached in
+.IR $XDG_CACHE_HOME/tim ,
+or
+.I ~/.cache/tim
+when it is unset.
 .TP
-.B HOME
-When
-.B XDG_CACHE_HOME
-is unset, cached repositories are stored in
-.I $HOME/.cache/tim
-.
-.SH FILES
-.TP
-.I $XDG_CACHE_HOME/tim
-.TQ
-.I $HOME/.cache/tim
-Location of cached Git repositories used for module imports.
+.B NO_COLOR
+Print diagnostics without color.
 .SH EXAMPLES
-Compile a program for the current platform:
-.PP
 .nf
 .RS
-$ tim hello.tim
-$ ./hello
+$ tim hello.tim && ./hello
+$ tim run server.tim \-\-port 8080
+$ tim \-c 'println(2 ** 100)'
+$ tim \-\-target arm64\-darwin hello.tim
 .RE
 .fi
-.PP
-Compile inline code for macOS on arm64:
-.PP
-.nf
-.RS
-$ tim -target arm64-darwin -c 'println("hi");exit(0)'
-.RE
-.fi
-.PP
-Refresh all cached dependencies before compiling:
-.PP
-.nf
-.RS
-$ tim -u project.tim
-.RE
-.fi
-.SH EXIT STATUS
-.TP
-.B 0
-Compilation succeeded.
-.TP
-.B >0
-An error occurred.
 .SH SEE ALSO
-.BR go (1)
+GRAMMAR.md and STDLIB.md in the Tim sources.

@@ -1,31 +1,9 @@
-// Completion: 100% - Utility module complete
 package main
 
 import (
-	"hash/fnv"
 	"sort"
 	"strings"
 )
-
-// utils.go - Utility helper functions
-//
-// This file contains general-purpose utility functions used throughout
-// the compiler for string operations, hashing, and similarity matching.
-
-// hashStringKey hashes a string identifier to a uint64 for use as a map key.
-// Uses FNV-1a hash algorithm for deterministic, collision-resistant hashing.
-// Currently limited to 30-bit hash due to compiler integer literal limitations.
-// Sets bit 30 to distinguish symbolic keys from typical numeric indices.
-func hashStringKey(s string) uint64 {
-	h := fnv.New64a()
-	h.Write([]byte(s))
-	// Use FNV-1a 32-bit variant for now, mask to 30 bits (0x3FFFFFFF)
-	// Then set bit 30 (0x40000000) to distinguish symbolic keys
-	// This gives us range 0x40000000 to 0x7FFFFFFF (1073741824 to 2147483647)
-	h32 := fnv.New32a()
-	h32.Write([]byte(s))
-	return uint64((h32.Sum32() & 0x3FFFFFFF) | 0x40000000)
-}
 
 // levenshteinDistance calculates the edit distance between two strings.
 // Adjacent transpositions count as one edit (Damerau-Levenshtein), so the

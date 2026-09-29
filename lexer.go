@@ -158,21 +158,25 @@ type LexError struct {
 	Line, Column int
 }
 
-func (e *LexError) Error() string { return fmt.Sprintf("%d:%d: %s", e.Line, e.Column, e.Msg) }
-
 type lexer struct {
-	src          string
-	pos          int
-	line, col    int
-	toks         []Token
-	nest         []TokenType // open brackets
-	err          *LexError
-	nextStartsOp bool
+	src       string
+	pos       int
+	line, col int
+	toks      []Token
+	nest      []TokenType // open brackets
+	err       *LexError
 }
 
 // Lex splits Tim source into tokens, deciding which newlines end statements.
 func Lex(src string) ([]Token, *LexError) {
 	l := &lexer{src: src, line: 1, col: 1}
+	if strings.HasPrefix(src, "#!") {
+		// a script's interpreter line
+		l.pos = len(src)
+		if i := strings.IndexByte(src, '\n'); i >= 0 {
+			l.pos, l.line = i+1, 2
+		}
+	}
 	for l.err == nil {
 		l.skipSpace()
 		if l.pos >= len(l.src) {

@@ -1,8 +1,0 @@
-// Treat C memory as a cstruct and read and write its fields.
-cstruct Event { type: uint32, timestamp: uint64 }
-
-event := c.calloc(1, Event.size) as Event
-event.type <- 0x100
-event.timestamp <- 12345
-println(event.type, event.timestamp, read_u32(event, 0))
-c.free(event)

@@ -122,7 +122,7 @@ func writeCoreMachO(path string, arch Arch, code []byte, entry int, cimps []cImp
 	trieOff := fixupsOff + len(fixups)
 	strOff := trieOff + len(trie)
 	sigOff := alignUp(strOff+len(strtab), 16)
-	sigSize := int(codeSignatureBlobSize(filepath.Base(path), uint64(sigOff)))
+	sigSize := codeSignatureSize(filepath.Base(path), sigOff)
 	linkSize := sigOff + sigSize - linkOff
 
 	var cmds []byte
@@ -255,16 +255,49 @@ func writeCoreMachO(path string, arch Arch, code []byte, entry int, cimps []cImp
 	copy(img[fixupsOff:], fixups)
 	copy(img[trieOff:], trie)
 	copy(img[strOff:], strtab)
-	sig, err := generateCodeSignature(filepath.Base(path), img[:sigOff], 0, uint64(textSize))
-	if err != nil {
-		return err
-	}
-	if len(sig) > sigSize {
-		return fmt.Errorf("code signature larger than reserved")
-	}
+	sig := codeSignature(filepath.Base(path), img[:sigOff], uint64(textSize))
 	copy(img[sigOff:], sig)
 	if err := os.WriteFile(path, img, 0o755); err != nil {
 		return err
 	}
 	return os.Chmod(path, 0o755)
+}
+
+// An ad-hoc code signature: a SuperBlob holding one CodeDirectory with the
+// SHA-256 of each 4 KiB page, which arm64 macOS requires to run a binary.
+const (
+	csPage     = 4096
+	csDirSize  = 88 // CodeDirectory version 0x20400
+	csBlobHead = 12 + 8
+)
+
+func codeSignatureSize(ident string, codeLimit int) int {
+	pages := (codeLimit + csPage - 1) / csPage
+	return alignUp(csBlobHead+csDirSize+len(ident)+1+pages*sha256.Size, 16)
+}
+
+func codeSignature(ident string, code []byte, execLimit uint64) []byte {
+	be := binary.BigEndian
+	pages := (len(code) + csPage - 1) / csPage
+	dirLen := csDirSize + len(ident) + 1 + pages*sha256.Size
+	b := be.AppendUint32(nil, 0xfade0cc0) // embedded signature
+	b = be.AppendUint32(b, uint32(csBlobHead+dirLen))
+	b = be.AppendUint32(b, 1)
+	b = be.AppendUint32(b, 0) // the code directory slot
+	b = be.AppendUint32(b, csBlobHead)
+	for _, v := range []uint32{0xfade0c02, uint32(dirLen), 0x20400, 2 /* ad hoc */, uint32(csDirSize + len(ident) + 1),
+		csDirSize, 0, uint32(pages), uint32(len(code))} {
+		b = be.AppendUint32(b, v)
+	}
+	b = append(b, sha256.Size, 2 /* SHA-256 */, 0, 12 /* log2 page */)
+	b = append(b, make([]byte, 16)...)
+	for _, v := range []uint64{uint64(len(code)), 0, execLimit, 1 /* main binary */} {
+		b = be.AppendUint64(b, v)
+	}
+	b = append(append(b, ident...), 0)
+	for i := 0; i < len(code); i += csPage {
+		sum := sha256.Sum256(code[i:min(i+csPage, len(code))])
+		b = append(b, sum[:]...)
+	}
+	return b
 }

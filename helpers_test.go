@@ -1,0 +1,120 @@
+package main
+
+import (
+	"context"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
+	"strings"
+	"testing"
+	"time"
+)
+
+// containsMainFunction checks if code contains a Main function definition
+func containsMainFunction(code string) bool {
+	// Simple check for main = or main :=
+	return strings.Contains(code, "main =") || strings.Contains(code, "main :=")
+}
+
+// needsMainWrapper checks if code should be wrapped in main function
+func needsMainWrapper(code string) bool {
+	// Don't wrap if already has main
+	if containsMainFunction(code) {
+		return false
+	}
+	// Don't wrap if has imports (imports must be at module level)
+	if strings.Contains(code, "import ") {
+		return false
+	}
+	// Don't wrap if has module-level variable declarations before function definitions
+	// Pattern: "name := value" at start of line before "->"
+	lines := strings.Split(code, "\n")
+	hasModuleLevelVar := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, ":=") && !strings.Contains(trimmed, "->") {
+			hasModuleLevelVar = true
+		}
+		if hasModuleLevelVar && strings.Contains(trimmed, "->") {
+			// Has a variable declaration before a lambda definition
+			return false
+		}
+	}
+	return true
+}
+
+// runWithTimeout runs exePath with the given timeout and returns its combined
+// output. It replaces reliance on the external `timeout(1)` binary, which is
+// not present on macOS (it ships as `gtimeout` from coreutils, if at all).
+func runWithTimeout(exePath string, seconds int) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
+	defer cancel()
+	return exec.CommandContext(ctx, exePath).CombinedOutput()
+}
+
+// compileAndRun is a helper function that compiles and runs Tim code,
+// returning the output
+func compileAndRun(t *testing.T, code string) string {
+	t.Helper()
+
+	// Create temporary directory
+	tmpDir := t.TempDir()
+
+	// Auto-wrap test code in main function if it doesn't have one
+	// This allows test snippets to use lowercase variables
+	// But don't wrap if code has imports (they must be at module level)
+	if needsMainWrapper(code) {
+		// Remove leading/trailing whitespace from each line to avoid parsing issues
+		lines := strings.Split(code, "\n")
+		var cleaned []string
+		for _, line := range lines {
+			trimmed := strings.TrimSpace(line)
+			if trimmed != "" {
+				cleaned = append(cleaned, trimmed)
+			}
+		}
+		code = "main = {\n" + strings.Join(cleaned, "\n") + "\n}"
+	}
+
+	// Write source file
+	srcFile := filepath.Join(tmpDir, "test.tim")
+	if err := os.WriteFile(srcFile, []byte(code), 0644); err != nil {
+		t.Fatalf("Failed to write source file: %v", err)
+	}
+
+	// Compile using Go API directly
+	exePath := filepath.Join(tmpDir, "test")
+	osType, _ := ParseOS(runtime.GOOS)
+	archType, _ := ParseArch(runtime.GOARCH)
+
+	// Add .exe extension on Windows
+	if runtime.GOOS == "windows" {
+		exePath += ".exe"
+	}
+
+	platform := Platform{
+		OS:   osType,
+		Arch: archType,
+	}
+	if err := CompileTim(srcFile, exePath, platform); err != nil {
+		t.Fatalf("Compilation failed: %v", err)
+	}
+
+	// Run - inherit environment variables for SDL_VIDEODRIVER etc
+	cmd := exec.Command(exePath)
+	cmd.Env = os.Environ()
+	runOutput, err := cmd.CombinedOutput()
+	// Note: Tim programs may return non-zero exit codes as their result value
+	// We only fail if there's an actual execution error (not just non-zero exit)
+	if err != nil {
+		// Check if it's just a non-zero exit code (which is normal for Tim)
+		if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() >= 0 {
+			return strings.ReplaceAll(string(runOutput), "\r\n", "\n")
+		}
+		// Actual execution error (program didn't run)
+		t.Fatalf("Execution failed: %v\nOutput: %s", err, runOutput)
+	}
+
+	return strings.ReplaceAll(string(runOutput), "\r\n", "\n")
+}

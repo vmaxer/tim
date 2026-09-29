@@ -1,7 +1,0 @@
-// A cstruct has C layout: a uint32, padding, then a uint64.
-cstruct SDL_Event {
-    type: uint32,
-    timestamp: uint64
-}
-
-println(f"SDL_Event: {SDL_Event.size} bytes, timestamp at {SDL_Event.timestamp.offset}")

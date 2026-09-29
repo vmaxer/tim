@@ -12,7 +12,7 @@ import (
 func compileWithin(t *testing.T, src, exe string, limit time.Duration) {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- CompileTimWithOptions(src, exe, GetDefaultPlatform(), 0, false, false) }()
+	go func() { done <- CompileTim(src, exe, GetDefaultPlatform()) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -45,9 +45,6 @@ func TestExamplesCompile(t *testing.T) {
 		t.Skip("no examples")
 	}
 	for _, f := range files {
-		if filepath.Base(f) == "hello.tim" {
-			continue
-		}
 		t.Run(filepath.Base(f), func(t *testing.T) {
 			compileWithin(t, f, filepath.Join(t.TempDir(), "out"), 10*time.Second)
 		})
@@ -215,7 +212,7 @@ func TestArityMismatch(t *testing.T) {
 	if err := os.WriteFile(src, []byte("f = x -> x * 2\nprintln(f(1, 2))\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	err := CompileTimWithOptions(src, filepath.Join(dir, "main"), GetDefaultPlatform(), 0, false, false)
+	err := CompileTim(src, filepath.Join(dir, "main"), GetDefaultPlatform())
 	if err == nil || !strings.Contains(err.Error(), "'f' takes 1 argument, but 2 were given") {
 		t.Errorf("expected arity error, got %v", err)
 	}

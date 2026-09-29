@@ -1,4 +1,3 @@
-// Completion: 100% - Import resolution module complete
 package main
 
 import (

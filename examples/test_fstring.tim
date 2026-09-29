@@ -1,2 +1,0 @@
-name = "Tim"
-println(f"Hello, {name}!")

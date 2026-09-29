@@ -200,7 +200,10 @@ func (l *cLib) linkName(os OS) []string {
 	lib := pkgConfigLib(l.name)
 	switch os {
 	case OSWindows:
-		return []string{mapLibraryToDLL(l.name)}
+		if dll, ok := windowsDLLs[l.name]; ok {
+			return []string{dll}
+		}
+		return []string{lib + ".dll"}
 	case OSDarwin:
 		for _, dir := range []string{"/opt/homebrew/lib", "/usr/local/lib"} {
 			if matches, _ := filepath.Glob(filepath.Join(dir, "lib"+lib+".*.dylib")); len(matches) > 0 {
@@ -214,6 +217,10 @@ func (l *cLib) linkName(os OS) []string {
 	}
 	return []string{"lib" + lib + ".so"}
 }
+
+// windowsDLLs are the DLL names of libraries whose name differs.
+var windowsDLLs = map[string]string{"sdl3": "SDL3.dll", "sdl2": "SDL2.dll", "opengl": "opengl32.dll", "glu": "glu32.dll",
+	"glfw": "glfw3.dll", "curl": "libcurl.dll", "png": "libpng.dll", "jpeg": "libjpeg.dll", "zlib": "zlib1.dll"}
 
 // pkgConfigLib returns the -l name pkg-config gives for a package, or the name itself.
 func pkgConfigLib(name string) string {

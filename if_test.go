@@ -22,7 +22,7 @@ func TestIfLexing(t *testing.T) {
 }
 
 func TestIfParsing(t *testing.T) {
-	parser := NewParser(`main = {
+	parser := NewParserWithFilename(`main = {
 if 1 {
     println(1)
 } elif 0 {
@@ -30,7 +30,7 @@ if 1 {
 } else {
     println(3)
 }
-}`)
+}`, "test.tim")
 	program := parser.ParseProgram()
 	if len(program.Statements) != 1 {
 		t.Fatalf("expected 1 top-level statement, got %d", len(program.Statements))

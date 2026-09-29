@@ -61,7 +61,10 @@ func (e coreError) Error() string { return e.msg }
 
 func unsupportedf(format string, args ...any) { panic(coreError{fmt.Sprintf(format, args...)}) }
 
-type loopLabels struct{ cont, exit label }
+type loopLabels struct {
+	cont, exit label
+	arenas     int // arenas open when the loop started
+}
 
 type frame struct {
 	fn       *Fun
@@ -73,6 +76,14 @@ type frame struct {
 	variadic int   // slot of the variadic parameter
 	defers   int32 // offset of the list of deferred functions, or 0
 	loops    []loopLabels
+	arenas   []arenaScope // the arenas open at this point of the function
+}
+
+// arenaScope is an open arena: the slots it may leave pointers in, which
+// are cleared when it is left, so they do not keep its garbage alive.
+type arenaScope struct {
+	vars  []*Var
+	temps int
 }
 
 type coreGen struct {
@@ -466,11 +477,22 @@ func (g *coreGen) storeVar(v *Var) {
 	case v.Kind == SymGlobal:
 		g.a.store(rA, rGlob, int32(8*v.Index))
 	case root(v).Boxed:
-		g.a.mov(rC, rA)
+		t := g.tmp()
+		g.a.store(rA, rFP, t)
 		g.loadRaw(v)
+		g.a.mov(rC, rA)
 		g.untag(rA)
-		g.a.store(rC, rA, 8)
+		g.a.load(rB, rFP, t)
+		g.a.store(rB, rA, 8)
+		// the write barrier, inside an arena (R.depth)
+		done := g.a.newLabel()
+		g.a.load(rB, rRT, 8)
+		g.a.brZero(rB, done)
 		g.a.mov(rA, rC)
+		g.callRT("rt_wb", rt(), inA())
+		g.a.bind(done)
+		g.a.load(rA, rFP, t)
+		g.free(1)
 	case v.Kind == SymLocal:
 		g.a.store(rA, rFP, slotOff(g.localSlot(v)))
 	default:
@@ -480,6 +502,9 @@ func (g *coreGen) storeVar(v *Var) {
 
 // define binds a new variable to the value computed by value.
 func (g *coreGen) define(v *Var, value func()) {
+	if n := len(g.f.arenas); n > 0 && (v.Kind == SymLocal || v.Kind == SymGlobal) {
+		g.f.arenas[n-1].vars = append(g.f.arenas[n-1].vars, v)
+	}
 	if v.Kind == SymLocal && v.Boxed {
 		g.callRT("rt_cell", rt(), immv(0))
 		g.a.store(rA, rFP, slotOff(g.localSlot(v)))
@@ -583,7 +608,7 @@ func (g *coreGen) stmt(s Statement, tail bool) {
 	case *JumpStmt:
 		g.jump(s.IsBreak, s.Label, s.Value)
 	case *ArenaStmt:
-		g.stmts(s.Body, false)
+		g.arena(s.Body, false)
 	case *DeferStmt:
 		g.closure(g.c.Deferred[s])
 		t := g.tmp()
@@ -627,12 +652,48 @@ func (g *coreGen) setIndex(_ func(), index, value Expression) {
 	g.free(2)
 }
 
+// arena runs body in an arena of its own; when value is set, the value of
+// the body is the arena's value, which outlives it.
+func (g *coreGen) arena(body []Statement, value bool) {
+	g.callRT("rt_arena_enter", rt())
+	g.f.arenas = append(g.f.arenas, arenaScope{temps: g.f.temps})
+	g.stmts(body, false)
+	if !value {
+		g.a.imm(rA, 0)
+	}
+	g.leaveArenas(len(g.f.arenas) - 1)
+	g.f.arenas = g.f.arenas[:len(g.f.arenas)-1]
+}
+
+// leaveArenas leaves the arenas opened since n were open, keeping rA.
+func (g *coreGen) leaveArenas(n int) {
+	g.a.imm(rB, 0)
+	for i := len(g.f.arenas) - 1; i >= n; i-- {
+		s := g.f.arenas[i]
+		for _, v := range s.vars {
+			if v.Kind == SymGlobal {
+				g.a.store(rB, rGlob, int32(8*v.Index))
+			} else {
+				g.a.store(rB, rFP, slotOff(g.localSlot(v)))
+			}
+		}
+		for t := s.temps; t < g.f.maxTemps; t++ {
+			g.a.store(rB, rFP, slotOff(g.f.fixed+t))
+		}
+		g.callRT("rt_arena_exit", rt(), inA())
+		g.a.imm(rB, 0)
+	}
+}
+
 func (g *coreGen) jump(isBreak bool, lbl int, value Expression) {
 	if isBreak && lbl == 0 {
 		if value != nil {
-			g.expr(value, !g.f.top && g.f.defers == 0)
+			g.expr(value, !g.f.top && g.f.defers == 0 && len(g.f.arenas) == 0)
 		} else {
 			g.a.imm(rA, 0)
+		}
+		if !g.f.top {
+			g.leaveArenas(0)
 		}
 		g.runDefers()
 		if g.f.top {
@@ -650,6 +711,7 @@ func (g *coreGen) jump(isBreak bool, lbl int, value Expression) {
 	if lbl > 0 {
 		target = loops[lbl-1]
 	}
+	g.leaveArenas(target.arenas)
 	if isBreak {
 		g.a.jmp(target.exit)
 	} else {
@@ -705,7 +767,7 @@ func (g *coreGen) loop(s *LoopStmt) {
 		check()
 		g.a.load(rA, rFP, ts)
 		g.define(it, func() {})
-		g.f.loops = append(g.f.loops, loopLabels{cont, exit})
+		g.f.loops = append(g.f.loops, loopLabels{cont, exit, len(g.f.arenas)})
 		g.stmts(s.Body, false)
 		g.f.loops = g.f.loops[:len(g.f.loops)-1]
 		g.a.bind(cont)
@@ -737,7 +799,7 @@ func (g *coreGen) loop(s *LoopStmt) {
 		g.a.op(aluAdd, rB, rB, rD)
 		g.a.load(rA, rB, 8)
 		g.define(it, func() {})
-		g.f.loops = append(g.f.loops, loopLabels{cont, exit})
+		g.f.loops = append(g.f.loops, loopLabels{cont, exit, len(g.f.arenas)})
 		g.stmts(s.Body, false)
 		g.f.loops = g.f.loops[:len(g.f.loops)-1]
 		g.a.bind(cont)
@@ -758,7 +820,7 @@ func (g *coreGen) while(s *WhileStmt) {
 	g.a.bind(top)
 	g.jumpIf(s.Condition, false, exit)
 	check()
-	g.f.loops = append(g.f.loops, loopLabels{top, exit})
+	g.f.loops = append(g.f.loops, loopLabels{top, exit, len(g.f.arenas)})
 	g.stmts(s.Body, false)
 	g.f.loops = g.f.loops[:len(g.f.loops)-1]
 	g.a.jmp(top)
@@ -792,11 +854,7 @@ func (g *coreGen) expr(e Expression, tail bool) {
 		g.array(e.Elements, func(base int32, n int) { g.callRT("rt_list", rt(), slotAt(base), immv(uint64(n))) })
 	case *MapExpr:
 		var kv []Expression
-		for i := range e.Keys {
-			k := e.Keys[i]
-			if i < len(e.Names) && e.Names[i] != "" {
-				k = &StringExpr{Value: e.Names[i]}
-			}
+		for i, k := range e.Keys {
 			kv = append(kv, k, e.Values[i])
 		}
 		g.array(kv, func(base int32, n int) { g.callRT("rt_map", rt(), slotAt(base), immv(uint64(n/2))) })
@@ -871,12 +929,8 @@ func (g *coreGen) expr(e Expression, tail bool) {
 		}
 		g.expr(e.DefaultExpr, tail)
 		g.a.bind(end)
-	case *JumpExpr:
-		g.jump(e.IsBreak, e.Label, e.Value)
 	case *ArenaExpr:
-		g.stmts(e.Body, tail)
-	case *LengthExpr:
-		g.rtCall("rt_len", e.Operand)
+		g.arena(e.Body, true)
 	case *RandomExpr:
 		g.callRT("rt_random", rt())
 	case *NamespacedIdentExpr:

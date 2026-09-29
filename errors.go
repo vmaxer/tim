@@ -1,4 +1,3 @@
-// Completion: 100% - Error handling complete, clear and helpful messages
 package main
 
 import (
@@ -261,31 +260,15 @@ func (ec *ErrorCollector) Report(useColor bool) string {
 		sb.WriteString(warn.Format(useColor))
 	}
 
-	// Summary
-	if len(ec.errors) > 0 || len(ec.warnings) > 0 {
-		sb.WriteString("\n")
-		if len(ec.errors) > 0 {
-			if useColor {
-				sb.WriteString("\033[1;31m")
-			}
-			sb.WriteString(fmt.Sprintf("%d error(s)", len(ec.errors)))
-			if useColor {
-				sb.WriteString("\033[0m")
-			}
-		}
+	if n := len(ec.errors) + len(ec.warnings); n > 1 {
+		summary := fmt.Sprintf("%d errors", len(ec.errors))
 		if len(ec.warnings) > 0 {
-			if len(ec.errors) > 0 {
-				sb.WriteString(", ")
-			}
-			if useColor {
-				sb.WriteString("\033[1;33m")
-			}
-			sb.WriteString(fmt.Sprintf("%d warning(s)", len(ec.warnings)))
-			if useColor {
-				sb.WriteString("\033[0m")
-			}
+			summary = fmt.Sprintf("%d errors and %d warnings", len(ec.errors), len(ec.warnings))
 		}
-		sb.WriteString(" found\n")
+		if useColor {
+			summary = "\033[1;31m" + summary + "\033[0m"
+		}
+		sb.WriteString("\n" + summary + "\n")
 	}
 
 	return sb.String()

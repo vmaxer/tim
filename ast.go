@@ -1,4 +1,3 @@
-// Completion: 98% - All AST nodes implemented, comprehensive coverage
 package main
 
 import (
@@ -18,11 +17,10 @@ type Node interface {
 }
 
 type Program struct {
-	Statements         []Statement
-	ExportMode         string                  // "*" for export all without prefix, "" for require prefix
-	ExportedFuncs      []string                // Specific functions to export (only if ExportMode is not "*")
-	FunctionNamespaces map[string]string       // function name -> namespace (for imports)
-	CStructs           map[string]*CStructDecl // cstruct name -> declaration
+	Statements    []Statement
+	ExportMode    string                  // "*" for export all without prefix, "" for require prefix
+	ExportedFuncs []string                // Specific functions to export (only if ExportMode is not "*")
+	CStructs      map[string]*CStructDecl // cstruct name -> declaration
 }
 
 type Statement interface {
@@ -36,7 +34,6 @@ type AssignStmt struct {
 	Value          Expression
 	Mutable        bool     // true for := or <-, false for =
 	IsUpdate       bool     // true for <-, false for = and :=
-	IsReuseMutable bool     // true when = is used to update existing mutable variable
 	Precision      string   // Legacy type annotation: "b64", "f32", etc. (empty if none)
 	TypeAnnotation *TimType // Type annotation: num, str, cstring, cptr, etc. (nil if none)
 }
@@ -247,13 +244,10 @@ type LoopStmt struct {
 	IteratorType  string     // Optional cstruct type annotation: `@ b as Ball in ...` (empty if none)
 	Iterable      Expression // Expression to iterate over (e.g., range(10))
 	Body          []Statement
-	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
-	NeedsMaxCheck bool        // Whether to emit runtime max iteration checking
-	BaseOffset    int         // Stack offset before loop body (set during collectSymbols)
-	NumThreads    int         // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
-	Reducer       *LambdaExpr // Optional reduction lambda for parallel loops: | a,b | { a + b }
-	Vectorized    bool        // Whether this loop has been marked for SIMD vectorization
-	VectorWidth   int         // Elements per SIMD vector (e.g., 4 for AVX doubles, 8 for AVX floats)
+	MaxIterations int64 // Maximum allowed iterations (math.MaxInt64 for infinite)
+	NeedsMaxCheck bool  // Whether to emit runtime max iteration checking
+	BaseOffset    int   // Stack offset before loop body (set during collectSymbols)
+	NumThreads    int   // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
 }
 
 type WhileStmt struct {
@@ -421,25 +415,6 @@ type NamespacedIdentExpr struct {
 func (n *NamespacedIdentExpr) String() string  { return n.Namespace + "." + n.Name }
 func (n *NamespacedIdentExpr) expressionNode() {}
 
-// JumpExpr represents a label jump used as an expression (e.g., in match blocks)
-type JumpExpr struct {
-	Label   int        // Target label (0 = outer scope, N = loop label)
-	Value   Expression // Optional value to return (for @0 value syntax)
-	IsBreak bool       // true for ret @N (exit loop), false for @N (continue loop)
-}
-
-func (j *JumpExpr) String() string {
-	prefix := "@"
-	if j.IsBreak {
-		prefix = "ret @"
-	}
-	if j.Value != nil {
-		return fmt.Sprintf("%s%d %s", prefix, j.Label, j.Value.String())
-	}
-	return fmt.Sprintf("%s%d", prefix, j.Label)
-}
-func (j *JumpExpr) expressionNode() {}
-
 type BinaryExpr struct {
 	Pos      Pos
 	Left     Expression
@@ -451,25 +426,6 @@ func (b *BinaryExpr) String() string {
 	return "(" + b.Left.String() + " " + b.Operator + " " + b.Right.String() + ")"
 }
 func (b *BinaryExpr) expressionNode() {}
-
-// FMAExpr represents a Fused Multiply-Add pattern: a * b + c or a * b - c
-// This is recognized by the optimizer and can be compiled to FMA instructions (VFMADD/VFMSUB)
-type FMAExpr struct {
-	A        Expression // First multiplicand
-	B        Expression // Second multiplicand
-	C        Expression // Addend/subtrahend
-	IsSub    bool       // true for FMSUB (a * b - c), false for FMADD (a * b + c)
-	IsNegMul bool       // true for FNMADD (-(a * b) + c), not currently detected
-}
-
-func (f *FMAExpr) String() string {
-	op := "+"
-	if f.IsSub {
-		op = "-"
-	}
-	return fmt.Sprintf("fma(%s * %s %s %s)", f.A.String(), f.B.String(), op, f.C.String())
-}
-func (f *FMAExpr) expressionNode() {}
 
 // UnaryExpr represents a unary operation: not, -, #, ++expr, --expr
 type UnaryExpr struct {
@@ -495,9 +451,8 @@ func (i *InExpr) String() string {
 func (i *InExpr) expressionNode() {}
 
 type MatchClause struct {
-	Guard        Expression
-	Result       Expression
-	IsValueMatch bool // True if this is a value match (0 -> ...), false if guard (| x > 0 -> ...)
+	Guard  Expression
+	Result Expression
 }
 
 type MatchExpr struct {
@@ -546,13 +501,11 @@ func (b *BlockExpr) String() string {
 func (b *BlockExpr) expressionNode() {}
 
 type CallExpr struct {
-	Pos                 Pos
-	Function            string
-	Args                []Expression
-	MaxRecursionDepth   int64 // Maximum recursion depth (math.MaxInt64 for infinite)
-	NeedsRecursionCheck bool  // Whether to emit runtime recursion depth checking
-	IsCFFI              bool  // Whether this is a C FFI call (c.malloc, c.free, etc.)
-	RawBitcast          bool  // Whether to use raw bitcast for return value (call()! syntax)
+	Pos        Pos
+	Function   string
+	Args       []Expression
+	IsCFFI     bool // Whether this is a C FFI call (c.malloc, c.free, etc.)
+	RawBitcast bool // Whether to use raw bitcast for return value (call()! syntax)
 }
 
 func (c *CallExpr) String() string {
@@ -601,7 +554,6 @@ type MapExpr struct {
 	Pos    Pos
 	Keys   []Expression
 	Values []Expression
-	Names  []string // Names[i] is the identifier written for key i, which legacy backends hash
 }
 
 func (m *MapExpr) String() string {
@@ -698,28 +650,12 @@ type LambdaExpr struct {
 	VariadicParam     string              // Name of variadic parameter (if any), empty if none
 	ReturnType        *TimType            // Return type annotation (nil if none)
 	Body              Expression
-	IsPure            bool              // Automatically detected: true if function has no side effects
-	CapturedVars      []string          // Variables captured from outer scope (for closures)
-	CapturedVarTypes  map[string]string // Types of captured variables (for correct codegen)
-	IsNestedLambda    bool              // True if this lambda is defined inside another lambda
 }
 
 func (l *LambdaExpr) String() string {
 	return "(" + strings.Join(l.Params, ", ") + ") -> " + l.Body.String()
 }
 func (l *LambdaExpr) expressionNode() {}
-
-// WildcardPattern matches any value without binding
-type WildcardPattern struct{}
-
-type LengthExpr struct {
-	Operand Expression
-}
-
-func (l *LengthExpr) String() string {
-	return "#" + l.Operand.String()
-}
-func (l *LengthExpr) expressionNode() {}
 
 type CastExpr struct {
 	Pos        Pos
@@ -735,130 +671,6 @@ func (c *CastExpr) String() string {
 	return c.Expr.String() + " as " + c.Type
 }
 func (c *CastExpr) expressionNode() {}
-
-type UnsafeExpr struct {
-	X86_64Block   []Statement       // x86_64 architecture block
-	ARM64Block    []Statement       // arm64 architecture block
-	RISCV64Block  []Statement       // riscv64 architecture block
-	X86_64Return  *UnsafeReturnStmt // optional return value for x86_64
-	ARM64Return   *UnsafeReturnStmt // optional return value for arm64
-	RISCV64Return *UnsafeReturnStmt // optional return value for riscv64
-}
-
-func (u *UnsafeExpr) String() string {
-	return fmt.Sprintf("unsafe { x86_64: %d stmts } { arm64: %d stmts } { riscv64: %d stmts }",
-		len(u.X86_64Block), len(u.ARM64Block), len(u.RISCV64Block))
-}
-func (u *UnsafeExpr) expressionNode() {}
-
-type RegisterExpr struct {
-	Name string // Register name (e.g., "rax", "xmm0", "x0", "a0")
-}
-
-type RegisterAssignStmt struct {
-	Register string // Register name (e.g., "rax", "x0", "a0") or memory address like "[rax]"
-	Value    any    // Either Expression, string (register), *RegisterOp, or *MemoryLoad
-}
-
-func (r *RegisterAssignStmt) String() string {
-	switch v := r.Value.(type) {
-	case Expression:
-		return r.Register + " <- " + v.String()
-	case string:
-		return r.Register + " <- " + v
-	case *RegisterOp:
-		return r.Register + " <- " + v.String()
-	case *MemoryLoad:
-		return r.Register + " <- " + v.String()
-	default:
-		return r.Register + " <- <unknown>"
-	}
-}
-func (r *RegisterAssignStmt) statementNode() {}
-
-type UnsafeReturnStmt struct {
-	Register string // Register to return (e.g., "rax", "xmm0")
-	AsType   string // Optional type cast (e.g., "cstr", "pointer", empty for Tim value)
-}
-
-func (u *UnsafeReturnStmt) String() string {
-	if u.AsType != "" {
-		return fmt.Sprintf("%s as %s", u.Register, u.AsType)
-	}
-	return u.Register
-}
-func (u *UnsafeReturnStmt) statementNode() {}
-
-type RegisterOp struct {
-	Left     string // Register name or empty for unary
-	Operator string // +, -, *, /, %, &, |, ^, <<, >>, ~
-	Right    any    // Register name (string) or immediate (NumberExpr)
-}
-
-func (r *RegisterOp) String() string {
-	if r.Left == "" {
-		// Unary operation
-		switch v := r.Right.(type) {
-		case string:
-			return r.Operator + v
-		default:
-			return r.Operator + "<unknown>"
-		}
-	}
-	// Binary operation
-	switch v := r.Right.(type) {
-	case Expression:
-		return r.Left + " " + r.Operator + " " + v.String()
-	case string:
-		return r.Left + " " + r.Operator + " " + v
-	default:
-		return r.Left + " " + r.Operator + " <unknown>"
-	}
-}
-
-type MemoryLoad struct {
-	Size    string // "u8", "u16", "u32", "u64", "i8", "i16", "i32", "i64" (empty = u64)
-	Address string // Register containing address (e.g., "rax", "rbx")
-	Offset  int64  // Optional offset (e.g., [rax + 16])
-}
-
-func (m *MemoryLoad) String() string {
-	sizeStr := ""
-	if m.Size != "" && m.Size != "u64" {
-		sizeStr = m.Size + " "
-	}
-	offsetStr := ""
-	if m.Offset != 0 {
-		offsetStr = fmt.Sprintf(" + %d", m.Offset)
-	}
-	return sizeStr + "[" + m.Address + offsetStr + "]"
-}
-
-type MemoryStore struct {
-	Size    string // "uint8", "uint16", "uint32", "uint64" (empty = uint64)
-	Address string // Register containing address (e.g., "rax", "rbx")
-	Offset  int64  // Optional offset (e.g., [rax + 16])
-	Value   any    // Value to store (register name string or *NumberExpr)
-}
-
-func (m *MemoryStore) String() string {
-	sizeStr := ""
-	if m.Size != "" && m.Size != "uint64" {
-		sizeStr = " as " + m.Size
-	}
-	offsetStr := ""
-	if m.Offset != 0 {
-		offsetStr = fmt.Sprintf(" + %d", m.Offset)
-	}
-	return "[" + m.Address + offsetStr + "] <- " + fmt.Sprint(m.Value) + sizeStr
-}
-
-func (m *MemoryStore) statementNode() {}
-
-type SyscallStmt struct{}
-
-func (s *SyscallStmt) String() string { return "syscall" }
-func (s *SyscallStmt) statementNode() {}
 
 // ArenaStmt represents an arena memory block: arena { ... }
 // All allocations within the block are freed when the arena exits
