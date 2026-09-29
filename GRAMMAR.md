@@ -17,7 +17,7 @@ reads best:
 | Rust        | `->` and `=>`, `as` casts, `if` as an expression, immutable by default     |
 | Go          | one way to do things, no classes, `defer`, explicit mutability             |
 | C           | the operator set, `cstruct`, direct FFI, `printf`                          |
-| Assembly    | `unsafe` register blocks, `syscall`, `ret`                                 |
+| Assembly    | 64-bit bit operations, `popcount`, `read_*`/`write_*` on raw memory, `ret`  |
 
 ## 1. Notation
 
@@ -53,7 +53,7 @@ escape   = "\n" | "\t" | "\r" | "\0" | "\\" | '\"' | "\{" | "\x" HEX HEX | "\u{"
 
 ```
 and  as  break  continue  cstruct  defer  elif  else  err  export  if  import
-in   inf  no  not  or  ret  unsafe  yes  arena
+in   inf  no  not  or  ret  yes  arena
 ```
 
 **Operators and punctuation:**
@@ -183,7 +183,7 @@ args       = expr { "," expr } ;
 index      = expr | [ expr ] ":" [ expr ] ;           (* xs[i], xs[a:b], xs[:b], xs[a:] *)
 
 primary    = NUMBER | STRING | FSTRING | "yes" | "no" | "inf" | IDENT
-           | "(" expr ")" | list | map | block | guards | if | unsafe ;
+           | "(" expr ")" | list | map | block | guards | if ;
 list       = "[" [ expr ( { "," expr } | "@" IDENT "in" expr [ "if" expr ] ) ] "]" ;
 map        = "{" "}" | "{" key ":" expr { "," key ":" expr } "}" ;
 key        = IDENT | STRING | NUMBER ;
@@ -328,37 +328,7 @@ unknown cstruct type is a compile error. On cstruct values, `a + b`, `a - b` and
 `a * b` call the methods `add`, `sub` and `mul`; `a * s`, `s * a` and `a / s` call
 `scale(a, s)` and `scale(a, 1 / s)`.
 
-## 7. Unsafe code
-
-`unsafe` gives direct access to registers, memory and system calls, with one block
-per architecture:
-
-```ebnf
-unsafe     = "unsafe" [ ctype ] ublock ublock ublock [ "as" ctype ] ;   (* x86_64, arm64, riscv64 *)
-ublock     = "{" { ustmt END } "}" ;
-ustmt      = REG "<-" ( uexpr | "[" REG [ ( "+" | "-" ) NUMBER ] "]" [ "as" ctype ] )
-           | "[" REG [ ( "+" | "-" ) NUMBER ] "]" "<-" ( REG | NUMBER ) [ "as" ctype ]
-           | "syscall" ;
-uexpr      = ( REG | NUMBER | IDENT ) [ uop ( REG | NUMBER ) ] | "~" REG ;
-uop        = "+" | "-" | "*" | "/" | "%" | "&" | "|" | "^" | "<<" | ">>" ;
-```
-
-```tim
-pid = unsafe int64 {
-    rax <- 39
-    syscall
-} {
-    x8 <- 172
-    syscall
-} {
-    a7 <- 172
-    syscall
-}
-```
-
-The value of `unsafe` is the return register (`rax`, `x0`, `a0`) read as `ctype`.
-
-## 8. Program execution
+## 7. Program execution
 
 Top-level statements run in order. If the program defines a function `main` and
 never calls it at top level, `main()` runs after the top level. The exit code is 0,
@@ -366,7 +336,7 @@ unless the program calls `exit(n)`, returns `ret n` at top level, or `main` give
 number, which is truncated to an integer; an error exits with 1. Deferred calls run
 when the program ends, last first, as they do when a function returns.
 
-## 9. What changed from Tim 1
+## 8. What changed from Tim 1
 
 | Tim 1                                    | Tim 2                                        |
 |------------------------------------------|----------------------------------------------|
@@ -385,6 +355,7 @@ when the program ends, last first, as they do when a function returns.
 | `call()!`, `! N` recursion bounds        | removed: FFI signatures carry the types      |
 | ENet `&8080`, `<-` send, `<=` receive    | removed from the language                    |
 | `class`, `with`, `alias`, `spawn`        | removed: use functions, maps and cstructs    |
+| `unsafe` register blocks, `vec2`/`vec4`  | removed: C functions, `read_*`/`write_*`     |
 | `shadow`                                 | inner blocks shadow freely                   |
 | `@first` `@last` `@counter` `@i`         | removed                                      |
 | condition loops require `! N`            | `! N` is optional everywhere                 |

@@ -1,1 +1,2 @@
 testdata/core/* -text
+testdata/core/lib/** -text

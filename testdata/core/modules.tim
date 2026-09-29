@@ -1,0 +1,4 @@
+import "./lib/geo" as geo
+println(geo.hyp(3, 4), geo.square(5), geo.unit)
+square(x) = -1 // the module's square stays its own
+println(square(2), geo.square(2))

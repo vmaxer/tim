@@ -90,13 +90,3 @@ func TestCheckCapturesAndBoxing(t *testing.T) {
 		}
 	}
 }
-
-func TestCheckRecordsUnsupported(t *testing.T) {
-	c, err := checkSource(t, "x = unsafe int64 { rax <- 1 } { x0 <- 1 } { a0 <- 1 }\nprintln(x)")
-	if err != "" {
-		t.Fatal(err)
-	}
-	if got := strings.Join(c.Unsupported, ","); got != "unsafe" {
-		t.Errorf("unsupported = %s", got)
-	}
-}

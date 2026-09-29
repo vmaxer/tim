@@ -90,19 +90,58 @@ func addPrelude(prog *Program) {
 	prog.Statements = append(prog.Statements, extra.Statements...)
 }
 
+// CompileTim compiles the program in inputPath to an executable.
+func CompileTim(inputPath string, outputPath string, platform Platform) error {
+	return CompileTimWithOptions(inputPath, outputPath, platform, 0, VerboseMode, false)
+}
+
+// CompileTimWithOptions compiles with the given verbosity; depsOnly lists the
+// program's imports instead of compiling it.
+func CompileTimWithOptions(inputPath string, outputPath string, platform Platform, _ float64, verbose bool, depsOnly bool) error {
+	if verbose {
+		old := VerboseMode
+		VerboseMode = true
+		defer func() { VerboseMode = old }()
+	}
+	path, err := filepath.Abs(inputPath)
+	if err != nil {
+		return err
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("failed to read %s: %v", inputPath, err)
+	}
+	if depsOnly {
+		prog := parseQuietly(string(src), path)
+		if prog == nil {
+			return fmt.Errorf("%s does not parse", inputPath)
+		}
+		for _, s := range prog.Statements {
+			switch s := s.(type) {
+			case *ImportStmt:
+				fmt.Printf("%s as %s\n", s.URL, s.Alias)
+			case *CImportStmt:
+				fmt.Printf("C %s as %s\n", s.Library, s.Alias)
+			}
+		}
+		return nil
+	}
+	handled, err := tryCore(src, path, outputPath, platform)
+	if !handled && err == nil {
+		err = fmt.Errorf("%s: cannot compile for %s", inputPath, platform.FullString())
+	}
+	return err
+}
+
 // tryCore compiles with the core code generator. It returns handled=false
-// when the program needs the legacy backend.
+// when it cannot compile the program for the platform.
 func tryCore(src []byte, path, out string, p Platform) (handled bool, err error) {
 	why := ""
 	defer func() {
 		if VerboseMode && !handled {
-			fmt.Fprintf(os.Stderr, "core: legacy backend (%s)\n", why)
+			fmt.Fprintf(os.Stderr, "tim: %s\n", why)
 		}
 	}()
-	if os.Getenv("TIM_LEGACY") != "" {
-		why = "requested"
-		return false, nil
-	}
 	t, a, write := coreTargetFor(p)
 	if a == nil {
 		why = "platform " + p.FullString()
@@ -118,11 +157,8 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 		}
 	}()
 	prog := NewParserWithFilename(string(src), path).ParseProgramRaw()
-	for _, s := range prog.Statements {
-		if _, ok := s.(*ImportStmt); ok {
-			why = "Tim imports"
-			return false, nil
-		}
+	if err := loadModules(prog, path, p); err != nil {
+		return true, err
 	}
 	addPrelude(prog)
 	c, err := Check(prog, path, string(src))
@@ -141,13 +177,11 @@ func tryCore(src []byte, path, out string, p Platform) (handled bool, err error)
 		return true, newReportedError(ce.Plain)
 	}
 	if len(c.Unsupported) > 0 {
-		why = strings.Join(c.Unsupported, ", ")
-		return false, nil
+		return true, fmt.Errorf("%s uses what Tim 2 does not support: %s", filepath.Base(path), strings.Join(c.Unsupported, ", "))
 	}
 	code, entry, cimps, err := compileCore(c, a, t)
 	if err != nil {
-		why = err.Error()
-		return false, nil
+		return true, fmt.Errorf("internal compiler error: %v", err)
 	}
 	return true, write(out, p.Arch, code, entry, cimps)
 }
@@ -245,4 +279,80 @@ func parseQuietly(src, path string) (prog *Program) {
 	p := NewParserWithFilename(src, path)
 	p.quiet = true
 	return p.ParseProgramRaw()
+}
+
+// loadModules replaces each Tim import with the module's definitions:
+// functions and globals named alias.name (unprefixed for `as *` or a module
+// that says `export *`), with the module's cstructs and C imports.
+func loadModules(prog *Program, path string, p Platform) error {
+	var rest []Statement
+	var mods []Statement
+	for _, s := range prog.Statements {
+		imp, ok := s.(*ImportStmt)
+		if !ok {
+			rest = append(rest, s)
+			continue
+		}
+		src := imp.URL
+		if strings.HasPrefix(src, ".") {
+			src = filepath.Clean(filepath.Join(filepath.Dir(path), src))
+		}
+		files, err := ResolveImport(&ImportSpec{Source: src, Version: imp.Version, Alias: imp.Alias}, p.OS.String(), p.Arch.String())
+		if err != nil {
+			return fmt.Errorf("cannot import %s: %v", imp.URL, err)
+		}
+		self, _ := filepath.Abs(path)
+		for _, f := range files {
+			if abs, _ := filepath.Abs(f); abs == self {
+				continue
+			}
+			text, err := os.ReadFile(f)
+			if err != nil {
+				return err
+			}
+			mod := NewParserWithFilename(string(text), f).ParseProgramRaw()
+			prefix := imp.Alias + "."
+			if imp.Alias == "*" || mod.ExportMode == "*" {
+				prefix = ""
+			}
+			renames := map[string]string{}
+			for _, s := range mod.Statements {
+				if a, ok := s.(*AssignStmt); ok && !a.IsUpdate {
+					renames[a.Name] = prefix + a.Name
+				}
+			}
+			for _, s := range mod.Statements {
+				switch s := s.(type) {
+				case *AssignStmt:
+					if s.IsUpdate {
+						continue
+					}
+					walkNodes(s, func(n any) {
+						switch n := n.(type) {
+						case *CallExpr:
+							if to, ok := renames[n.Function]; ok {
+								n.Function = to
+							}
+						case *IdentExpr:
+							if to, ok := renames[n.Name]; ok {
+								n.Name = to
+							}
+						}
+					})
+					s.Name = renames[s.Name]
+					mods = append(mods, s)
+				case *CStructDecl:
+					if prog.CStructs == nil {
+						prog.CStructs = map[string]*CStructDecl{}
+					}
+					prog.CStructs[s.Name] = s
+					mods = append(mods, s)
+				case *CImportStmt:
+					mods = append(mods, s)
+				}
+			}
+		}
+	}
+	prog.Statements = append(mods, rest...)
+	return nil
 }

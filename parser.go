@@ -332,6 +332,7 @@ func (p *Parser) importStmt() Statement {
 		return &CImportStmt{Library: name, Alias: alias, SoPath: src}
 	}
 	if spec.IsLocal || spec.Version != "" || isGitURL(src) || strings.ContainsAny(src, `/\`) {
+		p.cImports[alias] = true // a namespace, like a C library's
 		return &ImportStmt{URL: spec.Source, Version: spec.Version, Alias: alias}
 	}
 	p.cImports[alias] = true
@@ -1155,8 +1156,6 @@ func (p *Parser) postfix() Expression {
 				switch {
 				case p.isDeclared(id.Name):
 					e = &CallExpr{Pos: callPos, Function: id.Name, Args: args}
-				case id.Name == "vec2" && len(args) == 2, id.Name == "vec4" && len(args) == 4:
-					e = &VectorExpr{Components: args, Size: len(args)}
 				case isBitOp && len(args) == 2:
 					e = &BinaryExpr{Pos: callPos, Left: args[0], Operator: op, Right: args[1]}
 				case id.Name == "random" && len(args) == 0:
@@ -1632,6 +1631,7 @@ func (p *Parser) subExpression(src string, at Token) Expression {
 
 // unsafe parses `unsafe [T] {x86_64} {arm64} {riscv64} [as T]`.
 func (p *Parser) unsafe() Expression {
+	p.fail("'unsafe' was removed in Tim 2: call C through c.name(...), and read and write memory with read_u8 ... write_f64")
 	p.advance()
 	ret := "uint64"
 	if p.at(TOKEN_IDENT) && castTypes[p.cur().Value] {

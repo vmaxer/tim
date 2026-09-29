@@ -904,8 +904,10 @@ func (k *checker) infer(e Expression) Type {
 	case *NamespacedIdentExpr:
 		lib := k.cimps[e.Namespace]
 		if lib == nil {
-			k.unsupported("module constants")
-			return TAny
+			// a module's global
+			id := &IdentExpr{Pos: e.Pos, Name: e.Namespace + "." + e.Name}
+			k.c.Rewrites[e] = id
+			return k.expr(id)
 		}
 		v, ok := lib.consts[e.Name]
 		if !ok {
@@ -1028,7 +1030,7 @@ func (k *checker) binary(e *BinaryExpr) Type {
 
 func (k *checker) call(e *CallExpr) Type {
 	name := e.Function
-	if recv, method, ok := strings.Cut(name, "."); ok {
+	if recv, method, ok := strings.Cut(name, "."); ok && k.lookup(name) == nil {
 		if lib := k.cimps[recv]; lib != nil && k.lookup(recv) == nil {
 			return k.cCall(e, lib, method)
 		}
@@ -1041,7 +1043,7 @@ func (k *checker) call(e *CallExpr) Type {
 			e.Args = append([]Expression{&IdentExpr{Pos: e.Pos, Name: recv}}, e.Args...)
 			return k.call(e)
 		}
-		k.unsupported("module calls")
+		k.undefined(e.Pos, "function", name)
 		k.exprs(e.Args)
 		return TAny
 	}
