@@ -16,7 +16,7 @@ func TestLoopPrograms(t *testing.T) {
 	}{
 		{
 			name: "simple_range_loop",
-			source: `@ i in 0..<5 {
+			source: `for i in 0..<5 {
     println(i)
 }
 `,
@@ -25,7 +25,7 @@ func TestLoopPrograms(t *testing.T) {
 		{
 			name: "loop_with_arithmetic",
 			source: `sum := 0
-@ i in 1..<11 {
+for i in 1..<11 {
     sum += i
 }
 println(sum)
@@ -34,8 +34,8 @@ println(sum)
 		},
 		{
 			name: "nested_loops",
-			source: `@ i in 0..<3 {
-    @ j in 0..<3 {
+			source: `for i in 0..<3 {
+    for j in 0..<3 {
         printf("%v ", i * 3 + j)
     }
     println("")
@@ -45,7 +45,7 @@ println(sum)
 		},
 		{
 			name: "loop_break",
-			source: `@ i in 0..<10 {
+			source: `for i in 0..<10 {
     i > 5 {
         ret @
     }
@@ -57,7 +57,7 @@ println(sum)
 		{
 			name: "list_iteration",
 			source: `items := [10, 20, 30, 40]
-@ item in items {
+for item in items {
     println(item)
 }
 `,
@@ -128,7 +128,7 @@ func TestExistingLoopPrograms(t *testing.T) {
 
 // TestInclusiveRange tests the inclusive range operator (..)
 func TestInclusiveRange(t *testing.T) {
-	source := `@ i in 1..5 {
+	source := `for i in 1..5 {
     println(i)
 }
 `
@@ -140,11 +140,11 @@ func TestInclusiveRange(t *testing.T) {
 func TestDeeplyNestedLoops(t *testing.T) {
 	// Test 5-level nesting (levels 0-2 use registers, 3-4 use stack)
 	source5 := `sum := 0
-@ a in 0..<2 {
-    @ b in 0..<2 {
-        @ c in 0..<2 {
-            @ d in 0..<2 {
-                @ e in 0..<2 {
+for a in 0..<2 {
+    for b in 0..<2 {
+        for c in 0..<2 {
+            for d in 0..<2 {
+                for e in 0..<2 {
                     sum <- sum + 1
                 }
             }
@@ -157,12 +157,12 @@ println(sum)
 
 	// Test 6-level nesting (all stack-based beyond first 3)
 	source6 := `count := 0
-@ a in 0..<2 {
-    @ b in 0..<2 {
-        @ c in 0..<2 {
-            @ d in 0..<2 {
-                @ e in 0..<2 {
-                    @ f in 0..<2 {
+for a in 0..<2 {
+    for b in 0..<2 {
+        for c in 0..<2 {
+            for d in 0..<2 {
+                for e in 0..<2 {
+                    for f in 0..<2 {
                         count <- count + 1
                     }
                 }

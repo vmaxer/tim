@@ -264,7 +264,7 @@ func (e *ExpressionStmt) statementNode() {}
 type LoopStmt struct {
 	// No explicit label - determined by nesting depth when created with @
 	Iterator      string     // Variable name (e.g., "i")
-	IteratorType  string     // Optional cstruct type annotation: `@ b as Ball in ...` (empty if none)
+	IteratorType  string     // Optional cstruct type annotation: `for b as Ball in ...` (empty if none)
 	Iterable      Expression // Expression to iterate over (e.g., range(10))
 	Body          []Statement
 	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
@@ -318,32 +318,16 @@ type ReceiveLoopStmt struct {
 }
 
 func (r *ReceiveLoopStmt) String() string {
-	return fmt.Sprintf("@ %s, %s in %s { ... }", r.MessageVar, r.SenderVar, r.Address.String())
+	return fmt.Sprintf("for %s, %s in %s { ... }", r.MessageVar, r.SenderVar, r.Address.String())
 }
 
 func (r *ReceiveLoopStmt) statementNode() {}
-
-type LoopExpr struct {
-	// No explicit label - determined by nesting depth when created with @
-	Iterator      string      // Variable name (e.g., "i")
-	Iterable      Expression  // Expression to iterate over (e.g., range(10))
-	Body          []Statement // Body statements
-	MaxIterations int64       // Maximum allowed iterations (math.MaxInt64 for infinite)
-	NeedsMaxCheck bool        // Whether to emit runtime max iteration checking
-	NumThreads    int         // Number of threads for parallel execution (0 = sequential, -1 = all cores, N = specific count)
-	Reducer       *LambdaExpr // Optional reduction lambda for parallel loops: | a,b | { a + b }
-}
-
-func (l *LoopExpr) String() string {
-	return fmt.Sprintf("@ %s in %s { ... }", l.Iterator, l.Iterable.String())
-}
-func (l *LoopExpr) expressionNode() {}
 
 func (l *LoopStmt) String() string {
 	var out strings.Builder
 	// Show parallel prefix if NumThreads is set
 	if l.NumThreads == -1 {
-		out.WriteString("@@ ")
+		out.WriteString("|| ")
 	} else if l.NumThreads > 0 {
 		out.WriteString(fmt.Sprintf("%d @ ", l.NumThreads))
 	} else {
@@ -746,7 +730,8 @@ func (s *SliceExpr) expressionNode() {}
 type RangeExpr struct {
 	Start     Expression
 	End       Expression
-	Inclusive bool // true for ..=, false for ..<
+	Inclusive bool       // true for ..= and .., false for ..<
+	Step      Expression // optional step (0..100..10); nil means 1
 }
 
 func (r *RangeExpr) String() string {
@@ -754,7 +739,11 @@ func (r *RangeExpr) String() string {
 	if r.Inclusive {
 		op = "..="
 	}
-	return r.Start.String() + op + r.End.String()
+	s := r.Start.String() + op + r.End.String()
+	if r.Step != nil {
+		s += ".." + r.Step.String()
+	}
+	return s
 }
 func (r *RangeExpr) expressionNode() {}
 

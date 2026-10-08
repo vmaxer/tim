@@ -555,6 +555,9 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 				switch t := fc.getExprType(arg); t {
 				case "string":
 					fc.emitSyscallPrintTimString()
+				case "cstring":
+					fc.out.Cvttsd2si("rax", "xmm0")
+					fc.emitCStrWrite(1)
 				case "list", "map":
 					fc.emitSyscallPrintList(t == "map")
 				default:
@@ -563,8 +566,13 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 
 			case 's': // String
 				fc.compileExpression(arg)
-				// xmm0 contains Tim string pointer - print it
-				fc.emitSyscallPrintTimString()
+				if fc.isCFFIStringCall(arg) || fc.getExprType(arg) == "cstring" {
+					fc.out.Cvttsd2si("rax", "xmm0")
+					fc.emitCStrWrite(1)
+				} else {
+					// xmm0 contains Tim string pointer - print it
+					fc.emitSyscallPrintTimString()
+				}
 
 			case 'f', 'g': // Float
 				fc.compileExpression(arg)

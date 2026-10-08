@@ -272,7 +272,7 @@ func TestStrengthReductionInLoop(t *testing.T) {
 	t.Skip("Integer strength reduction disabled - infrastructure in place for future use")
 	source := `main = {
     sum := 0 as int32
-    @ i in 0..<10 {
+    for i in 0..<10 {
         sum += (i as int32) * 8    // Should be optimized to i << 3
     }
     println(sum)

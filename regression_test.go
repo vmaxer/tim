@@ -259,12 +259,12 @@ println(zs)
 println([7, 1 / 2] * 2)
 println([1, 2] + [3, 4])
 acc := [1]
-@ i in 0..<3 {
+for i in 0..<3 {
     acc <- acc + [i * 10]
 }
 println(acc)
 a := [1 / 3, 5, 9]
-@ i in 0..<3 {
+for i in 0..<3 {
     println(i)
     println(a[i] + 1)
 }
@@ -287,7 +287,7 @@ println(max(2 ** 70, 2 ** 70 + 1))
 println(min(-1, -1 / 2))
 n = 10 ** 20 / 10 ** 19
 t := 0
-@ i in 0..<n {
+for i in 0..<n {
     t <- t + i
 }
 println(t)

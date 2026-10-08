@@ -720,10 +720,6 @@ func (fc *TimCompiler) trackDependenciesInExpr(expr Expression) {
 		if e.DefaultExpr != nil {
 			fc.trackDependenciesInExpr(e.DefaultExpr)
 		}
-	case *LoopExpr:
-		for _, stmt := range e.Body {
-			fc.trackDependenciesInStatement(stmt)
-		}
 	case *ListExpr:
 		for _, elem := range e.Elements {
 			fc.trackDependenciesInExpr(elem)
@@ -916,7 +912,6 @@ func (fc *TimCompiler) compileInternal(program *Program, outputPath string, deps
 	fc.eb.Define("fmt_str", "%s\x00")
 	fc.eb.Define("fmt_int", "%ld\n\x00")
 	fc.eb.Define("fmt_float", "%.0f\n\x00") // Print float without decimal places
-	fc.eb.Define("_loop_max_exceeded_msg", "Error: loop exceeded maximum iterations\n\x00")
 	fc.eb.Define("_recursion_max_exceeded_msg", "Error: recursion exceeded maximum depth\n\x00")
 	fc.eb.Define("_null_ptr_msg", "ERROR: Null pointer dereference detected\n\x00")
 	fc.eb.Define("_bounds_negative_msg", "ERROR: Array index out of bounds (index < 0)\n\x00")
@@ -1696,12 +1691,13 @@ func (fc *TimCompiler) isExpressionPure(expr Expression, pureFunctions map[strin
 		}
 		return true
 	case *RangeExpr:
-		return fc.isExpressionPure(e.Start, pureFunctions) && fc.isExpressionPure(e.End, pureFunctions)
+		return fc.isExpressionPure(e.Start, pureFunctions) && fc.isExpressionPure(e.End, pureFunctions) &&
+			(e.Step == nil || fc.isExpressionPure(e.Step, pureFunctions))
 	case *LengthExpr:
 		return fc.isExpressionPure(e.Operand, pureFunctions)
 	case *InExpr:
 		return fc.isExpressionPure(e.Value, pureFunctions) && fc.isExpressionPure(e.Container, pureFunctions)
-	case *LoopExpr, *BlockExpr:
+	case *BlockExpr:
 		return false
 	default:
 		return false
@@ -2346,15 +2342,19 @@ func (fc *TimCompiler) compileSpawnStmt(stmt *SpawnStmt) {
 func (fc *TimCompiler) compileLoopStatement(stmt *LoopStmt) {
 	// Check if this is a parallel loop
 	if stmt.NumThreads != 0 {
-		// Parallel loop: @@ or N @
-		// Currently only range loops are supported for parallel execution
+		// Parallel loop: || x in ...
+		// Currently only plain range loops are supported for parallel execution
 		if rangeExpr, isRange := stmt.Iterable.(*RangeExpr); isRange {
-			fc.compileParallelRangeLoop(stmt, rangeExpr)
-		} else {
-			fmt.Fprintf(os.Stderr, "Error: Parallel loops currently only support range expressions (e.g., 0..<100)\n")
-			fmt.Fprintf(os.Stderr, "       List iteration with parallel loops not yet implemented\n")
-			os.Exit(1)
+			if rangeExpr.Step == nil {
+				fc.compileParallelRangeLoop(stmt, rangeExpr)
+				return
+			}
+			fc.compileRangeLoop(stmt, rangeExpr)
+			return
 		}
+		fmt.Fprintf(os.Stderr, "Error: Parallel loops currently only support range expressions (e.g., 0..<100)\n")
+		fmt.Fprintf(os.Stderr, "       List iteration with parallel loops not yet implemented\n")
+		os.Exit(1)
 		return
 	}
 
@@ -2528,6 +2528,8 @@ func (fc *TimCompiler) compileIfStatement(stmt *IfStmt) {
 }
 
 func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
+	step := rangeStepValue(rangeExpr)
+
 	// Fall back to scalar compilation
 	// REGISTER ALLOCATION OPTIMIZATION:
 	// Use rbx for loop counter, r12 for loop limit
@@ -2657,14 +2659,15 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 	fc.variables[stmt.Iterator] = iterOffset
 	fc.mutableVars[stmt.Iterator] = true
 
-	// Loop start label - this is where we jump back to
-	loopStartPos := fc.eb.text.Len()
-
-	// Reset iteration counter to 0 at loop start (critical for nested loops)
+	// Reset iteration counter to 0 at loop entry (the setup code re-runs each
+	// time an enclosing loop iterates, which keeps nested loops correct)
 	if stmt.NeedsMaxCheck {
 		fc.out.XorRegWithReg("rax", "rax")
 		fc.out.MovRegToMem("rax", "rbp", -iterationCountOffset)
 	}
+
+	// Loop start label - this is where we jump back to
+	loopStartPos := fc.eb.text.Len()
 
 	// Register this loop on the active loop stack
 	loopLabel := len(fc.activeLoops) + 1
@@ -2687,26 +2690,13 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 			fc.out.MovMemToReg("rax", "rbp", -iterationCountOffset)
 			// Load max iterations
 			fc.out.MovMemToReg("rcx", "rbp", -maxIterOffset)
-			// Compare: if iteration_count >= max_iterations, exceeded limit
+			// Compare: if iteration_count >= max_iterations, the limit caps the loop
 			fc.out.CmpRegToReg("rax", "rcx")
 
-			// Jump past error handling if not exceeded
-			notExceededJumpPos := fc.eb.text.Len()
-			fc.out.JumpConditional(JumpLess, 0) // Placeholder, will patch
-
-			// Exceeded max iterations - print error and exit
-			// printf("Error: Loop exceeded max iterations\n")
-			fc.out.LeaSymbolToReg("rdi", "_loop_max_exceeded_msg")
-			fc.callFunction("printf", "")
-
-			// exit(1)
-			fc.out.MovImmToReg("rdi", "1")
-			fc.callFunction("exit", "")
-
-			// Patch the jump to skip error handling
-			notExceededPos := fc.eb.text.Len()
-			notExceededOffset := int32(notExceededPos - (notExceededJumpPos + 6))
-			fc.patchJumpImmediate(notExceededJumpPos+2, notExceededOffset)
+			maxCheckJumpPos := fc.eb.text.Len()
+			fc.out.JumpConditional(JumpGreaterOrEqual, 0) // Placeholder
+			fc.activeLoops[len(fc.activeLoops)-1].EndPatches = append(
+				fc.activeLoops[len(fc.activeLoops)-1].EndPatches, maxCheckJumpPos+2)
 		}
 
 		// Increment iteration counter
@@ -2771,7 +2761,15 @@ func (fc *TimCompiler) compileRangeLoop(stmt *LoopStmt, rangeExpr *RangeExpr) {
 	}
 
 	// Increment loop counter
-	if useRegister {
+	if step != 1 {
+		if useRegister {
+			fc.out.AddImmToReg(counterReg, step)
+		} else {
+			fc.out.MovMemToReg("rax", "rbp", -counterOffset)
+			fc.out.AddImmToReg("rax", step)
+			fc.out.MovRegToMem("rax", "rbp", -counterOffset)
+		}
+	} else if useRegister {
 		fc.out.IncReg(counterReg) // Single instruction!
 	} else {
 		fc.out.MovMemToReg("rax", "rbp", -counterOffset)
@@ -3076,9 +3074,6 @@ func hasAtomicInExpr(expr Expression) bool {
 	case *BlockExpr:
 		// Check all statements in the block
 		return hasAtomicOperations(e.Statements)
-	case *LoopExpr:
-		// Check loop body
-		return hasAtomicOperations(e.Body)
 	}
 	return false
 }
@@ -3091,10 +3086,10 @@ func (fc *TimCompiler) compileParallelRangeLoop(stmt *LoopStmt, rangeExpr *Range
 	// Determine actual thread count
 	actualThreads := stmt.NumThreads
 	if actualThreads == -1 {
-		// @@ syntax: detect CPU cores at compile time
+		// || syntax: detect CPU cores at compile time
 		actualThreads = GetNumCPUCores()
 		if VerboseMode {
-			debugf("DEBUG: @@ resolved to %d CPU cores\n", actualThreads)
+			debugf("DEBUG: || resolved to %d CPU cores\n", actualThreads)
 		}
 	}
 
@@ -3110,7 +3105,7 @@ func (fc *TimCompiler) compileParallelRangeLoop(stmt *LoopStmt, rangeExpr *Range
 
 	if !startIsLit || !endIsLit {
 		fmt.Fprintf(os.Stderr, "Error: Parallel loops currently require constant range bounds\n")
-		fmt.Fprintf(os.Stderr, "       Example: @@ i in 0..<100 { } (not @@ i in start..<end)\n")
+		fmt.Fprintf(os.Stderr, "       Example: || i in 0..<100 { } (not || i in start..<end)\n")
 		fmt.Fprintf(os.Stderr, "       Dynamic ranges will be supported in a future version\n")
 		os.Exit(1)
 	}
@@ -3550,7 +3545,7 @@ func (fc *TimCompiler) compileListLoop(stmt *LoopStmt) {
 	fc.variables[stmt.Iterator] = iterOffset
 	fc.mutableVars[stmt.Iterator] = true
 
-	// A typed cstruct iterator (`@ b as Ball in balls`) makes the loop variable a
+	// A typed cstruct iterator (`for b as Ball in balls`) makes the loop variable a
 	// pointer to that struct, so record its type for field-access resolution —
 	// otherwise `b.field` reads at an unknown offset and silently yields 0. This
 	// mirrors the ARM64 backend (arm64_codegen.go).
@@ -3779,32 +3774,32 @@ func (fc *TimCompiler) isCFFIStringCall(expr Expression) bool {
 		return false
 	}
 
+	funcName := callExpr.Function
+
 	// Check if this is a namespaced C FFI function call (contains dot)
-	if !strings.Contains(callExpr.Function, ".") {
-		return false
-	}
-
-	// Extract namespace/alias and function name
-	parts := strings.Split(callExpr.Function, ".")
-	if len(parts) != 2 {
-		return false
-	}
-	alias := parts[0]
-	funcName := parts[1]
-
-	// Look up in parsed headers
-	// NOTE: cConstants is keyed by alias, not library name
-	// e.g., for "import sdl3 as sdl", the key is "sdl"
-	if nsHeader, exists := fc.cConstants[alias]; exists {
-		if funcSig, exists := nsHeader.Functions[funcName]; exists {
-			// Check if return type is char*
-			returnType := strings.TrimSpace(funcSig.ReturnType)
-			isCString := returnType == "char*" || returnType == "const char*"
-			if VerboseMode {
-				fmt.Fprintf(os.Stderr, "isCFFIStringCall: %s.%s -> %s (isCString=%v)\n", alias, funcName, returnType, isCString)
-			}
-			return isCString
+	if strings.Contains(funcName, ".") {
+		parts := strings.Split(funcName, ".")
+		if len(parts) != 2 {
+			return false
 		}
+		alias := parts[0]
+		funcName = parts[1]
+
+		// Look up in parsed headers
+		// NOTE: cConstants is keyed by alias, not library name
+		// e.g., for "import sdl3 as sdl", the key is "sdl"
+		if nsHeader, exists := fc.cConstants[alias]; exists {
+			if funcSig, exists := nsHeader.Functions[funcName]; exists {
+				// Check if return type is char*
+				returnType := strings.ReplaceAll(strings.TrimSpace(funcSig.ReturnType), " ", "")
+				if VerboseMode {
+					fmt.Fprintf(os.Stderr, "isCFFIStringCall: %s.%s -> %s\n", alias, funcName, returnType)
+				}
+				return returnType == "char*" || returnType == "constchar*"
+			}
+		}
+	} else if !callExpr.IsCFFI {
+		return false
 	}
 
 	// Fallback: use naming heuristics for common patterns
@@ -3868,6 +3863,9 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		}
 		return "number"
 	case *CallExpr:
+		if fc.isCFFIStringCall(e) {
+			return "cstring"
+		}
 		// Check if this is a C FFI call (namespace.function where namespace is a C import)
 		if strings.Contains(e.Function, ".") {
 			parts := strings.Split(e.Function, ".")
@@ -3880,10 +3878,10 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 					// Look up function signature
 					if constants, ok := fc.cConstants[alias]; ok {
 						if funcSig, found := constants.Functions[funcName]; found {
-							returnType := strings.TrimSpace(funcSig.ReturnType)
+							returnType := strings.ReplaceAll(strings.TrimSpace(funcSig.ReturnType), " ", "")
 
 							// Map C return types to Tim types
-							if returnType == "char*" || returnType == "const char*" {
+							if returnType == "char*" || returnType == "constchar*" {
 								return "cstring"
 							} else if isPointerType(returnType) {
 								return "cpointer"
@@ -4435,54 +4433,12 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		fc.out.DivsdXmm("xmm0", "xmm1")
 
 	case *BooleanExpr:
-		// Boolean: yes = {0: 1.0, 1: 1.0}, no = {0: 0.0, 1: 0.0}
-		// Marker at key 1 distinguishes booleans from numbers
-		// Allocate 40 bytes (count + 2 entries × (key + value))
-		// Layout: [count:8][key0:8][val0:8][key1:8][val1:8]
-		fc.trackFunctionCall("malloc")
-		fc.out.MovImmToReg("rdi", "40")
-		fc.eb.GenerateCallInstruction("malloc")
-
-		// rax now contains pointer to allocated map
+		// Booleans are the numbers 1 (yes) and 0 (no)
 		if e.Value {
-			// yes: count=2.0, key0=0, val0=1.0, key1=1, val1=1.0
-			fc.out.MovImmToReg("rcx", "2")
-			fc.out.Cvtsi2sd("xmm1", "rcx")
-			fc.out.MovXmmToMem("xmm1", "rax", 0) // count = 2.0
-
-			fc.out.XorRegWithReg("rcx", "rcx")
-			fc.out.MovRegToMem("rcx", "rax", 8) // key[0] = 0
-
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.Cvtsi2sd("xmm1", "rcx")
-			fc.out.MovXmmToMem("xmm1", "rax", 16) // value[0] = 1.0
-
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.MovRegToMem("rcx", "rax", 24) // key[1] = 1
-
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.Cvtsi2sd("xmm1", "rcx")
-			fc.out.MovXmmToMem("xmm1", "rax", 32) // value[1] = 1.0
+			fc.out.MovImmToReg("rax", "1")
 		} else {
-			// no: count=2.0, key0=0, val0=0.0, key1=1, val1=0.0
-			fc.out.MovImmToReg("rcx", "2")
-			fc.out.Cvtsi2sd("xmm1", "rcx")
-			fc.out.MovXmmToMem("xmm1", "rax", 0) // count = 2.0
-
-			fc.out.XorRegWithReg("rcx", "rcx")
-			fc.out.MovRegToMem("rcx", "rax", 8) // key[0] = 0
-
-			fc.out.XorpdXmm("xmm1", "xmm1")
-			fc.out.MovXmmToMem("xmm1", "rax", 16) // value[0] = 0.0
-
-			fc.out.MovImmToReg("rcx", "1")
-			fc.out.MovRegToMem("rcx", "rax", 24) // key[1] = 1
-
-			fc.out.XorpdXmm("xmm1", "xmm1")
-			fc.out.MovXmmToMem("xmm1", "rax", 32) // value[1] = 0.0
+			fc.out.XorRegWithReg("rax", "rax")
 		}
-
-		// Store the pointer in xmm0 (as float64)
 		fc.out.Cvtsi2sd("xmm0", "rax")
 
 	case *StringExpr:
@@ -5420,6 +5376,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		// Compile range expression by expanding it to a list
 		// 0..<10 becomes [0, 1, 2, ..., 9]
 		// 0..=10 becomes [0, 1, 2, ..., 10]
+		// 0..100..30 becomes [0, 30, 60, 90]
 
 		// Evaluate start and end expressions (must be compile-time constants for now)
 		startNum, startOk := e.Start.(*NumberExpr)
@@ -5431,17 +5388,18 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 
 		start := int64(startNum.Value)
 		end := int64(endNum.Value)
+		step := rangeStepValue(e)
 
 		// Build list of elements
 		var elements []Expression
 		if e.Inclusive {
 			// ..= includes end value
-			for i := start; i <= end; i++ {
+			for i := start; i <= end; i += step {
 				elements = append(elements, &NumberExpr{Value: float64(i)})
 			}
 		} else {
 			// ..< excludes end value
-			for i := start; i < end; i++ {
+			for i := start; i < end; i += step {
 				elements = append(elements, &NumberExpr{Value: float64(i)})
 			}
 		}
@@ -6356,20 +6314,6 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		// Load stack address into rax and convert to float64 for return
 		fc.out.MovRegToReg("rax", "rsp")
 		fc.out.Cvtsi2sd("xmm0", "rax")
-
-	case *LoopExpr:
-		// Loop expressions return a value (possibly through reduction)
-		// For now, we don't support parallel loop expressions with reducers
-		if e.NumThreads != 0 && e.Reducer != nil {
-			compilerError("parallel loop expressions with reducers not yet implemented")
-		}
-		if e.NumThreads != 0 {
-			compilerError("parallel loop expressions not yet implemented")
-		}
-
-		// For sequential loops, we need to accumulate results
-		// This is a simplified implementation - full support needs more work
-		compilerError("loop expressions (@ i in ... { expr }) not yet implemented as expressions")
 	}
 }
 
@@ -6642,12 +6586,7 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 		exprType := fc.getExprType(expr.Expr)
 		if exprType == "bool" {
 			// Convert boolean to C string ("true" or "false")
-			// xmm0 contains pointer to boolean map
-			// Extract value at key 0 to determine yes or no
-
-			fc.out.Cvttsd2si("rax", "xmm0")       // Convert pointer to integer
-			fc.out.MovMemToXmm("xmm1", "rax", 16) // Load value[0]
-			fc.out.Cvttsd2si("rcx", "xmm1")       // Convert to integer (1 for yes, 0 for no)
+			fc.out.Cvttsd2si("rcx", "xmm0") // 1 for yes, 0 for no
 
 			// Create "true" or "false" C string
 			trueLabel := fmt.Sprintf("bool_true_cstr_%d", fc.stringCounter)
@@ -6731,22 +6670,11 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 
 	case "cbool":
 		// Convert Tim boolean to C bool (true/false integer)
-		// xmm0 contains pointer to boolean map
-		fc.out.Cvttsd2si("rax", "xmm0")       // Convert pointer to integer
-		fc.out.MovMemToXmm("xmm1", "rax", 16) // Load value[0]
-		fc.out.Cvttsd2si("rax", "xmm1")       // Convert to integer (1 for yes, 0 for no)
-		// rax now has 1 or 0, convert back to float64 in xmm0
+		fc.out.Cvttsd2si("rax", "xmm0")
 		fc.out.Cvtsi2sd("xmm0", "rax")
 
 	case "num":
-		// Convert boolean to number (1.0 or 0.0)
-		exprType := fc.getExprType(expr.Expr)
-		if exprType == "bool" {
-			// Extract value[0] from boolean map
-			fc.out.Cvttsd2si("rax", "xmm0")       // Convert pointer to integer
-			fc.out.MovMemToXmm("xmm0", "rax", 16) // Load value[0] (1.0 or 0.0)
-		}
-		// else: already a number, no conversion needed
+		// Booleans are already the numbers 1.0/0.0
 
 	default:
 		// Unknown type - treat as type annotation (e.g., cstruct names)
@@ -12168,7 +12096,9 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 				"calloc":  {ReturnType: "void*", Params: []CFunctionParam{{Type: "size_t"}, {Type: "size_t"}}},
 				// Note: printf is variadic and can't be fully described here,
 				// but we can at least mark the format string as const char*
-				"printf": {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+				"printf":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+				"strerror": {ReturnType: "const char*", Params: []CFunctionParam{{Type: "int"}}},
+				"getenv":   {ReturnType: "const char*", Params: []CFunctionParam{{Type: "const char*"}}},
 			}
 			if sig, ok := commonFunctions[funcName]; ok {
 				funcSig = sig
@@ -13331,6 +13261,10 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 					fc.callFunction("_tim_string_print", "")
 				}
 				fc.deallocateShadowSpace(shadowSpace)
+			} else if argType == "cstring" {
+				fc.compileExpression(arg)
+				fc.out.Cvttsd2si("rax", "xmm0")
+				fc.emitCStrWrite(1)
 			} else if fstrExpr, ok := arg.(*FStringExpr); ok {
 				// F-string - compile it and print without newline
 				fc.compileExpression(fstrExpr)
@@ -13905,6 +13839,11 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			boolPositions := make(map[int]bool)
 			stringPositions := make(map[int]bool)
 			integerPositions := make(map[int]bool)
+
+			if fc.platform.OS != OSWindows {
+				fc.compileExitfSyscall(call, strExpr)
+				return
+			}
 
 			argPos := 0
 			var result strings.Builder
@@ -18170,6 +18109,9 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 	case *RangeExpr:
 		collectFunctionCallsWithParams(e.Start, calls, params)
 		collectFunctionCallsWithParams(e.End, calls, params)
+		if e.Step != nil {
+			collectFunctionCallsWithParams(e.Step, calls, params)
+		}
 	case *ListExpr:
 		for _, elem := range e.Elements {
 			collectFunctionCallsWithParams(elem, calls, params)
@@ -18215,14 +18157,6 @@ func collectFunctionCallsWithParams(expr Expression, calls map[string]bool, para
 		collectFunctionCallsWithParams(e.Operation, calls, params)
 	case *BackgroundExpr:
 		collectFunctionCallsWithParams(e.Expr, calls, params)
-	case *LoopExpr:
-		collectFunctionCallsWithParams(e.Iterable, calls, params)
-		for _, stmt := range e.Body {
-			collectFunctionCallsFromStmtWithParams(stmt, calls, params)
-		}
-		if e.Reducer != nil {
-			collectFunctionCallsWithParams(e.Reducer, calls, params)
-		}
 	case *StructLiteralExpr:
 		for _, fieldExpr := range e.Fields {
 			collectFunctionCallsWithParams(fieldExpr, calls, params)

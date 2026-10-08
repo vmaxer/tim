@@ -16,8 +16,8 @@ import (
 var compileExpectations = map[string]string{
 	"const":                  "cannot update immutable variable",
 	"lambda_bad_syntax_test": "lambda definitions must use '->'",
-	"parallel_sum":           "parallel loop expressions with reducers not yet implemented",
-	"snakegame":              "loop expressions (@ i in ... { expr }) not yet implemented",
+	"parallel_sum":           "unexpected '||' in expression",
+	"snakegame":              "loops are statements, not expressions",
 }
 
 // Programs to skip entirely (pre-existing failures, need investigation)

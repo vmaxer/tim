@@ -1076,7 +1076,13 @@ func (g *rvGen) rangeLoop(s *LoopStmt) error {
 	g.sc.loops = g.sc.loops[:len(g.sc.loops)-1]
 	g.bind(lp.cont)
 	g.ld(rvT0, rvS0, cnt)
-	g.addi(rvT0, rvT0, 1)
+	step := rangeStepValue(r)
+	if step <= 2047 {
+		g.addi(rvT0, rvT0, int32(step))
+	} else {
+		g.li(rvT1, step)
+		g.op(0, 0, rvT0, rvT0, rvT1)
+	}
 	g.sd(rvT0, rvS0, cnt)
 	g.j(top)
 	g.bind(lp.brk)

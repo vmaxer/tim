@@ -135,7 +135,7 @@ func TestFMAInLoop(t *testing.T) {
 	code := `
 		main = {
 			sum := 0.0
-			@ i in 0..<10 {
+			for i in 0..<10 {
 				a = i + 1.0
 				b = i + 2.0
 				c = i + 3.0
@@ -309,7 +309,7 @@ func BenchmarkFMA(b *testing.B) {
 	code := `
 		main = {
 			sum := 0.0
-			@ i in 0..1000 {
+			for i in 0..1000 {
 				a = i + 1.0
 				b = i + 2.0
 				c = i + 3.0
@@ -329,7 +329,7 @@ func BenchmarkSeparateOps(b *testing.B) {
 	code := `
 		main = {
 			sum := 0.0
-			@ i in 0..1000 {
+			for i in 0..1000 {
 				a = i + 1.0
 				b = i + 2.0
 				c = i + 3.0

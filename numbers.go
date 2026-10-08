@@ -77,6 +77,18 @@ func newExactNumber(r *big.Rat) *NumberExpr {
 	return &NumberExpr{Value: f, Exact: r}
 }
 
+// rangeStepValue returns the constant integer step of a range (1 when absent).
+func rangeStepValue(r *RangeExpr) int64 {
+	if r.Step == nil {
+		return 1
+	}
+	n, ok := r.Step.(*NumberExpr)
+	if !ok || n.Value != math.Trunc(n.Value) || n.Value < 1 {
+		compilerError("range step must be a positive integer constant")
+	}
+	return int64(n.Value)
+}
+
 // Rat returns the exact value, or false if the number is inexact.
 func (n *NumberExpr) Rat() (*big.Rat, bool) {
 	if n.Exact != nil {

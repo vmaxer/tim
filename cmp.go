@@ -10,7 +10,7 @@ import (
 // This is fundamental for implementing the Tim language's comparison operators:
 //   - Pattern matching guards: n <= 1 -> 1
 //   - Filter expressions: [x in rest]{x < pivot}
-//   - Loop conditions: @ entity in entities{health > 0}
+//   - Loop conditions: for entity in entities{health > 0}
 //   - Error guards: size > 0 or! "invalid size"
 //   - Boolean comparisons: ==, !=, >=, <=, >, <
 

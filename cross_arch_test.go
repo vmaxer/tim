@@ -28,15 +28,15 @@ bump(7)
 println(fib(20), loop(1000000, 0), count)
 `, "6765 500000 12\n"},
 	{"loops", `sum := 0
-@ i in 0..<10 {
+for i in 0..<10 {
     sum <- sum + i * i
 }
 n := 0
-@ n < 5 ! 100 {
+for n < 5 ! 100 {
     n <- n + 1
 }
 m := 0
-@ yes ! 3 {
+for yes ! 3 {
     m <- m + 1
 }
 println(sum, n, m)
@@ -45,13 +45,13 @@ println(sum, n, m)
 xs[0] <- 10
 ys := [0] * 3
 tot := 0
-@ v in xs {
+for v in xs {
     tot <- tot + v
 }
 println(xs, #xs, xs[9], ys, tot)
 `, "[10, 0.5, 36893488147419103232, 3] 4 0 [0, 0, 0] 36893488147419103245.5\n"},
 	{"strings", `s := "ab"
-@ k in 1..=3 {
+for k in 1..=3 {
     s <- s + (k as string)
 }
 g = y -> y {

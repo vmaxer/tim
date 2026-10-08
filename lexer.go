@@ -47,8 +47,10 @@ const (
 	TOKEN_TILDE           // ~
 	TOKEN_DEFAULT_ARROW   // ~>
 	TOKEN_AT              // @
-	TOKEN_AT_AT           // @@ (parallel loop with all cores)
+	TOKEN_AT_AT           // || (parallel loop with all cores)
 	TOKEN_AT_PLUSPLUS     // @++
+	TOKEN_AT_LABEL        // @1, @2, ... (loop label, digits attached)
+	TOKEN_FOR             // for (loop keyword)
 	TOKEN_IN              // in keyword
 	TOKEN_LBRACE          // {
 	TOKEN_RBRACE          // }
@@ -528,9 +530,7 @@ func (l *Lexer) NextToken() Token {
 		case "while":
 			return Token{Type: TOKEN_WHILE, Value: value, Line: l.line, Column: tokenColumn}
 		case "for":
-			// `for` is a full alias for `@`-loops: lexes to TOKEN_AT so every loop
-			// form (for-each, typed iterator, condition, parallel) works unchanged.
-			return Token{Type: TOKEN_AT, Value: value, Line: l.line, Column: tokenColumn}
+			return Token{Type: TOKEN_FOR, Value: value, Line: l.line, Column: tokenColumn}
 		case "malloc":
 			return Token{Type: TOKEN_MALLOC, Value: value, Line: l.line, Column: tokenColumn}
 		case "free":
@@ -830,7 +830,7 @@ func (l *Lexer) NextToken() Token {
 		l.pos++
 		return Token{Type: TOKEN_DOT, Value: ".", Line: l.line, Column: tokenColumn}
 	case '@':
-		// Check for @@ (parallel loop)
+		// Check for || (parallel loop)
 		if l.peek() == '@' {
 			l.pos += 2
 			return Token{Type: TOKEN_AT_AT, Value: "@@", Line: l.line, Column: tokenColumn}
@@ -839,6 +839,16 @@ func (l *Lexer) NextToken() Token {
 		if l.peek() == '+' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '+' {
 			l.pos += 3
 			return Token{Type: TOKEN_AT_PLUSPLUS, Value: "@++", Line: l.line, Column: tokenColumn}
+		}
+
+		// Loop label: @ followed immediately by digits (@1, @2, @42)
+		if l.peek() >= '0' && l.peek() <= '9' {
+			start := l.pos
+			l.pos++ // skip @
+			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+				l.pos++
+			}
+			return Token{Type: TOKEN_AT_LABEL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
 		}
 
 		// Check for special keywords: @first, @last, @counter, @i

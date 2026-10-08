@@ -16,7 +16,7 @@ func TestParallelPrograms(t *testing.T) {
 	}{
 		{
 			name: "parallel_simple",
-			source: `@@ i in 0..<4 {
+			source: `|| i in 0..<4 {
     println(i)
 }
 `,
@@ -24,7 +24,7 @@ func TestParallelPrograms(t *testing.T) {
 		},
 		{
 			name: "parallel_noop",
-			source: `@@ i in 0..<10 {
+			source: `|| i in 0..<10 {
 }
 `,
 			expected: "",

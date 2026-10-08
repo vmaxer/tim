@@ -141,7 +141,7 @@ printf("5 + 10 = %v\n", result)
 // TestLoopWithLabel tests simple loops
 func TestLoopWithLabel(t *testing.T) {
 	code := `
-@ i in 0..<3 {
+for i in 0..<3 {
 	printf("i=%v\n", i)
 }
 `
@@ -209,7 +209,7 @@ func TestInsertionSort(t *testing.T) {
 	code := `
 // Build a list using += append operator in a loop
 result := []
-@ i in 1..<9 {
+for i in 1..<9 {
 	result += i
 }
 
@@ -248,7 +248,7 @@ printf("Day 2: %s\n", result)
 func TestForInLoop(t *testing.T) {
 	code := `
 sum := 0
-@ i in 1..<6 {
+for i in 1..<6 {
 	sum += i
 }
 printf("Sum: %v\n", sum)

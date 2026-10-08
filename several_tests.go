@@ -166,16 +166,16 @@ height := 10
 printf("ASCII Pyramid (height %v):\n\n", height)
 
 // Draw pyramid
-@ i in 0..<height  ! 100000 {
+for i in 0..<height  ! 100000 {
     // Print spaces for centering
     spaces := height - i - 1
-    @ j in 0..<spaces  ! 100000 {
+    for j in 0..<spaces  ! 100000 {
         printf(" ")
     }
 
     // Print stars
     stars := 2 * i + 1
-    @ k in 0..<stars  ! 100000 {
+    for k in 0..<stars  ! 100000 {
         printf("*")
     }
 
@@ -185,17 +185,17 @@ printf("ASCII Pyramid (height %v):\n\n", height)
 printf("\nInverted Pyramid:\n\n")
 
 // Draw inverted pyramid
-@ i in 0..<height  ! 100000 {
+for i in 0..<height  ! 100000 {
     row := height - i - 1
 
     // Print spaces
-    @ j in 0..<i  ! 100000 {
+    for j in 0..<i  ! 100000 {
         printf(" ")
     }
 
     // Print stars
     numStars := 2 * row + 1
-    @ k in 0..<numStars  ! 100000 {
+    for k in 0..<numStars  ! 100000 {
         printf("*")
     }
 
@@ -287,7 +287,7 @@ ptr := malloc(8)
 atomic_store(ptr, 0)
 
 // Use sequential loop @ instead of parallel @@
-@ i in 0..<4 {
+for i in 0..<4 {
     old_val := atomic_add(ptr, 1)
 }
 
@@ -600,7 +600,7 @@ main ==> {
     // Basic cons operations
     list1 := 1 :: [2, 3, 4]
     printf("1 :: [2, 3, 4] = ")
-    @ item in list1 ! 100 {
+    for item in list1 ! 100 {
         printf("%v ", item)
     }
     printf("\n")
@@ -608,7 +608,7 @@ main ==> {
     // Multiple cons (right-associative)
     list2 := 1 :: 2 :: 3 :: []
     printf("1 :: 2 :: 3 :: [] = ")
-    @ item in list2 ! 100 {
+    for item in list2 ! 100 {
         printf("%v ", item)
     }
     printf("\n")
@@ -621,7 +621,7 @@ main ==> {
 
     countdown := build_list(5)
     printf("build_list(5) = ")
-    @ item in countdown ! 100 {
+    for item in countdown ! 100 {
         printf("%v ", item)
     }
     printf("\n")
@@ -630,7 +630,7 @@ main ==> {
     numbers := [10, 20, 30]
     extended := 0 :: numbers
     printf("0 :: [10, 20, 30] = ")
-    @ item in extended ! 100 {
+    for item in extended ! 100 {
         printf("%v ", item)
     }
     printf("\n")
@@ -641,7 +641,7 @@ main ==> {
     rest := &sample
     printf("head of [1, 2, 3, 4] = %v\n", first)
     printf("tail of [1, 2, 3, 4] = ")
-    @ item in rest ! 100 {
+    for item in rest ! 100 {
         printf("%v ", item)
     }
     printf("\n")
@@ -1205,7 +1205,7 @@ count := 20
 
 printf("Squares of first %v numbers:\n", count)
 
-@ i in 1..<(count + 1)  ! 100000 {
+for i in 1..<(count + 1)  ! 100000 {
     square := i * i
     sum <- sum + square
     printf("%v² = %v\n", i, square)
@@ -1255,26 +1255,26 @@ square := x => x * x
 isEven := x => (x % 2) == 0
 
 printf("Original list: ")
-@ n in numbers  ! 100000 {
+for n in numbers  ! 100000 {
     printf("%v ", n)
 }
 printf("\n")
 
 // Transform list elements
 printf("\nDoubled: ")
-@ n in numbers  ! 100000 {
+for n in numbers  ! 100000 {
     printf("%v ", double(n))
 }
 printf("\n")
 
 printf("Squared: ")
-@ n in numbers  ! 100000 {
+for n in numbers  ! 100000 {
     printf("%v ", square(n))
 }
 printf("\n")
 
 printf("Even numbers: ")
-@ n in numbers  ! 100000 {
+for n in numbers  ! 100000 {
     isEven(n) {
         printf("%v ", n)
     }
@@ -1284,7 +1284,7 @@ printf("\n")
 // Parallel transformation using built-in parallel map
 printf("\nParallel doubled: ")
 doubled := numbers | double
-@ n in doubled  ! 100000 {
+for n in doubled  ! 100000 {
     printf("%v ", n)
 }
 printf("\n")
@@ -1313,7 +1313,7 @@ printf("Collatz sequence starting from %v:\n", n)
 printf("%v ", n)
 
 // Apply Collatz rules until we reach 1
-@ i in 0..<1000  ! 5000 {
+for i in 0..<1000  ! 5000 {
     // Stop if we reached 1
     n == 1 {
         ret @1
@@ -1350,7 +1350,7 @@ factorial := (n, acc) => n <= 1 {
 
 // Calculate and display factorials
 printf("Factorials:\n")
-@ i in 1..<11  ! 100 {
+for i in 1..<11  ! 100 {
     result := factorial(i, 1)
     printf("%v! = %v\n", i, result)
 }
@@ -1403,7 +1403,7 @@ println(#ages)  // Should print 2
 
 // 7. Loops with @
 total := 0
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     total += i
 }
 println(total)  // Should print 10 (0+1+2+3+4)
@@ -1445,7 +1445,7 @@ b := 1.0
 printf("First %v Fibonacci numbers:\n", n)
 
 // Generate and print Fibonacci sequence
-@ i in 0..<n  ! 100000 {
+for i in 0..<n  ! 100000 {
     printf("%v ", a)
 
     // Calculate next Fibonacci number
@@ -1928,7 +1928,7 @@ div := (x, y) => x / y
 // Higher-order function: apply operation n times
 applyN := (fn, initial, count) => {
     result := initial
-    @ i in 0..<count ! 1000 {
+    for i in 0..<count ! 1000 {
         result <- fn(result)
     }
     result
@@ -2036,7 +2036,7 @@ println(result)
 			source: `// lambda_loop.tim - test calling stored lambda in a loop
 double := x => x * 2
 
-@ i in 0..<3  ! 30 {
+for i in 0..<3  ! 30 {
     result := double(i)
     println(result)
 }
@@ -2218,7 +2218,7 @@ println(last)
 			name: "list_iter_test",
 			source: `// list_iter_test.tim - test list iteration
 numbers := [10, 20, 30, 40, 50]
-@ num in numbers  ! 100000 {
+for num in numbers  ! 100000 {
     println(num)
 }
 `,
@@ -2342,7 +2342,7 @@ main ==> {
 			source: `// Test @ loop syntax (simplified from @)
 println("Testing @ loop syntax:")
 
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     println(i)
 }
 
@@ -2361,7 +2361,7 @@ Done!
 			name: "loop_break_test",
 			source: `// loop_break_test.tim - test @ loop syntax and @N jumps
 printf("Simple loop with @:\n")
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     printf("%.0f ", i)
 }
 printf("\n")
@@ -2374,7 +2374,7 @@ printf("\n")
 		{
 			name: "loop_mult",
 			source: `// loop_mult.tim - test loop variable in expression
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     x := i * 2
     println(x)
 }
@@ -2392,7 +2392,7 @@ printf("\n")
 println("Starting loop test")
 
 total := 0
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     println(i)
     total += i
 }
@@ -2413,7 +2413,7 @@ Loop done
 		{
 			name: "loop_test",
 			source: `// loop_test.tim - test basic loop
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     println(@i)
 }
 `,
@@ -2427,7 +2427,7 @@ Loop done
 		{
 			name: "loop_test2",
 			source: `// loop_test2.tim - test loop with 10 iterations
-@ i in 0..<10  ! 100 {
+for i in 0..<10  ! 100 {
     println(i)
     }
 `,
@@ -2445,12 +2445,12 @@ Loop done
 		},
 		{
 			name: "loop_unroll_test",
-			source: `@ i in 0..<4 {
+			source: `for i in 0..<4 {
     printf("iteration %g\n", i)
 }
 
 sum := 0
-@ i in 0..<5 {
+for i in 0..<5 {
     sum <- sum + i
 }
 printf("sum = %g\n", sum)
@@ -2466,7 +2466,7 @@ sum = 10
 			name: "loop_with_arithmetic",
 			source: `// loop_with_arithmetic.tim - test loops with arithmetic
 sum := 0
-@ i in 0..<5  ! 50 {
+for i in 0..<5  ! 50 {
     sum <- sum + i
 }
 println(sum)
@@ -2574,7 +2574,7 @@ update := (value, token) => {
 
 accumulator := 0
 
-@ token in program_tokens  ! 100000 {
+for token in program_tokens  ! 100000 {
     accumulator <- update(accumulator, token)
 }
 
@@ -2775,7 +2775,7 @@ println(#mapped)
 println("Testing empty range parallel loop")
 
 // Empty range: 0..<0
-@@ i in 0..<0 {
+|| i in 0..<0 {
     println("Should not execute")
 }
 
@@ -2793,7 +2793,7 @@ println("Testing large range parallel loop")
 // Just iterate through a large range without side effects
 // This tests that parallel loops can handle many iterations
 count := 0
-@@ i in 0..<10000 {
+|| i in 0..<10000 {
     // Empty loop body - just testing that it completes
 }
 
@@ -2809,7 +2809,7 @@ Large range test PASSED
 numbers = [1, 2, 3, 4, 5]
 doubled = numbers || x => x * 2
 
-@ val in doubled  ! 100000 {
+for val in doubled  ! 100000 {
     println(val)
 }
 
@@ -2884,7 +2884,7 @@ println(doubled[0])
 			source: `// parallel_test.tim - test parallel operator
 numbers = [1, 2, 3, 4, 5]
 doubled = numbers || x => x * 2
-@ val in doubled  ! 100000 {
+for val in doubled  ! 100000 {
     println(val)
 }
 `,
@@ -3199,7 +3199,7 @@ N := 100
 primes := [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97]
 
 // Display primes
-@ prime in primes  ! 100000 {
+for prime in primes  ! 100000 {
     printf("%v ", prime)
 }
 
@@ -3467,7 +3467,7 @@ printf("  cube(3) = %v\n\n", cube(3.0))
 // 7. Loops
 printf("→ Loops\n")
 printf("  First 3 primes: ")
-@ p in [2.0, 3.0, 5.0]  ! 100000 {
+for p in [2.0, 3.0, 5.0]  ! 100000 {
     printf("%v ", p)
 }
 printf("\n\n")

@@ -11,7 +11,7 @@ import (
 //   - Pattern matching: n <= 1 -> 1; ~> n * me(n - 1)
 //   - Error handling: x or! "error message"
 //   - Guard expressions: x or return y
-//   - Loop filtering: @ entity in entities{health > 0}
+//   - Loop filtering: for entity in entities{health > 0}
 //   - Default patterns: ~> (catch-all)
 
 // Condition codes for jumps

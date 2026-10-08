@@ -4224,7 +4224,7 @@ func (acg *ARM64CodeGen) compileLoopStatement(stmt *LoopStmt) error {
 	return acg.compileListLoop(stmt)
 }
 
-// compileWhileStatement compiles `while cond { body }` (and the `@ cond ! N`
+// compileWhileStatement compiles `while cond { body }` (and the `for cond ! N`
 // condition-loop form): evaluate the condition each iteration, run the body while
 // it is non-zero. Supports break (`ret @`/`break`) and continue, with the same
 // sp save/restore as range loops so a break out of a partially-pushed expression
@@ -4321,8 +4321,10 @@ func (acg *ARM64CodeGen) compileWhileStatement(stmt *WhileStmt) error {
 	return nil
 }
 
-// compileRangeExprLoop compiles a range expression loop (@ i in 1..<10 { ... })
+// compileRangeExprLoop compiles a range expression loop (for i in 1..<10 { ... })
 func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeExpr) error {
+	step := rangeStepValue(rangeExpr)
+
 	// Increment label counter for uniqueness
 	acg.labelCounter++
 
@@ -4463,13 +4465,13 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 		acg.patchJumpOffset(patchPos, offset)
 	}
 
-	// Increment iterator (add 1.0 to float64 value)
+	// Increment iterator (add step to float64 value)
 	offset = int32(16 + iterOffset - 8)
 	if err := acg.out.LdrImm64Double("d0", "x29", offset); err != nil {
 		return err
 	}
-	// Load 1.0 into d1
-	if err := acg.out.MovImm64("x0", 1); err != nil {
+	// Load step into d1
+	if err := acg.out.MovImm64("x0", uint64(step)); err != nil {
 		return err
 	}
 	// scvtf d1, x0
@@ -4509,7 +4511,7 @@ func (acg *ARM64CodeGen) compileRangeExprLoop(stmt *LoopStmt, rangeExpr *RangeEx
 	return nil
 }
 
-// compileListLoop compiles a list iteration loop (@ elem in [1,2,3] { ... })
+// compileListLoop compiles a list iteration loop (for elem in [1,2,3] { ... })
 func (acg *ARM64CodeGen) compileListLoop(stmt *LoopStmt) error {
 	// Increment label counter for uniqueness
 	acg.labelCounter++
@@ -4562,7 +4564,7 @@ func (acg *ARM64CodeGen) compileListLoop(stmt *LoopStmt) error {
 	iterOffset := acg.stackSize
 	acg.stackVars[stmt.Iterator] = iterOffset
 
-	// A cstruct-typed iterator (`@ b as Ball in ...`) lets the body read b.field
+	// A cstruct-typed iterator (`for b as Ball in ...`) lets the body read b.field
 	// directly without a per-iteration `b = elem as Ball` cast.
 	if _, isStruct := acg.cstructs[stmt.IteratorType]; isStruct {
 		acg.varCStructType[stmt.Iterator] = stmt.IteratorType

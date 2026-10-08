@@ -220,6 +220,9 @@ func foldConstantExpr(expr Expression) Expression {
 		// Fold range start and end
 		e.Start = foldConstantExpr(e.Start)
 		e.End = foldConstantExpr(e.End)
+		if e.Step != nil {
+			e.Step = foldConstantExpr(e.Step)
+		}
 		return e
 
 	case *ListExpr:
@@ -782,6 +785,9 @@ func strengthReduceExpr(expr Expression) Expression {
 	case *RangeExpr:
 		e.Start = strengthReduceExpr(e.Start)
 		e.End = strengthReduceExpr(e.End)
+		if e.Step != nil {
+			e.Step = strengthReduceExpr(e.Step)
+		}
 		return e
 
 	case *MatchExpr:
@@ -800,13 +806,6 @@ func strengthReduceExpr(expr Expression) Expression {
 	case *BlockExpr:
 		for i, stmt := range e.Statements {
 			e.Statements[i] = strengthReduceStmt(stmt)
-		}
-		return e
-
-	case *LoopExpr:
-		e.Iterable = strengthReduceExpr(e.Iterable)
-		for i, stmt := range e.Body {
-			e.Body[i] = strengthReduceStmt(stmt)
 		}
 		return e
 
@@ -954,6 +953,9 @@ func propagateConstantsExpr(expr Expression, constMap map[string]*NumberExpr) Ex
 	case *RangeExpr:
 		e.Start = propagateConstantsExpr(e.Start, constMap)
 		e.End = propagateConstantsExpr(e.End, constMap)
+		if e.Step != nil {
+			e.Step = propagateConstantsExpr(e.Step, constMap)
+		}
 		return e
 
 	case *ListExpr:
@@ -1070,6 +1072,9 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 	case *RangeExpr:
 		collectUsedVariablesExpr(e.Start, usedVars)
 		collectUsedVariablesExpr(e.End, usedVars)
+		if e.Step != nil {
+			collectUsedVariablesExpr(e.Step, usedVars)
+		}
 	case *ListExpr:
 		for _, elem := range e.Elements {
 			collectUsedVariablesExpr(elem, usedVars)
@@ -1176,10 +1181,6 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 			collectUsedVariables(stmt, usedVars)
 		}
 		for _, stmt := range e.RISCV64Block {
-			collectUsedVariables(stmt, usedVars)
-		}
-	case *LoopExpr:
-		for _, stmt := range e.Body {
 			collectUsedVariables(stmt, usedVars)
 		}
 	case *LoopStateExpr:

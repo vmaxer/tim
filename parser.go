@@ -826,6 +826,8 @@ func (p *Parser) parseAliasStmt() *AliasStmt {
 	// Validate that target is a valid keyword or operator
 	validTargets := map[TokenType]bool{
 		TOKEN_AT: true, TOKEN_IN: true, TOKEN_RET: true, TOKEN_ERR: true,
+		TOKEN_FOR: true, TOKEN_FOREACH: true, TOKEN_WHILE: true,
+		TOKEN_BREAK: true, TOKEN_CONTINUE: true,
 		TOKEN_UNSAFE: true, TOKEN_ARENA: true, TOKEN_DEFER: true,
 		TOKEN_INF: true, TOKEN_AND: true, TOKEN_OR: true,
 		TOKEN_NOT: true, TOKEN_XOR: true, TOKEN_AT_PLUSPLUS: true,
@@ -1282,27 +1284,19 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseJumpStatement()
 	}
 
-	// Check for @++ (continue current loop)
-	if p.current.Type == TOKEN_AT_PLUSPLUS {
+	// Parallel loop: || x in collection { ... }
+	if p.current.Type == TOKEN_PIPEPIPE && p.peek.Type == TOKEN_IDENT {
 		return p.parseLoopStatement()
 	}
 
-	// Check for parallel loops: @@ or N @
-	if p.current.Type == TOKEN_AT_AT {
-		// @@ means parallel loop with all cores
-		return p.parseLoopStatement()
+	// Loops start with 'for'; '@' only marks loop labels (ret @, break @1)
+	if p.current.Type == TOKEN_AT || p.current.Type == TOKEN_AT_LABEL ||
+		p.current.Type == TOKEN_AT_AT || p.current.Type == TOKEN_AT_PLUSPLUS {
+		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' is only for loop labels like ret @1")
+		return nil
 	}
 
-	// Check for N @ (parallel loop with N threads)
-	if p.current.Type == TOKEN_NUMBER && p.peek.Type == TOKEN_AT {
-		// This is N @ syntax for parallel loops
-		return p.parseLoopStatement()
-	}
-
-	// Check for @ (loop)
-
-	// Check for @ (either loop @N, loop @ ident, or jump @N)
-	if p.current.Type == TOKEN_AT {
+	if p.current.Type == TOKEN_FOR {
 		return p.parseLoopStatement()
 	}
 
@@ -1686,6 +1680,9 @@ func (p *Parser) parseFunDefinition(recvType string) Statement {
 		ParamCStructTypes: paramTypes,
 		VariadicParam:     variadic,
 		Body:              body,
+	}
+	if variadic != "" {
+		p.error("variadic functions are not yet supported")
 	}
 	return &AssignStmt{Name: name, Value: lambda}
 }
@@ -2589,9 +2586,7 @@ func (p *Parser) parseMatchClause() (*MatchClause, bool) {
 	// - identifier <- or identifier = (assignment statements)
 	isStatementToken := p.current.Type == TOKEN_RET ||
 		p.current.Type == TOKEN_ERR ||
-		p.current.Type == TOKEN_AT_PLUSPLUS ||
 		p.current.Type == TOKEN_LBRACE ||
-		(p.current.Type == TOKEN_AT && p.peek.Type == TOKEN_NUMBER) ||
 		(p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS))
 
 	if isStatementToken {
@@ -2699,13 +2694,9 @@ func (p *Parser) parseMatchTarget() Expression {
 		label := 0 // 0 means return from function
 		var value Expression
 
-		// Check for optional @N
-		if p.current.Type == TOKEN_AT {
-			p.nextToken() // skip '@'
-			if p.current.Type != TOKEN_NUMBER {
-				p.error("expected number after @ in ret statement")
-			}
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
+		// Check for optional label
+		if p.current.Type == TOKEN_AT_LABEL {
+			labelNum, err := strconv.ParseFloat(p.current.Value[1:], 64)
 			if err != nil {
 				p.error("invalid loop label number")
 			}
@@ -2713,7 +2704,10 @@ func (p *Parser) parseMatchTarget() Expression {
 			if label < 1 {
 				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
 			}
-			p.nextToken() // skip number
+			p.nextToken() // skip label
+		} else if p.current.Type == TOKEN_AT {
+			label = -1
+			p.nextToken() // skip '@'
 		}
 
 		// Check for optional value (stop at ~> or _ =>)
@@ -2735,37 +2729,6 @@ func (p *Parser) parseMatchTarget() Expression {
 
 		// Return a JumpExpr with IsBreak semantics (ret exits loop)
 		return &JumpExpr{Label: label, Value: value, IsBreak: true}
-	case TOKEN_AT_PLUSPLUS:
-		if p.loopDepth < 1 {
-			p.error("@++ requires at least 1 loop")
-		}
-		p.nextToken() // skip '@++'
-		// Check for optional return value: @++ value
-		var value Expression
-		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			value = p.parseExpression()
-			p.nextToken()
-		}
-		return &JumpExpr{Label: p.loopDepth, Value: value, IsBreak: false}
-	case TOKEN_AT:
-		p.nextToken() // skip '@'
-		if p.current.Type != TOKEN_NUMBER {
-			p.error("expected number after @ in match block")
-		}
-		labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-		if err != nil {
-			p.error("invalid label number")
-		}
-		label := int(labelNum)
-		p.nextToken() // skip label number
-		// Check for optional return value: @N value
-		var value Expression
-		if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			value = p.parseExpression()
-			p.nextToken()
-		}
-		// @N is continue (jump to top of loop N), not break
-		return &JumpExpr{Label: label, Value: value, IsBreak: false}
 	case TOKEN_IDENT:
 		// Check if this is an assignment statement (x <- value or x = value)
 		if p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS {
@@ -2802,718 +2765,251 @@ func (p *Parser) parseMatchTarget() Expression {
 	}
 }
 
-func (p *Parser) parseLoopStatement() Statement {
-	// Handle @++ token (continue current loop)
-	if p.current.Type == TOKEN_AT_PLUSPLUS {
-		// @++ means continue current loop (jump to @N where N is current loop depth)
-		if p.loopDepth < 1 {
-			p.error("@++ requires at least 1 loop")
+func (p *Parser) parseLoopBody(label int) []Statement {
+	oldDepth := p.loopDepth
+	p.loopDepth = label
+	defer func() { p.loopDepth = oldDepth }()
+
+	for p.peek.Type == TOKEN_NEWLINE {
+		p.nextToken()
+	}
+	var body []Statement
+	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
+		p.nextToken()
+		if p.current.Type == TOKEN_NEWLINE {
+			continue
 		}
-		// @++ is continue semantics (not break)
-		return &JumpStmt{IsBreak: false, Label: p.loopDepth, Value: nil}
+		stmt := p.parseStatement()
+		if stmt != nil {
+			body = append(body, stmt)
+		}
+	}
+	if p.peek.Type != TOKEN_RBRACE {
+		p.error("expected '}' at end of loop body")
+	} else {
+		p.nextToken()
+	}
+	return body
+}
+
+func (p *Parser) enterLoopBody(label int) []Statement {
+	for p.peek.Type == TOKEN_NEWLINE {
+		p.nextToken()
+	}
+	if p.peek.Type != TOKEN_LBRACE {
+		p.error("expected '{' to start loop body")
+		return nil
+	}
+	p.nextToken()
+	return p.parseLoopBody(label)
+}
+
+func (p *Parser) parseIterationBound() int64 {
+	if p.current.Type == TOKEN_INF {
+		return math.MaxInt64
+	}
+	if p.current.Type == TOKEN_NUMBER {
+		maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
+		if err != nil || maxInt < 1 {
+			p.error("iteration bound must be a positive integer or 'inf'")
+		}
+		return maxInt
+	}
+	p.error("expected number or 'inf' after '!' bound")
+	return math.MaxInt64
+}
+
+func (p *Parser) loopRangeMaxIterations(rangeExpr *RangeExpr) (int64, bool) {
+	startVal, startOk := rangeExpr.Start.(*NumberExpr)
+	endVal, endOk := rangeExpr.End.(*NumberExpr)
+	if !startOk || !endOk {
+		return math.MaxInt64, true
+	}
+	start := int64(startVal.Value)
+	end := int64(endVal.Value)
+	if rangeExpr.Inclusive {
+		end++
+	}
+	step := int64(1)
+	if rangeExpr.Step != nil {
+		if stepVal, stepOk := rangeExpr.Step.(*NumberExpr); stepOk && int64(stepVal.Value) > 0 {
+			step = int64(stepVal.Value)
+		}
+	}
+	return max((end-start+step-1)/step, 0), false
+}
+
+func (p *Parser) parseLoopStatement() Statement {
+	numThreads := 0
+	if p.current.Type == TOKEN_PIPEPIPE {
+		numThreads = -1
+		p.nextToken()
+	} else if p.current.Type == TOKEN_FOR {
+		p.nextToken()
+	} else {
+		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' is only for loop labels like ret @1")
+		return nil
+	}
+	for p.current.Type == TOKEN_NEWLINE {
+		p.nextToken()
 	}
 
-	// Parse parallel loop prefix: @@ or N @
-	numThreads := 0 // 0 = sequential, -1 = all cores, N = specific count
 	label := p.loopDepth + 1
 
-	// Handle @@ token (parallel loop with all cores)
-	if p.current.Type == TOKEN_AT_AT {
-		numThreads = -1
-		p.nextToken() // skip '@@'
-
-		// Skip newlines after '@@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// After @@, fall through to identifier parsing below
-		// (we'll add the parsing code after the TOKEN_AT block)
-	} else if p.current.Type == TOKEN_NUMBER {
-		// Handle N @ syntax (parallel loop with N threads)
-		threadCount, err := strconv.Atoi(p.current.Value)
-		if err != nil || threadCount < 1 {
-			p.error("thread count must be a positive integer")
-		}
-		numThreads = threadCount
-		p.nextToken() // skip number
-
-		// Expect @ token after the number
-		if p.current.Type != TOKEN_AT {
-			p.error("expected @ after thread count")
-		}
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// After N @, fall through to identifier parsing below
-	} else if p.current.Type == TOKEN_AT {
-		// Handle @ token (start loop at @(N+1))
-		// @ means start a loop at @(N+1) where N is current loop depth
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Check if this is @N (numbered loop) or @ ident (simple loop)
-		// But also check for condition loop: @ NUMBER max N { }
-		if p.current.Type == TOKEN_NUMBER {
-			// Check if this is a condition loop: @ NUMBER ...
-			// If peek is 'max', it's a condition loop.
-			// If peek is an operator, it's likely a condition expression starting with a number.
-			isOp := p.peek.Type == TOKEN_GT || p.peek.Type == TOKEN_LT ||
-				p.peek.Type == TOKEN_GE || p.peek.Type == TOKEN_LE ||
-				p.peek.Type == TOKEN_EQ || p.peek.Type == TOKEN_NE ||
-				p.peek.Type == TOKEN_PLUS || p.peek.Type == TOKEN_MINUS ||
-				p.peek.Type == TOKEN_STAR || p.peek.Type == TOKEN_SLASH ||
-				p.peek.Type == TOKEN_MOD || p.peek.Type == TOKEN_AND ||
-				p.peek.Type == TOKEN_OR || p.peek.Type == TOKEN_XOR ||
-				p.peek.Type == TOKEN_AMP_B || p.peek.Type == TOKEN_PIPE_B ||
-				p.peek.Type == TOKEN_CARET_B || p.peek.Type == TOKEN_LTLT_B ||
-				p.peek.Type == TOKEN_GTGT_B
-
-			if p.peek.Type != TOKEN_BANG && !isOp {
-				// This is @N jump syntax, handle it in the jump statement section
-				p.current.Type = TOKEN_AT // restore token type
-				goto handleJump
-			}
-			// Otherwise, fall through to condition loop parsing below
-		}
-
-		// Check for infinite loop syntax: @ { ... }
-		if p.current.Type == TOKEN_LBRACE {
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			// Check for optional '!' bound clause after the loop body
-			var maxIterations int64 = math.MaxInt64
-			needsMaxCheck := true
-
-			if p.peek.Type == TOKEN_BANG {
-				p.nextToken() // advance to '!'
-				p.nextToken() // skip '!'
-
-				// Parse iteration bound: either a number or 'inf'
-				if p.current.Type == TOKEN_INF {
-					maxIterations = math.MaxInt64
-					p.nextToken()
-				} else if p.current.Type == TOKEN_NUMBER {
-					maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-					if err != nil || maxInt < 1 {
-						p.error("iteration bound must be a positive integer or 'inf'")
-					}
-					maxIterations = maxInt
-					p.nextToken()
-				} else {
-					p.error("expected number or 'inf' after '!' bound")
-				}
-			}
-
-			// Create synthetic range 0..<limit with max for infinite loop
-			return &LoopStmt{
-				Iterator:      "_",
-				Iterable:      &RangeExpr{Start: &NumberExpr{Value: 0}, End: &NumberExpr{Value: 1000000}},
-				Body:          body,
-				MaxIterations: maxIterations,
-				NeedsMaxCheck: needsMaxCheck,
-				NumThreads:    numThreads,
-			}
-		}
-
-		// At this point, we need to determine the loop type:
-		// 1. @ ident in expr { } - for-each loop
-		// 2. @ ident, ident in expr { } - receive loop
-		// 3. @ expr max N { } - condition loop
-
-		// Check for condition loop: if we don't have an identifier followed by 'in' or ','
-		// then it's a condition expression
-		isConditionLoop := false
-		if p.current.Type != TOKEN_IDENT {
-			// Not an identifier, must be start of condition expression (or error)
-			isConditionLoop = true
-		} else {
-			// Have identifier - check what comes after. `in` (for-each), `,`
-			// (receive loop), or a type annotation `as`/`:` (typed iterator,
-			// `@ b as Ball in ...` / `@ b: Ball in ...`) all mean a for-each/receive
-			// loop; anything else is a condition loop.
-			if p.peek.Type != TOKEN_IN && p.peek.Type != TOKEN_COMMA && p.peek.Type != TOKEN_AS && p.peek.Type != TOKEN_COLON {
-				// Not followed by 'in', ',', 'as', or ':' - must be condition loop
-				isConditionLoop = true
-			}
-		}
-
-		if isConditionLoop {
-			// Condition loop: @ expr ! N { ... }
-			// Set flag to prevent parsePrimary from consuming the '!' bound as a
-			// recursion limit, and to let parsePostfix leave the '!' unconsumed.
-			oldInConditionLoop := p.inConditionLoop
-			p.inConditionLoop = true
-			defer func() { p.inConditionLoop = oldInConditionLoop }()
-
-			// Parse the condition expression using parseComparison
-			// This handles comparisons (i < 5), function calls (check()), etc.
-			// but avoids match block parsing that would consume the { token
-			condition := p.parseComparison()
-
-			// After parsing postfix expression, peek should be on '!'
-			if p.peek.Type != TOKEN_BANG {
-				p.error("condition loop requires '!' bound clause (e.g., @ n < 5 ! 10 { ... })")
-			}
-
-			p.nextToken() // move to '!'
-			p.nextToken() // skip '!', now current is on the number/inf
-
-			// Parse iteration bound: either a number or 'inf'
-			var maxIterations int64
-			if p.current.Type == TOKEN_INF {
-				maxIterations = math.MaxInt64
-				p.nextToken() // skip 'inf'
-			} else if p.current.Type == TOKEN_NUMBER {
-				maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-				if err != nil || maxInt < 1 {
-					p.error("iteration bound must be a positive integer or 'inf'")
-				}
-				maxIterations = maxInt
-				p.nextToken() // skip number
-			} else {
-				p.error("expected number or 'inf' after '!' bound")
-			}
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start loop body")
-			}
-
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			// Return a WhileStmt for condition-based loops
-			return &WhileStmt{
-				Condition:     condition,
-				Body:          body,
-				MaxIterations: maxIterations,
-				NumThreads:    numThreads,
-			}
-		}
-
-		// For-each or receive loop - we have an identifier
-		firstIdent := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Optional type annotation on the loop variable: `@ b as Ball in ...` or
-		// the `:` shorthand `@ b: Ball in ...`. The runtime value is still a
-		// float64; for a cstruct type this lets the body access `b.field` directly.
-		iteratorType := ""
-		if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
-			p.nextToken() // skip 'as' / ':'
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected type name after type annotation in loop variable")
-			}
-			iteratorType = p.current.Value
-			p.nextToken() // skip type name
-		}
-
-		// Check if this is a receive loop: @ msg, from in ":5000"
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip comma
-
-			// Skip newlines after comma
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect second identifier
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected identifier after comma in receive loop")
-			}
-			secondIdent := p.current.Value
-			p.nextToken() // skip second identifier
-
-			// Expect 'in' keyword
-			if p.current.Type != TOKEN_IN {
-				p.error("expected 'in' in receive loop")
-			}
-			p.nextToken() // skip 'in'
-
-			// Parse address expression
-			address := p.parseExpression()
-
-			// Expect opening brace for body
-			if p.peek.Type != TOKEN_LBRACE {
-				p.error("expected '{' after receive loop address")
-			}
-			p.nextToken() // move to '{'
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Consume closing brace
-			if p.peek.Type == TOKEN_RBRACE {
-				p.nextToken() // move to '}'
-			}
-
-			return &ReceiveLoopStmt{
-				MessageVar: firstIdent,
-				SenderVar:  secondIdent,
-				Address:    address,
-				Body:       body,
-			}
-		}
-
-		// Check if this is a for-each loop (@ i in list) or a condition loop (@ i < 5)
-		if p.current.Type == TOKEN_IN {
-			// For-each loop: @ identifier in expression
-			iterator := firstIdent
-			p.nextToken() // skip 'in'
-
-			// Parse iterable expression. Set inConditionLoop so a trailing '!'
-			// bound is left unconsumed by parsePostfix and not eaten as a
-			// recursion limit on a call iterable (e.g. "@ msg in read_channel() ! inf").
-			oldILH := p.inConditionLoop
-			p.inConditionLoop = true
-			iterable := p.parseExpression()
-			p.inConditionLoop = oldILH
-
-			// Determine max iterations and whether runtime checking is needed
-			var maxIterations int64
-			needsRuntimeCheck := false
-
-			// Check if '!' bound is present
-			if p.peek.Type == TOKEN_BANG {
-				p.nextToken() // advance to '!'
-				p.nextToken() // skip '!'
-
-				// Explicit bound always requires runtime checking
-				needsRuntimeCheck = true
-
-				// Parse iteration bound: either a number or 'inf'
-				if p.current.Type == TOKEN_INF {
-					maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-					p.nextToken()                 // skip 'inf'
-				} else if p.current.Type == TOKEN_NUMBER {
-					// Parse the number
-					maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-					if err != nil || maxInt < 1 {
-						p.error("iteration bound must be a positive integer or 'inf'")
-					}
-					maxIterations = maxInt
-					p.nextToken() // skip number
-				} else {
-					p.error("expected number or 'inf' after '!' bound")
-				}
-			} else {
-				// No explicit bound - check if we can determine iteration count at compile time
-				if rangeExpr, ok := iterable.(*RangeExpr); ok {
-					// Try to calculate max from range: end - start
-					startVal, startOk := rangeExpr.Start.(*NumberExpr)
-					endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-					if startOk && endOk {
-						// Literal range - known at compile time, no runtime check needed
-						start := int64(startVal.Value)
-						end := int64(endVal.Value)
-						maxIterations = max(end-start, 0)
-						needsRuntimeCheck = false
-					} else {
-						// Non-literal range bound (`0..<n`): the loop compares the
-						// iterator against the runtime end each step, so it always
-						// terminates — no separate safety cap needed.
-						maxIterations = math.MaxInt64
-						needsRuntimeCheck = false
-					}
-				} else if listExpr, ok := iterable.(*ListExpr); ok {
-					// List literal - known at compile time, no runtime check needed
-					maxIterations = int64(len(listExpr.Elements))
-					needsRuntimeCheck = false
-				} else if _, ok := iterable.(*IdentExpr); ok {
-					// Variable (could be a list or map) - use runtime length check
-					maxIterations = math.MaxInt64 // Use max value, will check length at runtime
-					needsRuntimeCheck = true
-				} else if _, ok := iterable.(*IndexExpr); ok {
-					// Indexed expression (e.g., lists[0]) - use runtime length check
-					maxIterations = math.MaxInt64
-					needsRuntimeCheck = true
-				} else {
-					// Not a range expression or list literal, require explicit max
-					p.error("loop requires 'max' clause (or use range expression like 0..<10 or list literal)")
-				}
-				// Advance to next token after iterable expression
-				p.nextToken()
-			}
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start loop body")
-			}
-
-			// Skip newlines after '{'
-			for p.peek.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Track loop depth for nested loops
-			oldDepth := p.loopDepth
-			p.loopDepth = label
-			defer func() { p.loopDepth = oldDepth }()
-
-			// Parse loop body
-			var body []Statement
-			for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-				p.nextToken()
-				if p.current.Type == TOKEN_NEWLINE {
-					continue
-				}
-				stmt := p.parseStatement()
-				if stmt != nil {
-					body = append(body, stmt)
-				}
-			}
-
-			// Expect and consume '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of loop body")
-			}
-			p.nextToken() // consume the '}'
-
-			return &LoopStmt{
-				Iterator:      iterator,
-				IteratorType:  iteratorType,
-				Iterable:      iterable,
-				Body:          body,
-				MaxIterations: maxIterations,
-				NeedsMaxCheck: needsRuntimeCheck,
-				NumThreads:    numThreads,
-			}
-		}
-	}
-
-	// Common identifier and loop body parsing for @@ and N @
-	// Only execute this if we have parallel loop prefix
-	if numThreads != 0 {
-		// Expect identifier for loop variable
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier after parallel loop prefix")
-		}
-		iterator := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Check for receive loop syntax - not supported for parallel loops
-		if p.current.Type == TOKEN_COMMA {
-			p.error("receive loops (@ msg, from in ...) cannot be parallel")
-		}
-
-		// Expect 'in' keyword
-		if p.current.Type != TOKEN_IN {
-			p.error("expected 'in' in loop statement")
-		}
-		p.nextToken() // skip 'in'
-
-		// Parse iterable expression. Set inConditionLoop so a trailing '!'
-		// bound is left unconsumed by parsePostfix.
-		oldILH := p.inConditionLoop
-		p.inConditionLoop = true
-		iterable := p.parseExpression()
-		p.inConditionLoop = oldILH
-
-		// Determine max iterations and whether runtime checking is needed
-		var maxIterations int64
-		needsRuntimeCheck := false
-
-		// Check if '!' bound is present
-		if p.peek.Type == TOKEN_BANG {
-			p.nextToken() // advance to '!'
-			p.nextToken() // skip '!'
-
-			// Explicit bound always requires runtime checking
-			needsRuntimeCheck = true
-
-			// Parse iteration bound: either a number or 'inf'
-			if p.current.Type == TOKEN_INF {
-				maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-				p.nextToken()                 // skip 'inf'
-			} else if p.current.Type == TOKEN_NUMBER {
-				// Parse the number
-				maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-				if err != nil || maxInt < 1 {
-					p.error("iteration bound must be a positive integer or 'inf'")
-				}
-				maxIterations = maxInt
-				p.nextToken() // skip number
-			} else {
-				p.error("expected number or 'inf' after '!' bound")
-			}
-		} else {
-			// No explicit bound - check if we can determine iteration count at compile time
-			if rangeExpr, ok := iterable.(*RangeExpr); ok {
-				// Try to calculate max from range: end - start
-				startVal, startOk := rangeExpr.Start.(*NumberExpr)
-				endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-				if startOk && endOk {
-					// Literal range - known at compile time, no runtime check needed
-					start := int64(startVal.Value)
-					end := int64(endVal.Value)
-					maxIterations = max(end-start, 0)
-					needsRuntimeCheck = false
-				} else {
-					// Range bounds are not literals, require explicit max
-					p.error("loop over non-literal range requires explicit 'max' clause")
-				}
-			} else if listExpr, ok := iterable.(*ListExpr); ok {
-				// List literal - known at compile time, no runtime check needed
-				maxIterations = int64(len(listExpr.Elements))
-				needsRuntimeCheck = false
-			} else if _, ok := iterable.(*IdentExpr); ok {
-				// Variable (could be a list or map) - use runtime length check
-				maxIterations = math.MaxInt64 // Use max value, will check length at runtime
-				needsRuntimeCheck = true
-			} else if _, ok := iterable.(*IndexExpr); ok {
-				// Indexed expression (e.g., lists[0]) - use runtime length check
-				maxIterations = math.MaxInt64
-				needsRuntimeCheck = true
-			} else {
-				// Not a range expression or list literal, require explicit max
-				p.error("loop requires 'max' clause (or use range expression like 0..<10 or list literal)")
-			}
-			// Advance to next token after iterable expression
-			p.nextToken()
-		}
-
-		// Skip newlines before '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Expect '{'
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected '{' to start loop body")
-		}
-
-		// Skip newlines after '{'
-		for p.peek.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Track loop depth for nested loops
-		oldDepth := p.loopDepth
-		p.loopDepth = label
-		defer func() { p.loopDepth = oldDepth }()
-
-		// Parse loop body
-		var body []Statement
-		for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-			p.nextToken()
-			if p.current.Type == TOKEN_NEWLINE {
-				continue
-			}
-			stmt := p.parseStatement()
-			if stmt != nil {
-				body = append(body, stmt)
-			}
-		}
-
-		// Expect and consume '}'
-		if p.peek.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of loop body")
-		}
-		p.nextToken() // consume the '}'
-
-		// Check for optional reducer: | a,b | { a + b }
-		var reducer *LambdaExpr
-		if p.peek.Type == TOKEN_PIPE {
-			// Only allow reducers for parallel loops
-			if numThreads == 0 {
-				p.error("reducer syntax '| a,b | { expr }' only allowed for parallel loops (@@ or N @)")
-			}
-
-			p.nextToken() // advance to '|'
-			p.nextToken() // consume '|', advance to first parameter
-
-			// Parse parameter list
-			var params []string
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected parameter name after '|'")
-			}
-			params = append(params, p.current.Value)
-			p.nextToken()
-
-			// Expect comma
-			if p.current.Type != TOKEN_COMMA {
-				p.error("reducer requires exactly two parameters (e.g., | a,b | ...)")
-			}
-			p.nextToken() // skip comma
-
-			// Skip newlines after comma
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Parse second parameter
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected second parameter name after comma")
-			}
-			params = append(params, p.current.Value)
-			p.nextToken()
-
-			// Expect second '|'
-			if p.current.Type != TOKEN_PIPE {
-				p.error("expected '|' after reducer parameters")
-			}
-			p.nextToken() // skip second '|'
-
-			// Skip newlines before '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Expect '{'
-			if p.current.Type != TOKEN_LBRACE {
-				p.error("expected '{' to start reducer body")
-			}
-			p.nextToken() // skip '{'
-
-			// Skip newlines after '{'
-			for p.current.Type == TOKEN_NEWLINE {
-				p.nextToken()
-			}
-
-			// Parse reducer body (single expression)
-			reducerBody := p.parseExpression()
-
-			// Expect '}'
-			if p.peek.Type != TOKEN_RBRACE {
-				p.error("expected '}' at end of reducer body")
-			}
-			p.nextToken() // advance to '}'
-
-			// Create lambda expression for reducer
-			reducer = &LambdaExpr{
-				Params:        params,
-				VariadicParam: "",
-				Body:          reducerBody,
-			}
-		}
-
-		return &LoopStmt{
-			Iterator:      iterator,
-			Iterable:      iterable,
-			Body:          body,
+	if p.current.Type == TOKEN_BANG {
+		p.nextToken()
+		maxIterations := p.parseIterationBound()
+		return &WhileStmt{
+			Condition:     &NumberExpr{Value: 1},
+			Body:          p.enterLoopBody(label),
 			MaxIterations: maxIterations,
-			NeedsMaxCheck: needsRuntimeCheck,
 			NumThreads:    numThreads,
-			Reducer:       reducer,
 		}
 	}
 
-handleJump:
-	// If we reach here, must be @N for a jump statement
-	p.nextToken() // skip '@'
-
-	// Expect number for jump label
-	if p.current.Type != TOKEN_NUMBER {
-		p.error("expected number after @ (e.g., @0, @1, @2)")
+	if p.current.Type == TOKEN_LBRACE {
+		return &WhileStmt{
+			Condition:     &NumberExpr{Value: 1},
+			Body:          p.parseLoopBody(label),
+			MaxIterations: math.MaxInt64,
+			NumThreads:    numThreads,
+		}
 	}
 
-	labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-	if err != nil {
-		p.error("invalid jump label number")
+	if p.current.Type == TOKEN_NUMBER && p.peek.Type == TOKEN_LBRACE {
+		count, err := parseNumber(p.current.Value)
+		if err != nil {
+			p.error(err.Error())
+			return nil
+		}
+		return &LoopStmt{
+			Iterator:      "_",
+			Iterable:      &RangeExpr{Start: &NumberExpr{Value: 0}, End: count, Inclusive: false},
+			Body:          p.enterLoopBody(label),
+			MaxIterations: int64(count.Value),
+			NumThreads:    numThreads,
+		}
 	}
-	label = int(labelNum)
 
-	p.nextToken() // skip label number
+	isConditionLoop := true
+	if p.current.Type == TOKEN_IDENT {
+		if p.peek.Type == TOKEN_IN || p.peek.Type == TOKEN_COMMA ||
+			p.peek.Type == TOKEN_AS || p.peek.Type == TOKEN_COLON {
+			isConditionLoop = false
+		}
+	}
 
-	// It's a jump statement: @N or @N value
-	if label < 0 {
-		p.error("jump label must be >= 0 (use @0, @1, @2, etc.)")
+	if isConditionLoop {
+		oldInConditionLoop := p.inConditionLoop
+		p.inConditionLoop = true
+		condition := p.parseComparison()
+		p.inConditionLoop = oldInConditionLoop
+
+		if p.peek.Type != TOKEN_BANG {
+			p.error("condition loop requires a '!' bound clause (e.g., for n < 5 ! 10 { ... }); use 'while' for an unbounded condition loop")
+			return nil
+		}
+		p.nextToken()
+		p.nextToken()
+		maxIterations := p.parseIterationBound()
+		return &WhileStmt{
+			Condition:     condition,
+			Body:          p.enterLoopBody(label),
+			MaxIterations: maxIterations,
+			NumThreads:    numThreads,
+		}
 	}
-	// Check for optional return value: @0 value
-	var value Expression
-	if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		value = p.parseExpression()
+
+	firstIdent := p.current.Value
+	p.nextToken()
+
+	iteratorType := ""
+	if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+		p.nextToken()
+		if p.current.Type != TOKEN_IDENT {
+			p.error("expected type name after type annotation in loop variable")
+		}
+		iteratorType = p.current.Value
+		p.nextToken()
 	}
-	return &JumpStmt{IsBreak: true, Label: label, Value: value}
+
+	if p.current.Type == TOKEN_COMMA {
+		p.nextToken()
+		for p.current.Type == TOKEN_NEWLINE {
+			p.nextToken()
+		}
+		if p.current.Type != TOKEN_IDENT {
+			p.error("expected identifier after comma in receive loop")
+		}
+		secondIdent := p.current.Value
+		p.nextToken()
+		if p.current.Type != TOKEN_IN {
+			p.error("expected 'in' in receive loop")
+		}
+		p.nextToken()
+		address := p.parseExpression()
+		return &ReceiveLoopStmt{
+			MessageVar: firstIdent,
+			SenderVar:  secondIdent,
+			Address:    address,
+			Body:       p.enterLoopBody(label),
+		}
+	}
+
+	if p.current.Type != TOKEN_IN {
+		p.error("expected 'in' in loop statement")
+		return nil
+	}
+	iterator := firstIdent
+	p.nextToken()
+
+	oldILH := p.inConditionLoop
+	p.inConditionLoop = true
+	iterable := p.parseExpression()
+	p.inConditionLoop = oldILH
+
+	var maxIterations int64
+	needsRuntimeCheck := false
+
+	if p.peek.Type == TOKEN_BANG {
+		p.nextToken()
+		p.nextToken()
+		needsRuntimeCheck = true
+		maxIterations = p.parseIterationBound()
+	} else if rangeExpr, ok := iterable.(*RangeExpr); ok {
+		var rangeNeedsCheck bool
+		maxIterations, rangeNeedsCheck = p.loopRangeMaxIterations(rangeExpr)
+		if rangeNeedsCheck {
+			if numThreads != 0 {
+				p.error("parallel loop over non-literal range requires a '!' bound")
+				return nil
+			}
+			needsRuntimeCheck = false
+			maxIterations = math.MaxInt64
+		}
+	} else if listExpr, ok := iterable.(*ListExpr); ok {
+		maxIterations = int64(len(listExpr.Elements))
+		needsRuntimeCheck = false
+	} else if _, ok := iterable.(*IdentExpr); ok {
+		maxIterations = math.MaxInt64
+		needsRuntimeCheck = true
+	} else if _, ok := iterable.(*IndexExpr); ok {
+		maxIterations = math.MaxInt64
+		needsRuntimeCheck = true
+	} else {
+		p.error("for-each loop over this expression requires a '!' bound (e.g., for x in expr ! 100 { ... })")
+		return nil
+	}
+
+	return &LoopStmt{
+		Iterator:      iterator,
+		IteratorType:  iteratorType,
+		Iterable:      iterable,
+		Body:          p.enterLoopBody(label),
+		MaxIterations: maxIterations,
+		NeedsMaxCheck: needsRuntimeCheck,
+		NumThreads:    numThreads,
+	}
 }
 
 // parseGuardStatement parses a statement-level guard clause:
@@ -3555,23 +3051,20 @@ func (p *Parser) parseJumpStatement() Statement {
 	var value Expression
 
 	// Optional @ or @N label (loop exit).
-	if p.peek.Type == TOKEN_AT {
-		p.nextToken() // move onto '@'
-		if p.peek.Type == TOKEN_NUMBER {
-			// ret @N - exit specific loop N
-			p.nextToken() // move onto the number
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
-		} else {
-			// ret @ - exit current loop (label -1 means "current loop")
-			label = -1
+	if p.peek.Type == TOKEN_AT_LABEL {
+		p.nextToken() // move onto the label
+		labelNum, err := strconv.ParseFloat(p.current.Value[1:], 64)
+		if err != nil {
+			p.error("invalid loop label number")
 		}
+		label = int(labelNum)
+		if label < 1 {
+			p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
+		}
+	} else if p.peek.Type == TOKEN_AT {
+		// ret @ - exit current loop (label -1 means "current loop")
+		p.nextToken() // move onto '@'
+		label = -1
 	}
 
 	// Optional return/break value: present when the next token starts an
@@ -3620,18 +3113,20 @@ func (p *Parser) parseContinueStatement() Statement {
 // -1 when there is no explicit label (meaning the innermost loop).
 func (p *Parser) parseOptionalLoopLabel() int {
 	label := -1 // -1 means current (innermost) loop
-	if p.peek.Type == TOKEN_AT {
+	if p.peek.Type == TOKEN_AT_LABEL {
+		p.nextToken() // move onto the label
+		labelNum, err := strconv.ParseFloat(p.current.Value[1:], 64)
+		if err != nil {
+			p.error("invalid loop label number")
+		}
+		label = int(labelNum)
+		if label < 1 {
+			p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
+		}
+	} else if p.peek.Type == TOKEN_AT {
 		p.nextToken() // move onto '@'
 		if p.peek.Type == TOKEN_NUMBER {
-			p.nextToken() // move onto the number
-			labelNum, err := strconv.ParseFloat(p.current.Value, 64)
-			if err != nil {
-				p.error("invalid loop label number")
-			}
-			label = int(labelNum)
-			if label < 1 {
-				p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-			}
+			p.error("loop labels attach to '@' (e.g., @1)")
 		}
 	}
 	return label
@@ -3641,7 +3136,7 @@ func (p *Parser) parseForeachStatement() Statement {
 	p.nextToken() // skip 'foreach'
 
 	// foreach is just syntax sugar for @ ... in
-	// Parse as: @ ident in expr block
+	// Parse as: for ident in expr block
 	if p.current.Type != TOKEN_IDENT {
 		p.error("expected identifier after 'foreach'")
 		return nil
@@ -4108,8 +3603,8 @@ func (p *Parser) desugarComposeChain(funcs []Expression) Expression {
 	composeGensymCounter++
 
 	var body Expression = &IdentExpr{Name: param}
-	for _, func := range slices.Backward(funcs) {
-		name := p.composeOperandName(func)
+	for _, fn := range slices.Backward(funcs) {
+		name := p.composeOperandName(fn)
 		body = &CallExpr{Function: name, Args: []Expression{body}}
 	}
 	return &LambdaExpr{Params: []string{param}, VariadicParam: "", Body: body}
@@ -4230,7 +3725,13 @@ func (p *Parser) parseRange() Expression {
 		inclusive := p.current.Type == TOKEN_DOTDOT
 		p.nextToken() // skip range operator
 		right := p.parseAdditive()
-		return &RangeExpr{Start: left, End: right, Inclusive: inclusive}
+		var step Expression
+		if p.peek.Type == TOKEN_DOTDOT {
+			p.nextToken()
+			p.nextToken()
+			step = p.parseAdditive()
+		}
+		return &RangeExpr{Start: left, End: right, Inclusive: inclusive, Step: step}
 	}
 
 	return left
@@ -4262,6 +3763,13 @@ func (p *Parser) parseLambdaBody() Expression {
 
 	// Allow the body to begin on the next line (`f = (x) ->` / `= ` then newline).
 	p.skipNewlines()
+
+	// A loop (or `if`) statement body is wrapped in an implicit statement block
+	if p.current.Type == TOKEN_FOR || p.current.Type == TOKEN_FOREACH ||
+		p.current.Type == TOKEN_WHILE || p.current.Type == TOKEN_PIPEPIPE {
+		stmt := p.parseStatement()
+		return &BlockExpr{Statements: []Statement{stmt}}
+	}
 
 	// Check if lambda body is a block { ... }
 	if p.current.Type == TOKEN_LBRACE {
@@ -5216,7 +4724,11 @@ func (p *Parser) parsePrimary() Expression {
 				p.lambdaParams = params // Store params for parseLambdaBody
 				body := p.parseLambdaBody()
 				p.lambdaParams = nil
-				return &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, Body: body}
+				lambdaExpr := &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, Body: body}
+				if variadicParam != "" {
+					p.error("variadic functions are not yet supported")
+				}
+				return lambdaExpr
 			}
 
 			// Not a lambda after all, restore and parse as expression
@@ -5350,32 +4862,9 @@ func (p *Parser) parsePrimary() Expression {
 			return &BlockExpr{Statements: statements}
 		}
 
-	case TOKEN_AT_AT:
-		// Parallel loop expression: @@ i in ... { ... } | a,b | { ... }
-		return p.parseLoopExpr()
-
-	case TOKEN_AT:
-		// Could be loop expression (@ i in...) or jump expression (@N)
-		// Look ahead to decide
-		if p.peek.Type == TOKEN_NUMBER {
-			// Jump expression: @N [value]
-			// Returns JumpExpr for continuing loops (IsBreak=false)
-			p.nextToken() // skip '@'
-			if p.current.Type != TOKEN_NUMBER {
-				p.error("expected number after @")
-			}
-			labelNum, _ := strconv.ParseFloat(p.current.Value, 64)
-			label := int(labelNum)
-			p.nextToken() // skip number
-			var value Expression
-			if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-				value = p.parseExpression()
-				p.nextToken()
-			}
-			return &JumpExpr{Label: label, Value: value, IsBreak: false}
-		}
-		// Must be loop expression: @ ident in...
-		return p.parseLoopExpr()
+	case TOKEN_FOR:
+		p.error("loops are statements, not expressions")
+		return nil
 
 	case TOKEN_UNSAFE:
 		// unsafe { x86_64 } { arm64 } { riscv64 }
@@ -5446,250 +4935,6 @@ func (p *Parser) parseArenaExpr() Expression {
 	}
 
 	return &ArenaExpr{Body: body}
-}
-
-// isLoopExpr checks if current position looks like a loop expression
-// Pattern: @ ident in
-func (p *Parser) isLoopExpr() bool {
-	// Loop expressions start with @
-	return p.current.Type == TOKEN_AT
-}
-
-// parseLoopExpr parses a loop expression: @ i in iterable { body } or @@ i in iterable { body } | a,b | { a+b }
-func (p *Parser) parseLoopExpr() Expression {
-	// Parse parallel loop prefix: @@ or N @ or just @
-	numThreads := 0 // 0 = sequential, -1 = all cores, N = specific count
-	label := p.loopDepth + 1
-
-	// Handle @@ token (parallel loop with all cores)
-	if p.current.Type == TOKEN_AT_AT {
-		numThreads = -1
-		p.nextToken() // skip '@@'
-
-		// Skip newlines after '@@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else if p.current.Type == TOKEN_NUMBER {
-		// Handle N @ syntax (parallel loop with N threads)
-		threadCount, err := strconv.Atoi(p.current.Value)
-		if err != nil || threadCount < 1 {
-			p.error("thread count must be a positive integer")
-		}
-		numThreads = threadCount
-		p.nextToken() // skip number
-
-		// Expect @ token after the number
-		if p.current.Type != TOKEN_AT {
-			p.error("expected @ after thread count")
-		}
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else if p.current.Type == TOKEN_AT {
-		// Regular loop: @
-		p.nextToken() // skip '@'
-
-		// Skip newlines after '@'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-	} else {
-		p.error("expected @ or @@ to start loop expression")
-	}
-
-	// Expect identifier for loop variable
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after loop prefix")
-	}
-	iterator := p.current.Value
-	p.nextToken() // skip iterator
-
-	// Expect 'in' keyword
-	if p.current.Type != TOKEN_IN {
-		p.error("expected 'in' keyword in loop expression")
-	}
-	p.nextToken() // skip 'in'
-
-	// Parse iterable expression. Set inConditionLoop so a trailing '!' bound
-	// is left unconsumed by parsePostfix.
-	oldILH := p.inConditionLoop
-	p.inConditionLoop = true
-	iterable := p.parseExpression()
-	p.inConditionLoop = oldILH
-	p.nextToken() // move past iterable
-
-	// Determine max iterations and whether runtime checking is needed
-	var maxIterations int64
-	needsRuntimeCheck := false
-
-	// Check if '!' bound is present
-	if p.current.Type == TOKEN_BANG {
-		p.nextToken() // skip '!'
-
-		// Explicit bound always requires runtime checking
-		needsRuntimeCheck = true
-
-		// Parse iteration bound: either a number or 'inf'
-		if p.current.Type == TOKEN_INF {
-			maxIterations = math.MaxInt64 // Use MaxInt64 for infinite iterations
-			p.nextToken()                 // skip 'inf'
-		} else if p.current.Type == TOKEN_NUMBER {
-			// Parse the number
-			maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-			if err != nil || maxInt < 1 {
-				p.error("iteration bound must be a positive integer or 'inf'")
-			}
-			maxIterations = maxInt
-			p.nextToken() // skip number
-		} else {
-			p.error("expected number or 'inf' after '!' bound in loop expression")
-		}
-	} else {
-		// No explicit bound - check if we can determine iteration count at compile time
-		if rangeExpr, ok := iterable.(*RangeExpr); ok {
-			// Try to calculate max from range: end - start
-			startVal, startOk := rangeExpr.Start.(*NumberExpr)
-			endVal, endOk := rangeExpr.End.(*NumberExpr)
-
-			if startOk && endOk {
-				// Literal range - known at compile time, no runtime check needed
-				start := int64(startVal.Value)
-				end := int64(endVal.Value)
-				maxIterations = max(end-start, 0)
-				needsRuntimeCheck = false
-			} else {
-				// Non-literal range bound: the iterator-vs-end check terminates it.
-				maxIterations = math.MaxInt64
-				needsRuntimeCheck = false
-			}
-		} else if listExpr, ok := iterable.(*ListExpr); ok {
-			// List literal - known at compile time, no runtime check needed
-			maxIterations = int64(len(listExpr.Elements))
-			needsRuntimeCheck = false
-		} else {
-			// Not a range expression or list literal, require explicit max
-			p.error("loop expression requires 'max' clause (or use range expression like 0..<10 or list literal)")
-		}
-	}
-
-	// Expect '{'
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' to start loop body")
-	}
-	p.nextToken() // skip '{'
-
-	// Parse loop body
-	oldDepth := p.loopDepth
-	p.loopDepth = label
-	defer func() { p.loopDepth = oldDepth }()
-
-	var body []Statement
-	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-		p.nextToken()
-		if p.current.Type == TOKEN_NEWLINE {
-			continue
-		}
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-	}
-
-	// Expect and consume '}'
-	if p.peek.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of loop body")
-	}
-	p.nextToken() // consume the '}'
-
-	// Check for optional reducer: | a,b | { a + b }
-	var reducer *LambdaExpr
-	if p.peek.Type == TOKEN_PIPE {
-		// Only allow reducers for parallel loops
-		if numThreads == 0 {
-			p.error("reducer syntax '| a,b | { expr }' only allowed for parallel loops (@@ or N @)")
-		}
-
-		p.nextToken() // advance to '|'
-		p.nextToken() // consume '|', advance to first parameter
-
-		// Parse parameter list
-		var params []string
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected parameter name after '|'")
-		}
-		params = append(params, p.current.Value)
-		p.nextToken()
-
-		// Expect comma
-		if p.current.Type != TOKEN_COMMA {
-			p.error("reducer requires exactly two parameters (e.g., | a,b | ...)")
-		}
-		p.nextToken() // skip comma
-
-		// Skip newlines after comma
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Parse second parameter
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected second parameter name after comma")
-		}
-		params = append(params, p.current.Value)
-		p.nextToken()
-
-		// Expect second '|'
-		if p.current.Type != TOKEN_PIPE {
-			p.error("expected '|' after reducer parameters")
-		}
-		p.nextToken() // skip second '|'
-
-		// Skip newlines before '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Expect '{'
-		if p.current.Type != TOKEN_LBRACE {
-			p.error("expected '{' to start reducer body")
-		}
-		p.nextToken() // skip '{'
-
-		// Skip newlines after '{'
-		for p.current.Type == TOKEN_NEWLINE {
-			p.nextToken()
-		}
-
-		// Parse reducer body (single expression)
-		reducerBody := p.parseExpression()
-
-		// Expect '}'
-		if p.peek.Type != TOKEN_RBRACE {
-			p.error("expected '}' at end of reducer body")
-		}
-		p.nextToken() // advance to '}'
-
-		// Create lambda expression for reducer
-		reducer = &LambdaExpr{
-			Params:        params,
-			VariadicParam: "",
-			Body:          reducerBody,
-		}
-	}
-
-	return &LoopExpr{
-		Iterator:      iterator,
-		Iterable:      iterable,
-		Body:          body,
-		MaxIterations: maxIterations,
-		NeedsMaxCheck: needsRuntimeCheck,
-		NumThreads:    numThreads,
-		Reducer:       reducer,
-	}
 }
 
 // parseUnsafeExpr parses: unsafe [type] { x86_64 block } { arm64 block } { riscv64 block } [as type]
