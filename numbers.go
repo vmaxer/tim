@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math"
 	"math/big"
+	"slices"
 	"strings"
 )
 
@@ -597,8 +598,8 @@ func (fc *TimCompiler) emitNumArenaAlloc() {
 	fc.callArenaAlloc()
 	fc.currentArena = saved
 	fc.out.LeaMemToReg("rsp", "rbp", -8*len(calleeSaved))
-	for i := len(calleeSaved) - 1; i >= 0; i-- {
-		fc.out.PopReg(calleeSaved[i])
+	for _, c := range slices.Backward(calleeSaved) {
+		fc.out.PopReg(c)
 	}
 	fc.out.PopReg("rbp")
 	fc.out.Ret()

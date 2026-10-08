@@ -326,8 +326,8 @@ func (p *Parser) wouldShadow(name string) bool {
 // than a `c.`-namespace / C-FFI reference (the `c` and `C` namespaces are always
 // registered, so without this any variable named `c`/`C` would be unusable).
 func (p *Parser) isDeclaredVariable(name string) bool {
-	for i := len(p.scopes) - 1; i >= 0; i-- {
-		if p.scopes[i][name] {
+	for _, v := range slices.Backward(p.scopes) {
+		if v[name] {
 			return true
 		}
 	}
@@ -4108,8 +4108,8 @@ func (p *Parser) desugarComposeChain(funcs []Expression) Expression {
 	composeGensymCounter++
 
 	var body Expression = &IdentExpr{Name: param}
-	for i := len(funcs) - 1; i >= 0; i-- {
-		name := p.composeOperandName(funcs[i])
+	for _, func := range slices.Backward(funcs) {
+		name := p.composeOperandName(func)
 		body = &CallExpr{Function: name, Args: []Expression{body}}
 	}
 	return &LambdaExpr{Params: []string{param}, VariadicParam: "", Body: body}

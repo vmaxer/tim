@@ -2159,11 +2159,11 @@ func (fc *TimCompiler) popDeferScope() {
 		debugf("DEBUG: popDeferScope emitting %d deferred expressions\n", len(deferred))
 	}
 
-	for i := len(deferred) - 1; i >= 0; i-- {
+	for i, d := range slices.Backward(deferred) {
 		if VerboseMode {
-			debugf("DEBUG:   Emitting deferred expr %d: %T - %v\n", i, deferred[i], deferred[i])
+			debugf("DEBUG:   Emitting deferred expr %d: %T - %v\n", i, d, d)
 		}
-		fc.compileExpression(deferred[i])
+		fc.compileExpression(d)
 	}
 
 	fc.deferredExprs = fc.deferredExprs[:currentScope]
@@ -2824,7 +2824,7 @@ func (fc *TimCompiler) emitVectorizedBinaryOpLoop(stmt *LoopStmt, rangeExpr *Ran
 
 	// Get array pointers from variables map
 	// Extract base name from result (might be "result[i]" -> "result")
-	resultBase := strings.Split(resultName, "[")[0]
+	resultBase, _, _ := strings.Cut(resultName, "[")
 	resultOffset, resultExists := fc.variables[resultBase]
 	leftOffset, leftExists := fc.variables[leftArrayName]
 	rightOffset, rightExists := fc.variables[rightArrayName]
@@ -3199,7 +3199,7 @@ func (fc *TimCompiler) compileParallelRangeLoop(stmt *LoopStmt, rangeExpr *Range
 
 	// Allocate pthread_t array on stack to store thread IDs
 	// Each pthread_t is 8 bytes, allocate space for all threads
-	pthreadArraySize := int64(actualThreads * 8)
+	pthreadArraySize := int64(actualThreads*8+15) &^ 15
 	fc.out.SubImmFromReg("rsp", pthreadArraySize)
 	fc.out.MovRegToReg("r12", "rsp") // r12 = pthread_t array base
 
@@ -11186,7 +11186,7 @@ func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
 	}
 
 	// Load arguments from stack into xmm registers (in reverse order)
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		fc.out.MovMemToXmm(xmmRegs[i], "rsp", 0)
 		fc.out.AddImmToReg("rsp", 16)
 	}
@@ -11260,7 +11260,7 @@ func (fc *TimCompiler) compileLambdaDirectCall(call *CallExpr) {
 	fc.inTailPosition = savedTailPosition
 
 	// Load arguments from stack into xmm registers (in reverse order)
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		fc.out.MovMemToXmm(xmmRegs[i], "rsp", 0)
 		fc.out.AddImmToReg("rsp", 16)
 	}
@@ -11685,7 +11685,7 @@ func (fc *TimCompiler) compileDirectCall(call *DirectCallExpr) {
 	}
 
 	// Load arguments from stack into xmm registers (in reverse order)
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		fc.out.MovMemToXmm(xmmRegs[i], "rsp", 0)
 		fc.out.AddImmToReg("rsp", 16)
 	}
@@ -12039,7 +12039,7 @@ func (fc *TimCompiler) compileRecursiveCall(call *CallExpr) {
 	// Restore arguments from stack to registers xmm0, xmm1, xmm2, ...
 	// Arguments are on stack in order: [arg0, arg1, arg2, ...]
 	// We need to pop them in reverse order to get them into the right registers
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		regName := fmt.Sprintf("xmm%d", i)
 		fc.out.MovMemToXmm(regName, "rsp", 0)
 		fc.out.AddImmToReg("rsp", StackSlotSize)
@@ -13804,8 +13804,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		if needsDummyPush {
 			fc.out.PopReg("rax") // Dummy pop
 		}
-		for i := len(allocatedCalleeSaved) - 1; i >= 0; i-- {
-			fc.out.PopReg(allocatedCalleeSaved[i])
+		for _, a := range slices.Backward(allocatedCalleeSaved) {
+			fc.out.PopReg(a)
 		}
 
 	case "eprint", "eprintln", "eprintf":
@@ -14535,8 +14535,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		argRegs := []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
 
 		// Evaluate all arguments and save to stack (in reverse order)
-		for i := len(call.Args) - 1; i >= 0; i-- {
-			fc.compileExpression(call.Args[i]) // Result in xmm0
+		for _, v := range slices.Backward(call.Args) {
+			fc.compileExpression(v) // Result in xmm0
 			// Convert float64 to int64 and save
 			fc.out.Cvttsd2si("rax", "xmm0")
 			fc.out.PushReg("rax")
@@ -14587,8 +14587,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			compilerError("waitpid() requires exactly 3 arguments")
 		}
 		if fc.eb.target.OS() == OSLinux {
-			for i := len(call.Args) - 1; i >= 0; i-- {
-				fc.compileExpression(call.Args[i])
+			for _, v := range slices.Backward(call.Args) {
+				fc.compileExpression(v)
 				fc.out.Cvttsd2si("rax", "xmm0")
 				fc.out.PushReg("rax")
 			}
@@ -14613,8 +14613,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		}
 		if fc.eb.target.OS() == OSLinux {
 			argRegs := []string{"rdi", "rsi", "rdx", "r10", "r8", "r9"}
-			for i := len(call.Args) - 1; i >= 0; i-- {
-				fc.compileExpression(call.Args[i])
+			for _, v := range slices.Backward(call.Args) {
+				fc.compileExpression(v)
 				fc.out.Cvttsd2si("rax", "xmm0")
 				fc.out.PushReg("rax")
 			}
@@ -14641,8 +14641,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			compilerError("munmap() requires exactly 2 arguments")
 		}
 		if fc.eb.target.OS() == OSLinux {
-			for i := len(call.Args) - 1; i >= 0; i-- {
-				fc.compileExpression(call.Args[i])
+			for _, v := range slices.Backward(call.Args) {
+				fc.compileExpression(v)
 				fc.out.Cvttsd2si("rax", "xmm0")
 				fc.out.PushReg("rax")
 			}
@@ -17440,7 +17440,7 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 
 		// Pop arguments from the stack into registers. The last argument is on top
 		// of the stack, so unwinding in reverse places arg[i] into xmm[i].
-		for i := len(call.Args) - 1; i >= 0; i-- {
+		for i := range slices.Backward(call.Args) {
 			regName := fmt.Sprintf("xmm%d", i)
 			fc.out.MovMemToXmm(regName, "rsp", 0)
 			fc.out.AddImmToReg("rsp", StackSlotSize)

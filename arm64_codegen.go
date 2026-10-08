@@ -1715,8 +1715,8 @@ func (acg *ARM64CodeGen) popDeferScope() error {
 	deferred := acg.deferredExprs[currentScope]
 
 	// Execute deferred expressions in LIFO order
-	for i := len(deferred) - 1; i >= 0; i-- {
-		if err := acg.compileExpression(deferred[i]); err != nil {
+	for _, d := range slices.Backward(deferred) {
+		if err := acg.compileExpression(d); err != nil {
 			return err
 		}
 	}
@@ -3986,7 +3986,7 @@ func (acg *ARM64CodeGen) compileNamedCall(label string, args []Expression) error
 		acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x00, 0xfd}) // str d0, [sp]
 	}
 	// Reload into d0..d(n-1) (reverse, since the last pushed is on top).
-	for i := len(args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(args) {
 		instr := uint32(0xfd400000) | uint32(i) | (31 << 5) // ldr dN, [sp]
 		acg.out.out.writer.WriteBytes([]byte{byte(instr), byte(instr >> 8), byte(instr >> 16), byte(instr >> 24)})
 		acg.out.AddImm64("sp", "sp", 16)
@@ -4018,7 +4018,7 @@ func (acg *ARM64CodeGen) compileSelfRecursiveCall(call *CallExpr) error {
 		return fmt.Errorf("too many arguments to recursive call (max 8)")
 	}
 
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		// ldr dN, [sp]
 		regNum := uint32(i)
 		instr := uint32(0xfd400000) | (regNum) | (31 << 5) // ldr dN, [sp, #0]
@@ -4824,7 +4824,7 @@ func (acg *ARM64CodeGen) compileTailCall(call *CallExpr) error {
 
 	// Pop arguments from stack and store them in parameter locations
 	// Parameters are stored at [x29, #16 + paramOffset - 8]
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		// Pop d0 from stack
 		// ldr d0, [sp]
 		acg.out.out.writer.WriteBytes([]byte{0xe0, 0x03, 0x40, 0xfd})
@@ -4908,7 +4908,7 @@ func (acg *ARM64CodeGen) compileDirectCall(call *DirectCallExpr) error {
 		return fmt.Errorf("too many arguments to direct call (max 8)")
 	}
 
-	for i := len(call.Args) - 1; i >= 0; i-- {
+	for i := range slices.Backward(call.Args) {
 		// ldr dN, [sp]
 		regNum := uint32(i)
 		instr := uint32(0xfd400000) | (regNum) | (31 << 5) // ldr dN, [sp, #0]

@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"maps"
+	"slices"
 )
 
 // RegisterTracker manages register allocation and prevents clobbering
@@ -138,8 +139,8 @@ func (rt *RegisterTracker) FreeXMM(reg string) {
 	rt.xmmPurpose[index] = ""
 
 	// Remove from stack
-	for i := len(rt.xmmStack) - 1; i >= 0; i-- {
-		if rt.xmmStack[i] == index {
+	for i, v := range slices.Backward(rt.xmmStack) {
+		if v == index {
 			rt.xmmStack = append(rt.xmmStack[:i], rt.xmmStack[i+1:]...)
 			break
 		}
@@ -237,8 +238,8 @@ func (rt *RegisterTracker) FreeInt(reg string) {
 	delete(rt.intPurpose, reg)
 
 	// Remove from stack
-	for i := len(rt.intStack) - 1; i >= 0; i-- {
-		if rt.intStack[i] == reg {
+	for i, v := range slices.Backward(rt.intStack) {
+		if v == reg {
 			rt.intStack = append(rt.intStack[:i], rt.intStack[i+1:]...)
 			break
 		}

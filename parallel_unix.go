@@ -32,11 +32,18 @@ func GetNumCPUCores() int {
 	}
 	defer syscall.Close(data)
 
-	buf := make([]byte, 16384)
-	n, err := syscall.Read(data, buf)
-	if err != nil {
-		return 4
+	buf := make([]byte, 0, 16384)
+	tmp := make([]byte, 4096)
+	for {
+		n, err := syscall.Read(data, tmp)
+		if n > 0 {
+			buf = append(buf, tmp[:n]...)
+		}
+		if err != nil || n == 0 {
+			break
+		}
 	}
+	n := len(buf)
 
 	count := 0
 	for i := 0; i < n-9; i++ {
