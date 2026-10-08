@@ -22,7 +22,7 @@ main = {
     printf("Rendering a few frames...\n")
 
     counter := 0
-    @ counter < 10 ! 100 {
+    for counter < 10 ! 100 {
         sdl.SDL_RenderClear(renderer)
         sdl.SDL_RenderPresent(renderer)
         sdl.SDL_Delay(100)

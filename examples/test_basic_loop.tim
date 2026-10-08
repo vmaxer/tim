@@ -1,7 +1,7 @@
 printf("Starting\n")
 
 count := 0
-@ count < 3 ! inf {
+for count < 3 ! inf {
     printf("Count: %d\n", count)
     count <- count + 1
 }

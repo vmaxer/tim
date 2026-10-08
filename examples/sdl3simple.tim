@@ -21,7 +21,7 @@ defer sdl.SDL_DestroyRenderer(renderer)
 printf("Window created! Showing for 5 seconds...\n")
 
 frame_count := 0
-@ frame_count < 300 ! 300 {
+for frame_count < 300 ! 300 {
     sdl.SDL_RenderClear(renderer)
     sdl.SDL_RenderPresent(renderer)
     sdl.SDL_Delay(16)

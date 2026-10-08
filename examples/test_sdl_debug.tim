@@ -49,7 +49,7 @@ arena {
     event = alloc(128)
     printf("After alloc\n")
     
-    @ running ! 5 {
+    for running ! 5 {
         printf("Before SDL_PollEvent\n")
         poll_result = sdl.SDL_PollEvent(event)
         printf("SDL_PollEvent returned: %d\n", poll_result)

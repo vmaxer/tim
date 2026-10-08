@@ -40,7 +40,7 @@ defer sdl.SDL_DestroyTexture(tex)
 running := 1
 event := c.malloc(192) as SDL_Event
 
-@ running > 0 ! 2 {
+for running > 0 ! 2 {
     println("Loop iteration")
     running = 0
 }

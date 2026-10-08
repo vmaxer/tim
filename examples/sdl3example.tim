@@ -41,7 +41,7 @@ max_frames = 300
 arena {
     event = alloc(128)
     
-    @ running ! inf {
+    for running ! inf {
         has_event = sdl.SDL_PollEvent(event)
         has_event {
             | has_event > 0 => {

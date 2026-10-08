@@ -34,7 +34,7 @@ arena {
     // Use the same SDL_Event buffer sizing as the other SDL3 examples.
     event = alloc(192) as SDL_Event
 
-    @ running ! inf {
+    for running ! inf {
         frame_start = sdl.SDL_GetTicks()
 
         has_event = sdl.SDL_PollEvent(event)

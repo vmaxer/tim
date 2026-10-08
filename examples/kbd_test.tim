@@ -13,7 +13,7 @@ event := c.malloc(128)
 running := 1
 frame_count := 0
 
-@ running > 0 ! inf {
+for running > 0 ! inf {
     poll = sdl.SDL_PollEvent(event)
     {
         | poll > 0 => {
