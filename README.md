@@ -11,7 +11,7 @@
     *   **SIMD & FMA**
 *   **Minimalist Syntax**:
     *   Unified syntax for functions, lambdas, and pattern matching.
-    *   The `@` symbol handles all loops (range, while, infinite, for-each).
+    *   The `for` keyword handles all loops (range, while, infinite, for-each).
 *   **One Number Type**: `num` holds exact integers of any size, exact rationals and inexact floats. `0.1 + 0.2 == 0.3`, `2 ** 200` is exact, and `7 / 2` is `3.5`, not `3`.
 *   **Compact & Standalone**: "Hello World" is ~21KB on Linux. No `libc` dependency on Linux (uses direct syscalls).
 *   **Manual Memory Management w/ Safety**: First-class **Arena** allocators for bulk deallocation and `defer` for resource cleanup. No Garbage Collector pauses.
@@ -78,12 +78,12 @@ sign = x {
 }
 
 // Range Loop
-@ i in 0..<10 {
+for i in 0..<10 {
     println(i)
 }
 
 // While Loop (condition loops require a `!` bound)
-@ count > 0 ! 1000 {
+for count > 0 ! 1000 {
     count <- count - 1
 }
 ```
@@ -186,7 +186,7 @@ tex = sdl.SDL_CreateTextureFromSurface(renderer, bmp) or! {
 defer sdl.SDL_DestroyTexture(tex)
 
 // Main rendering loop. Run for approximately 2 seconds (20 frames * 100ms = 2s)
-@ frame in 0..<20 {
+for frame in 0..<20 {
 
     // Clear screen
     sdl.SDL_RenderClear(renderer)

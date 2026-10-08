@@ -193,7 +193,7 @@ Serializable := {
     to_json: () -> {
         // Serialize instance to JSON string
         keys := this.keys()
-        @ i in 0..<keys.length {
+        for i in 0..<keys.length {
             // Build JSON...
         }
     },
@@ -284,7 +284,7 @@ class Parser {
 
     parse_number = () -> {
         result := 0
-        @ ._peek() >= 48 and ._peek() <= 57 {
+        for ._peek() >= 48 and ._peek() <= 57 {
             result <- result * 10 + (._peek() - 48)
             ._advance()
         }
@@ -310,7 +310,7 @@ class StringBuilder {
 
     build = () => {
         result := ""
-        @ part in .parts {
+        for part in .parts {
             result <- result + part
         }
         ret result

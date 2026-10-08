@@ -484,16 +484,17 @@ x: num = num * 2       // OK - type annotation vs variable
 Tim has a dedicated boolean type with two values: `yes` and `no`.
 
 **Representation:**
-Booleans carry a marker to distinguish them from numbers:
+Booleans are the numbers `1` and `0`:
 ```tim
-yes    // {0: 1.0, 1: 1.0}  (marker: key 1 exists with value 1.0)
-no     // {0: 0.0, 1: 0.0}  (marker: key 1 exists with value 0.0)
+yes    // 1
+no     // 0
 ```
 
-**Key distinction:** Booleans are NOT the same as `1.0` and `0.0`:
+Comparisons return `yes`/`no`, so boolean literals and numbers interchange
+freely:
 ```tim
-yes == 1.0      // no (different internal structure)
-no == 0.0       // no (different internal structure)
+yes == 1.0      // yes
+no == 0.0       // yes
 yes == yes      // yes
 no == no        // yes
 ```
@@ -869,7 +870,7 @@ add = (x, y) -> x + y
 // With optional 'fun' keyword for clarity
 fun factorial = n -> {
     result := 1
-    @ i in 1..n {
+    for i in 1..n {
         result *= i
     }
     result
@@ -991,9 +992,9 @@ The composition operator provides a concise way to build complex transformations
 
 ### Variadic Functions
 
-> **Status: NOT YET WORKING.** Variadic functions parse and compile, but calling
-> one currently segfaults at runtime (the variadic argument-list machinery is
-> incomplete). The design below is the intended behavior; do not rely on it yet.
+> **Status: NOT YET WORKING.** Variadic functions are rejected at compile time
+> (the variadic argument-list machinery is incomplete). The design below is the
+> intended behavior; do not rely on it yet.
 
 Functions can accept a variable number of arguments using the `...` suffix on the last parameter:
 
@@ -1001,7 +1002,7 @@ Functions can accept a variable number of arguments using the `...` suffix on th
 // Simple variadic function
 sum = (first, rest...) -> {
     total := first
-    @ item in rest {
+    for item in rest {
         total <- total + item
     }
     total
@@ -1017,7 +1018,7 @@ printf = (format, args...) -> {
 
 // All arguments variadic
 log = (messages...) -> {
-    @ msg in messages {
+    for msg in messages {
         println(msg)
     }
 }
@@ -1043,7 +1044,7 @@ When calling a variadic function, you can:
 // Define variadic function
 max = (nums...) -> {
     result := nums[0]
-    @ n in nums {
+    for n in nums {
         ? n > result { result <- n }
     }
     result
@@ -1065,7 +1066,7 @@ max(1, 2, values..., 99)  // 99
 ### Infinite Loop
 
 ```tim
-@ {
+for {
     println("Forever")
 }
 ```
@@ -1073,7 +1074,7 @@ max(1, 2, values..., 99)  // 99
 ### Counted Loop
 
 ```tim
-@ 10 {
+for 10 {
     println("Hello")
 }
 ```
@@ -1081,12 +1082,12 @@ max(1, 2, values..., 99)  // 99
 ### Range Loop
 
 ```tim
-@ i in 0..10 {
+for i in 0..10 {
     println(i)
 }
 
 // With step
-@ i in 0..100..10 {  // 0, 10, 20, ...
+for i in 0..100..10 {  // 0, 10, 20, ...
     println(i)
 }
 ```
@@ -1095,7 +1096,7 @@ max(1, 2, values..., 99)  // 99
 
 ```tim
 nums = [1, 2, 3, 4, 5]
-@ n in nums {
+for n in nums {
     println(n)
 }
 ```
@@ -1107,15 +1108,15 @@ Tim supports both traditional and modern loop control syntax:
 **Traditional syntax** (using `ret @`):
 ```tim
 // Exit current loop
-@ i in 0..<100 {
+for i in 0..<100 {
     i > 50 { ret @ }      // Exit current loop
     i == 42 { ret @ 42 }  // Exit loop with value 42
     println(i)
 }
 
 // Nested loops with explicit labels
-@ i in 0..<10 {           // Loop @1 (outer)
-    @ j in 0..<10 {       // Loop @2 (inner)
+for i in 0..<10 {           // Loop @1 (outer)
+    for j in 0..<10 {       // Loop @2 (inner)
         j == 5 { ret @ }         // Exit inner loop (@2)
         i == 5 { ret @1 }        // Exit outer loop (@1)
         i == 3 and j == 7 { ret @1 42 }  // Exit outer loop with value
@@ -1143,10 +1144,10 @@ foreach i in 0..<10 {      // Loop @1
 }
 
 // foreach is syntax sugar for @ ... in
-foreach x in items { process(x) }  // Same as: @ x in items { process(x) }
+foreach x in items { process(x) }  // Same as: for x in items { process(x) }
 ```
 
-**Recommendation:** Use `foreach/break/continue` for familiar C-style loops, use `@ / ret @` for advanced control flow.
+**Recommendation:** Use `foreach/break/continue` for familiar C-style loops, use `for / ret @` for advanced control flow.
 
 **Loop Label Numbering:**
 
@@ -1165,21 +1166,22 @@ Loops are automatically numbered from **outermost to innermost**:
 
 ### Loop `!` Keyword
 
-Loops with unknown bounds or modified counters require `!`:
+Loops with unknown bounds or modified counters require `!`. The bound is a
+maximum iteration count: exceeding it stops the loop.
 
 ```tim
 // Counter modified in loop
-@ i in 0..<10 ! 20 {
-    i++  // Modified counter, needs !
+for i in 0..<10 ! 20 {
+    i <- i + 1  // Modified counter, needs !
 }
 
 // Unknown iteration count
-@ msg in read_channel() ! inf {
+for msg in read_channel() ! inf {
     process(msg)
 }
 
 // Condition-based loop
-@ x < threshold ! 1000 {
+for x < threshold ! 1000 {
     x = compute_next(x)
 }
 ```
@@ -1234,7 +1236,7 @@ data <= &"server:9000"    // Receive from remote
 ```tim
 // Worker pattern
 worker = -> {
-    @ {
+    for {
         task <= &8080
         result = process(task)
         &8081 <- result
@@ -1242,9 +1244,9 @@ worker = -> {
 }
 
 // Pipeline pattern
-stage1 = -> @ { &8080 <- generate_data() }
-stage2 = -> @ { data <= &8080; &8081 <- transform(data) }
-stage3 = -> @ { result <= &8081; save(result) }
+stage1 = -> for { &8080 <- generate_data() }
+stage2 = -> for { data <= &8080; &8081 <- transform(data) }
+stage3 = -> for { result <= &8081; save(result) }
 ```
 
 **Note:** ENet channels are compiled directly into machine code that uses ENet library calls.
@@ -1647,7 +1649,7 @@ event := c.calloc(1, 128)! as SDL_Event  // Allocates and zeros 128 bytes
 
 **What IS builtin:**
 - **Operators:** `#`, arithmetic, logic, bitwise, etc.
-- **Control flow:** `@` loops, match blocks, `ret`, `defer`
+- **Control flow:** `for` loops, match blocks, `ret`, `defer`
 - **Core I/O:** `print`, `println`, `printf`, `eprint`, `eprintln`, `eprintf`, `exitln`, `exitf`
 - **List operations:** `head()`, `tail()`
 - **Keywords:** `arena`, `unsafe`, `cstruct`, `import`, etc.
@@ -2571,7 +2573,7 @@ println("Hello, World!")
 // Iterative
 factorial = n -> {
     result := 1
-    @ i in 1..n {
+    for i in 1..n {
         result *= i
     }
     result
@@ -2590,7 +2592,7 @@ println(factorial(5, 1))  // 120
 ### FizzBuzz
 
 ```tim
-@ i in 1..100 {
+for i in 1..100 {
     result = i % 15 {
         0 -> "FizzBuzz"
         ~> i % 3 {
@@ -2688,7 +2690,7 @@ println(f"Results: {results}")
 ```tim
 // Simple echo server
 server =>> {
-    @ {
+    for {
         request <= &8080
         println(f"Received: {request}")
         &8080 <- f"Echo: {request}"
@@ -2792,7 +2794,7 @@ init_sdl = () => {
 main = () => {
     window, renderer = init_sdl()
 
-    @ frame in 0..<100 ! 200 {
+    for frame in 0..<100 ! 200 {
         // Clear screen to black
         sdl.SDL_SetRenderDrawColor(renderer, 0, 0, 0, 255)
         sdl.SDL_RenderClear(renderer)
@@ -2822,7 +2824,7 @@ main()
 process_requests = requests -> {
     arena {
         results := []
-        @ req in requests {
+        for req in requests {
             result = handle_request(req)
             results <- results + [result]
         }
@@ -2979,7 +2981,7 @@ Many languages accumulate features:
 **Tim's approach:** Minimal, orthogonal features
 
 **Examples:**
-- One loop construct: `@`
+- One loop construct: `for`
 - One function syntax: `=>`
 - One block syntax: `{ }`
 - Disambiguate by contents, not syntax
