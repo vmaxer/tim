@@ -1,0 +1,103 @@
+push = (xs: list, x) -> xs + [x]
+
+concat = (a: list, b: list) -> a + b
+
+slice = (xs: list, a, b) -> {
+	out := []
+	i := a
+	for i < b ! 65536 {
+		out <- out + [xs[i]]
+		i <- i + 1
+	}
+	out
+}
+
+reverse = (xs: list) -> {
+	out := []
+	i := #xs - 1
+	for i >= 0 ! 65536 {
+		out <- out + [xs[i]]
+		i <- i - 1
+	}
+	out
+}
+
+map = (xs: list, f) -> {
+	out := []
+	for x in xs ! 65536 {
+		out <- out + [f(x)]
+	}
+	out
+}
+
+filter = (xs: list, f) -> {
+	out := []
+	for x in xs ! 65536 {
+		keep := f(x)
+		keep {
+			0 => 0
+			~> out <- out + [x]
+		}
+	}
+	out
+}
+
+fold = (xs: list, z, f) -> {
+	acc := z
+	for x in xs ! 65536 {
+		acc <- f(acc, x)
+	}
+	acc
+}
+
+find = (xs: list, f) -> {
+	for x in xs ! 65536 {
+		keep := f(x)
+		keep {
+			0 => 0
+			~> ret x
+		}
+	}
+	err "not found"
+}
+
+min = (xs: list) -> {
+	n := #xs
+	n == 0 { err "empty list" }
+	best := xs[0]
+	i := 1
+	for i < n ! 65536 {
+		xs[i] < best { best <- xs[i] }
+		i <- i + 1
+	}
+	best
+}
+
+max = (xs: list) -> {
+	n := #xs
+	n == 0 { err "empty list" }
+	best := xs[0]
+	i := 1
+	for i < n ! 65536 {
+		xs[i] > best { best <- xs[i] }
+		i <- i + 1
+	}
+	best
+}
+
+sort = (xs: list) -> {
+	out := xs + []
+	n := #out
+	i := 1
+	for i < n ! 65536 {
+		v := out[i]
+		j := i - 1
+		for j >= 0 and out[j] > v ! 65536 {
+			out[j + 1] <- out[j]
+			j <- j - 1
+		}
+		out[j + 1] <- v
+		i <- i + 1
+	}
+	out
+}

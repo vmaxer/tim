@@ -1,0 +1,9 @@
+contains = (m, k) -> k in m
+
+get = (m, k) -> {
+	k in m {
+		1 => ret m[k]
+		~> ret 0
+	}
+	err "missing key"
+}

@@ -263,6 +263,11 @@ func resolveDirectory(spec *ImportSpec) ([]string, error) {
 	// Check if path exists
 	info, err := os.Stat(dirPath)
 	if err != nil {
+		if !strings.HasSuffix(dirPath, ".tim") {
+			if info2, err2 := os.Stat(dirPath + ".tim"); err2 == nil && !info2.IsDir() {
+				return []string{dirPath + ".tim"}, nil
+			}
+		}
 		return nil, fmt.Errorf("path not found: %s", dirPath)
 	}
 

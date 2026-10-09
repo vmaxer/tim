@@ -1,0 +1,56 @@
+read = (path: str) -> {
+	f := c.fopen(path as cstr, "rb")
+	f == 0 { err "cannot open file" }
+	c.fseek(f, 0, 2)
+	n := c.ftell(f)
+	c.fseek(f, 0, 0)
+	buf := c.malloc(n + 1)
+	c.memset(buf, 0, n + 1)
+	got := c.fread(buf, 1, n, f)
+	c.fclose(f)
+	got < n { err "read failed" }
+	ret str(buf as cstr)
+}
+
+write = (path: str, data: str) -> {
+	f := c.fopen(path as cstr, "wb")
+	f == 0 { err "cannot open file" }
+	buf := data as cstr
+	n := c.strlen(buf)
+	got := c.fwrite(buf, 1, n, f)
+	c.fclose(f)
+	got == n { ret 1 }
+	err "write failed"
+}
+
+append = (path: str, data: str) -> {
+	f := c.fopen(path as cstr, "ab")
+	f == 0 { err "cannot open file" }
+	buf := data as cstr
+	n := c.strlen(buf)
+	got := c.fwrite(buf, 1, n, f)
+	c.fclose(f)
+	got == n { ret 1 }
+	err "write failed"
+}
+
+exists = (path: str) -> {
+	f := c.fopen(path as cstr, "rb")
+	f == 0 { ret no }
+	c.fclose(f)
+	ret yes
+}
+
+remove = (path: str) -> c.remove(path as cstr) == 0
+
+rename = (a: str, b: str) -> c.rename(a as cstr, b as cstr) == 0
+
+env = (name: str) -> {
+	v := c.getenv(name as cstr)
+	v == 0 { ret "" }
+	ret str(v as cstr)
+}
+
+clock = -> c.time(0)
+
+sleep = ms -> c.usleep(ms * 1000)

@@ -1,0 +1,25 @@
+pi = -> 3.141592653589793
+
+e = -> 2.718281828459045
+
+min = (a, b) -> {
+	a < b { ret a }
+	ret b
+}
+
+max = (a, b) -> {
+	a > b { ret a }
+	ret b
+}
+
+clamp = (x, a, b) -> {
+	x < a { ret a }
+	x > b { ret b }
+	ret x
+}
+
+sign = x -> {
+	x > 0 { ret 1 }
+	x < 0 { ret -1 }
+	ret 0
+}

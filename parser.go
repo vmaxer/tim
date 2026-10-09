@@ -2902,7 +2902,7 @@ func (p *Parser) parseLoopStatement() Statement {
 	if isConditionLoop {
 		oldInConditionLoop := p.inConditionLoop
 		p.inConditionLoop = true
-		condition := p.parseComparison()
+		condition := p.parseLogicalOr()
 		p.inConditionLoop = oldInConditionLoop
 
 		if p.peek.Type != TOKEN_BANG {
@@ -4182,6 +4182,9 @@ func (p *Parser) parsePostfix() Expression {
 				fieldName = "malloc"
 			} else if p.current.Type == TOKEN_FREE {
 				fieldName = "free"
+			} else if p.current.Value != "" && ((p.current.Value[0] >= 'a' && p.current.Value[0] <= 'z') ||
+				(p.current.Value[0] >= 'A' && p.current.Value[0] <= 'Z')) {
+				fieldName = p.current.Value
 			} else {
 				p.error("expected field name after '.'")
 			}
@@ -4219,6 +4222,12 @@ func (p *Parser) parsePostfix() Expression {
 						if !fieldFound {
 							p.error("cstruct '" + cstruct.Name + "' has no field '" + fieldName + "'")
 						}
+					}
+				} else if ident.Name == "c" && strings.HasPrefix(fieldName, "sizeof_") {
+					if decl, ok := p.cstructs[fieldName[len("sizeof_"):]]; ok {
+						expr = &NumberExpr{Value: float64(decl.Size)}
+					} else {
+						p.error("unknown cstruct in '" + fieldName + "'")
 					}
 				} else if p.peek.Type == TOKEN_LPAREN {
 					// Check if this is a C import namespace (e.g., sdl, c) or a method call (e.g., xs.append).

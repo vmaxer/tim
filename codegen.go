@@ -82,6 +82,8 @@ type TimCompiler struct {
 	funcReturnsListElem  map[string]string             // function name -> cstruct element type of the list it returns
 	ctypes               *CStructTypes                 // shared, platform-independent cstruct type oracle (over the maps above)
 	functionSignatures   map[string]*FunctionSignature // function name -> signature (params, variadic)
+	funcBodyByName       map[string]*LambdaExpr        // function name -> lambda (for result typing)
+	inferringResult      map[string]bool               // recursion guard for result typing
 	sourceCode           string                        // Store source for recompilation
 	sourceDir            string                        // Directory of the source file being compiled
 	usedFunctions        map[string]bool               // Track which functions are called
@@ -247,6 +249,8 @@ func NewTimCompiler(platform Platform, verbose bool) (*TimCompiler, error) {
 		verbose:             verbose,
 		currentArena:        1, // Start at arena 1 (which is meta-arena[0], the global arena)
 		regAlloc:            NewRegisterAllocator(platform.Arch),
+		funcBodyByName:      make(map[string]*LambdaExpr),
+		inferringResult:     make(map[string]bool),
 		regTracker:          NewRegisterTracker(),
 		regSpiller:          NewRegisterSpiller(SpillToStack),
 		movedVars:           make(map[string]bool),
@@ -1008,6 +1012,7 @@ func (fc *TimCompiler) compileInternal(program *Program, outputPath string, deps
 	}
 	fc.collectingSymbols = false
 
+	fc.usesArenas = true
 	// Define arena metadata symbols AFTER symbol collection (when fc.usesArenas is set)
 	// but BEFORE code generation (so PC relocations can reference them)
 	if fc.usesArenas {
@@ -1121,8 +1126,16 @@ func (fc *TimCompiler) compileInternal(program *Program, outputPath string, deps
 		fc.out.XorRegWithReg("xmm0", "xmm0")
 	}
 
-	// Convert float64 result in xmm0 to int32 in rdi (for exit code)
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.MovImmToReg("rcx", "4607182418800017408")
+	fc.out.CmpRegToReg("rax", "rcx")
+	notTrueExit, doneExit := fc.newNumLabel(), fc.newNumLabel()
+	notTrueExit.jcc(JumpNotEqual)
+	fc.out.XorRegWithReg("rdi", "rdi")
+	doneExit.jmp()
+	notTrueExit.bind()
 	fc.out.Emit([]byte{0xf2, 0x48, 0x0f, 0x2c, 0xf8})
+	doneExit.bind()
 
 	// Lambda functions were already generated and jumped over before main evaluation
 
@@ -1285,6 +1298,9 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 			// Register function signature for call-site resolution (forward refs)
 			if lambdaExpr, ok := s.Value.(*LambdaExpr); ok {
 				funcName := s.Name
+				if lam, lamOk := s.Value.(*LambdaExpr); lamOk {
+					fc.funcBodyByName[funcName] = lam
+				}
 				fc.functionSignatures[funcName] = &FunctionSignature{
 					ParamCount:    len(lambdaExpr.Params),
 					VariadicParam: lambdaExpr.VariadicParam,
@@ -1362,6 +1378,9 @@ func (fc *TimCompiler) collectSymbols(stmt Statement) error {
 				// Register function signature for call-site resolution (forward refs)
 				if lambdaExpr, ok := s.Value.(*LambdaExpr); ok {
 					funcName := s.Name
+					if lam, lamOk := s.Value.(*LambdaExpr); lamOk {
+						fc.funcBodyByName[funcName] = lam
+					}
 					fc.functionSignatures[funcName] = &FunctionSignature{
 						ParamCount:    len(lambdaExpr.Params),
 						VariadicParam: lambdaExpr.VariadicParam,
@@ -3675,6 +3694,20 @@ func (fc *TimCompiler) compileJumpStatement(stmt *JumpStmt) {
 			fc.compileExpression(stmt.Value)
 			// xmm0 now contains return value
 		}
+		if fc.currentLambda == nil {
+			// Top-level `ret` sets the exit code (spec: Program Execution)
+			if stmt.Value != nil {
+				fc.out.Cvttsd2si("rdi", "xmm0")
+			} else {
+				fc.out.XorRegWithReg("rdi", "rdi")
+			}
+			if fc.platform.OS == OSWindows {
+				fc.out.MovRegToReg("rcx", "rdi")
+			}
+			fc.callFunction("exit", "")
+			fc.hasExplicitExit = true
+			return
+		}
 		fc.out.MovRegToReg("rsp", "rbp")
 
 		// REGISTER ALLOCATOR: Restore callee-saved registers (for lambda functions)
@@ -3847,6 +3880,19 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		if e.Operator == "::" {
 			return "list"
 		}
+		if e.Operator == "or!" {
+			return fc.getExprType(e.Left)
+		}
+		if e.Operator == "+" {
+			lt := fc.getExprType(e.Left)
+			rt := fc.getExprType(e.Right)
+			if (lt == "list" || rt == "list") && lt != "string" && rt != "string" {
+				return "list"
+			}
+			if lt == "string" || rt == "string" {
+				return "string"
+			}
+		}
 		// Binary expressions between strings return strings if operator is "+"
 		if e.Operator == "+" {
 			leftType := fc.getExprType(e.Left)
@@ -3863,8 +3909,23 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		}
 		return "number"
 	case *CallExpr:
+		if e.Function == "str" {
+			return "string"
+		}
 		if fc.isCFFIStringCall(e) {
 			return "cstring"
+		}
+		if rt := fc.inferCallReturnType(e.Function); rt != "" && rt != "unknown" {
+			return rt
+		}
+		if e.IsCFFI {
+			switch e.Function {
+			case "malloc", "realloc", "calloc", "fopen":
+				return "cpointer"
+			case "getenv", "strerror":
+				return "cstring"
+			}
+			return "number"
 		}
 		// Check if this is a C FFI call (namespace.function where namespace is a C import)
 		if strings.Contains(e.Function, ".") {
@@ -3967,6 +4028,9 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 			return "number"
 		}
 	case *IndexExpr:
+		if ct := fc.getExprType(e.List); ct == "string" {
+			return "string"
+		}
 		// Indexing returns the element type
 		// For lists/maps, elements are numbers (float64)
 		return "number"
@@ -4006,7 +4070,14 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		if n := len(e.Statements); n > 0 {
 			switch s := e.Statements[n-1].(type) {
 			case *ExpressionStmt:
+				if id, ok := s.Expr.(*IdentExpr); ok {
+					if t := fc.blockLocalType(e.Statements, id.Name); t != "" {
+						return t
+					}
+				}
 				return fc.getExprType(s.Expr)
+			case *AssignStmt:
+				return fc.getExprType(s.Value)
 			case *JumpStmt:
 				if s.Value != nil {
 					return fc.getExprType(s.Value)
@@ -4017,6 +4088,91 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 	default:
 		return "unknown"
 	}
+}
+
+// inferCallReturnType derives a user function's result type from its body.
+func (fc *TimCompiler) inferCallReturnType(name string) string {
+	key := name
+	if i := strings.LastIndex(key, "."); i >= 0 {
+		key = key[i+1:]
+	}
+	if fc.inferringResult[key] {
+		return ""
+	}
+	fc.inferringResult[key] = true
+	defer delete(fc.inferringResult, key)
+	lam := fc.funcBodyByName[name]
+	if lam == nil {
+		if i := strings.LastIndex(name, "."); i >= 0 {
+			lam = fc.funcBodyByName[name[i+1:]]
+		}
+	}
+	if lam == nil {
+		for _, lf := range fc.lambdaFuncs {
+			if lf.Name == name {
+				return fc.getExprType(lf.Body)
+			}
+		}
+		return ""
+	}
+	savedVals := make(map[string]string, len(lam.Params))
+	savedHad := make(map[string]bool, len(lam.Params))
+	for _, p := range lam.Params {
+		savedVals[p], savedHad[p] = fc.varTypes[p]
+		t := "unknown"
+		if ct, ok := lam.ParamCStructTypes[p]; ok {
+			switch ct {
+			case "num":
+				t = "number"
+			case "str":
+				t = "string"
+			case "list":
+				t = "list"
+			case "map":
+				t = "map"
+			case "bool":
+				t = "bool"
+			}
+		}
+		fc.varTypes[p] = t
+	}
+	result := fc.getExprType(lam.Body)
+	for _, p := range lam.Params {
+		if savedHad[p] {
+			fc.varTypes[p] = savedVals[p]
+		} else {
+			delete(fc.varTypes, p)
+		}
+	}
+	return result
+}
+
+// blockLocalType finds the type of a local from its assignment inside a block.
+func (fc *TimCompiler) blockLocalType(stmts []Statement, name string) string {
+	for _, stmt := range slices.Backward(stmts) {
+		if a, ok := stmt.(*AssignStmt); ok && a.Name == name {
+			return fc.getExprType(a.Value)
+		}
+	}
+	return ""
+}
+
+// tailExprType types a statement block by its final expression.
+func tailExprType(fc *TimCompiler, stmts []Statement) string {
+	if len(stmts) == 0 {
+		return ""
+	}
+	switch s := stmts[len(stmts)-1].(type) {
+	case *ExpressionStmt:
+		return fc.getExprType(s.Expr)
+	case *AssignStmt:
+		return fc.getExprType(s.Value)
+	case *JumpStmt:
+		if s.Value != nil {
+			return fc.getExprType(s.Value)
+		}
+	}
+	return ""
 }
 
 // getCStructForExpr returns the CStructDecl for an expression if it's known to be a cstruct pointer.
@@ -4972,7 +5128,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			leftType := fc.getExprType(e.Left)
 			rightType := fc.getExprType(e.Right)
 
-			if leftType == "string" && rightType == "string" {
+			if (leftType == "string" || rightType == "string") && leftType != "list" && rightType != "list" {
 				// String concatenation (strings are maps, so merge with offset keys)
 				leftStr, leftIsLiteral := e.Left.(*StringExpr)
 				rightStr, rightIsLiteral := e.Right.(*StringExpr)
@@ -5057,7 +5213,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				break
 			}
 
-			if leftType == "list" && rightType == "list" {
+			if rightType == "list" && leftType != "string" {
 				// List concatenation: [1, 2] + [3, 4] -> [1, 2, 3, 4]
 				leftList, leftIsLiteral := e.Left.(*ListExpr)
 				rightList, rightIsLiteral := e.Right.(*ListExpr)
@@ -5105,7 +5261,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 
 			// List + element: append element to list
 			// This makes "list += element" work as shorthand for "list <- list.append(element)"
-			if leftType == "list" || leftType == "unknown" {
+			if leftType == "list" {
 				// Compile list (result in xmm0)
 				fc.compileExpression(e.Left)
 				fc.out.SubImmFromReg("rsp", 8)
@@ -5501,8 +5657,10 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				fc.out.MovImmToReg("rax", fmt.Sprintf("%d", i))
 				fc.out.MovRegToMem("rax", "rbx", offset)
 
-				// Compile and write value
+				// Compile and write value (element compiles may clobber rbx)
+				fc.out.PushReg("rbx")
 				fc.compileExpression(elem)
+				fc.out.PopReg("rbx")
 				fc.out.MovXmmToMem("xmm0", "rbx", offset+8)
 			}
 
@@ -5624,9 +5782,8 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		// Strings are map[uint64]float64, so use map indexing
 		containerType := fc.getExprType(e.List)
 
-		// If indexing a number, return 0.0 (undefined property)
 		if containerType == "number" {
-			fc.out.XorpdXmm("xmm0", "xmm0") // xmm0 = 0.0
+			fc.out.XorpdXmm("xmm0", "xmm0")
 			break
 		}
 
@@ -5649,7 +5806,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		// Compile index/key expression (returns value as float64 in xmm0)
 		fc.compileExpression(e.Index)
 		// Save key/index to stack
-		fc.out.MovXmmToMem("xmm0", "rsp", StackSlotSize)
+		fc.out.MovXmmToMem("xmm0", "rsp", 8)
 
 		// Load container pointer from stack to rbx
 		// Pointer is stored as float64, need to extract to integer register
@@ -5668,7 +5825,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			// Keys are interleaved with values at 16-byte strides
 			//
 			// Load key to search for from stack into xmm2
-			fc.out.MovMemToXmm("xmm2", "rsp", StackSlotSize)
+			fc.out.MovMemToXmm("xmm2", "rsp", 8)
 
 			// Load count from [rbx]
 			fc.out.MovMemToXmm("xmm1", "rbx", 0)
@@ -5923,7 +6080,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			// Offset = 8 + (index * 16) + 8 = 16 + index * 16
 
 			// Load index from stack (as float64)
-			fc.out.MovMemToXmm("xmm0", "rsp", StackSlotSize)
+			fc.out.MovMemToXmm("xmm0", "rsp", 8)
 			// Convert index from float64 to integer in rcx
 			fc.out.Cvttsd2si("rcx", "xmm0")
 
@@ -6584,6 +6741,9 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 	case "cstr":
 		// Check if this is a boolean
 		exprType := fc.getExprType(expr.Expr)
+		if exprType == "cstring" || exprType == "cstr" || exprType == "cpointer" {
+			return
+		}
 		if exprType == "bool" {
 			// Convert boolean to C string ("true" or "false")
 			fc.out.Cvttsd2si("rcx", "xmm0") // 1 for yes, 0 for no
@@ -6616,11 +6776,7 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 			donePos := fc.eb.text.Len()
 			fc.eb.text.Bytes()[doneJump] = byte(donePos - (doneJump + 1))
 
-			// Convert C string pointer to float64 in xmm0
-			fc.out.SubImmFromReg("rsp", StackSlotSize)
-			fc.out.MovRegToMem("rax", "rsp", 0)
-			fc.out.MovMemToXmm("xmm0", "rsp", 0)
-			fc.out.AddImmToReg("rsp", StackSlotSize)
+			fc.out.Cvtsi2sd("xmm0", "rax")
 			return
 		}
 
@@ -6630,11 +6786,7 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 		fc.trackFunctionCall("_tim_string_to_cstr")
 		fc.trackFunctionCall("_tim_string_to_cstr")
 		fc.out.CallSymbol("_tim_string_to_cstr")
-		// Convert C string pointer (rax) back to float64 in xmm0
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		fc.out.MovRegToMem("rax", "rsp", 0)
-		fc.out.MovMemToXmm("xmm0", "rsp", 0)
-		fc.out.AddImmToReg("rsp", StackSlotSize)
+		fc.out.Cvtsi2sd("xmm0", "rax")
 
 	case "string", "str":
 		// Convert value to Tim string
@@ -6643,6 +6795,13 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 		if exprType == "string" {
 			// Already a string, no conversion needed
 			// xmm0 already has correct value from fc.compileExpression(expr.Expr)
+			return
+		}
+
+		if exprType == "cstring" || exprType == "cstr" || exprType == "cpointer" {
+			fc.out.Cvttsd2si("rdi", "xmm0")
+			fc.trackFunctionCall("_tim_cstr_to_string")
+			fc.out.CallSymbol("_tim_cstr_to_string")
 			return
 		}
 
@@ -6663,10 +6822,8 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 
 		fc.emitNumToString()
 
-	case "list":
-		// Convert C array to Tim list
-		// TODO: implement when needed (requires length parameter)
-		compilerError("'as list' conversion not yet implemented")
+	case "list", "map", "bool":
+		// Native type annotations are metadata: the value is unchanged
 
 	case "cbool":
 		// Convert Tim boolean to C bool (true/false integer)
@@ -7552,7 +7709,7 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 
 			// Mark parameter type as "number" by default (all values are float64 in Tim)
 			// This prevents x + y from being interpreted as list append when x and y are parameters
-			fc.varTypes[paramName] = "number"
+			fc.varTypes[paramName] = "unknown"
 
 			// A cstruct-typed param (`(a as V)` or a method's implicit `self: V`):
 			// record the type so `a.x` inside the body reads the field directly.
@@ -7561,6 +7718,19 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 			if ct, ok := lambda.ParamCStructTypes[paramName]; ok {
 				if _, isStruct := fc.cstructs[ct]; isStruct {
 					fc.varCStructType[paramName] = ct
+				} else {
+					switch ct {
+					case "num":
+						fc.varTypes[paramName] = "number"
+					case "str":
+						fc.varTypes[paramName] = "string"
+					case "list":
+						fc.varTypes[paramName] = "list"
+					case "map":
+						fc.varTypes[paramName] = "map"
+					case "bool":
+						fc.varTypes[paramName] = "bool"
+					}
 				}
 			}
 
@@ -7719,7 +7889,7 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 			if typ, exists := lambda.CapturedVarTypes[capturedVar]; exists {
 				fc.varTypes[capturedVar] = typ
 			} else {
-				fc.varTypes[capturedVar] = "number"
+				fc.varTypes[capturedVar] = "unknown"
 			}
 
 			// Load captured variable from environment and store at fixed offset
@@ -8007,7 +8177,7 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 	// String runtime functions (string_concat, string_to_cstr) use arena allocation.
 	// If they're needed but arenas weren't explicitly used in the source, set up arenas now.
 	numNeedsArena := fc.usedFunctions["_tim_num"] && fc.eb.target.OS() != OSLinux
-	if !fc.usesArenas && (fc.usedFunctions["_tim_string_concat"] || fc.usedFunctions["_tim_string_to_cstr"] || numNeedsArena) {
+	if !fc.usesArenas && (fc.usedFunctions["_tim_string_concat"] || fc.usedFunctions["_tim_string_to_cstr"] || fc.usedFunctions["_tim_cstr_to_string"] || numNeedsArena) {
 		fc.usesArenas = true
 		fc.eb.DefineWritable("_tim_arena_meta", "\x00\x00\x00\x00\x00\x00\x00\x00")
 		fc.eb.DefineWritable("_tim_arena_meta_cap", "\x00\x00\x00\x00\x00\x00\x00\x00")
@@ -8395,10 +8565,16 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		// Save C string pointer
 		fc.out.MovRegToReg("r12", "rdi") // r12 = C string pointer
 
-		// Calculate string length using strlen(r12)
-		fc.out.MovRegToReg("rdi", "r12") // Set argument for strlen
-		fc.callFunction("strlen", "")
-		fc.out.MovRegToReg("r14", "rax") // r14 = string length
+		fc.out.XorRegWithReg("r14", "r14")
+		lenStart := fc.eb.text.Len()
+		fc.out.Emit([]byte{0x43, 0x80, 0x3c, 0x34, 0x00})
+		lenDoneJump := fc.eb.text.Len()
+		fc.out.Emit([]byte{0x74, 0x00})
+		fc.out.IncReg("r14")
+		lenBackJump := fc.eb.text.Len()
+		fc.out.Emit([]byte{0xeb, 0x00})
+		fc.patchShortJump(lenBackJump+1, lenStart)
+		fc.patchShortJump(lenDoneJump+1, fc.eb.text.Len())
 
 		// Allocate Tim string map: 8 + (length * 16) bytes
 		// count (8 bytes) + (key, value) pairs (16 bytes each)
@@ -12099,6 +12275,23 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 				"printf":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
 				"strerror": {ReturnType: "const char*", Params: []CFunctionParam{{Type: "int"}}},
 				"getenv":   {ReturnType: "const char*", Params: []CFunctionParam{{Type: "const char*"}}},
+				"memset":   {ReturnType: "void*", Params: []CFunctionParam{{Type: "void*"}, {Type: "int"}, {Type: "size_t"}}},
+				"memcpy":   {ReturnType: "void*", Params: []CFunctionParam{{Type: "void*"}, {Type: "void*"}, {Type: "size_t"}}},
+				"memcmp":   {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}, {Type: "void*"}, {Type: "size_t"}}},
+				"strlen":   {ReturnType: "size_t", Params: []CFunctionParam{{Type: "const char*"}}},
+				"strcmp":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+				"fopen":    {ReturnType: "void*", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+				"fclose":   {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}}},
+				"fread":    {ReturnType: "size_t", Params: []CFunctionParam{{Type: "void*"}, {Type: "size_t"}, {Type: "size_t"}, {Type: "void*"}}},
+				"fwrite":   {ReturnType: "size_t", Params: []CFunctionParam{{Type: "void*"}, {Type: "size_t"}, {Type: "size_t"}, {Type: "void*"}}},
+				"fseek":    {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}, {Type: "long"}, {Type: "int"}}},
+				"ftell":    {ReturnType: "long", Params: []CFunctionParam{{Type: "void*"}}},
+				"remove":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+				"rename":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+				"time":     {ReturnType: "int64_t", Params: []CFunctionParam{{Type: "void*"}}},
+				"usleep":   {ReturnType: "int", Params: []CFunctionParam{{Type: "uint"}}},
+				"exit":     {ReturnType: "void", Params: []CFunctionParam{{Type: "int"}}},
+				"atoi":     {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
 			}
 			if sig, ok := commonFunctions[funcName]; ok {
 				funcSig = sig
@@ -16848,9 +17041,18 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		// Save FILE* pointer
 		fc.out.PushReg("rax")
 
-		// Get content length using strlen
 		fc.out.MovMemToReg("rdi", "rsp", StackSlotSize) // content
-		fc.callFunction("strlen", "")
+		fc.out.XorRegWithReg("rdx", "rdx")
+		wlenStart := fc.eb.text.Len()
+		fc.out.Emit([]byte{0x80, 0x3c, 0x17, 0x00})
+		wlenDoneJump := fc.eb.text.Len()
+		fc.out.Emit([]byte{0x74, 0x00})
+		fc.out.IncReg("rdx")
+		wlenBackJump := fc.eb.text.Len()
+		fc.out.Emit([]byte{0xeb, 0x00})
+		fc.patchShortJump(wlenBackJump+1, wlenStart)
+		fc.patchShortJump(wlenDoneJump+1, fc.eb.text.Len())
+		fc.out.MovRegToReg("rax", "rdx")
 		fc.out.PushReg("rax") // Save length
 
 		// Write file: fwrite(content, 1, length, file)
@@ -18291,7 +18493,7 @@ func checkForwardReferences(program *Program) []string {
 		"popcount": true, "clz": true, "ctz": true,
 		"chan": true, "close": true,
 		"append": true, "head": true, "tail": true, "pop": true,
-		"error": true, "is_nan": true,
+		"error": true, "is_nan": true, "str": true,
 		"_error_code_extract": true,
 		"printa":              true,
 		"alloc":               true, "free": true,
@@ -18385,6 +18587,8 @@ func checkForwardReferences(program *Program) []string {
 // (implemented in the compiler). Shared by getUnknownFunctions (validation)
 // and suggestSimilarFunctions ("did you mean" hints).
 var builtinFunctionNames = map[string]bool{
+	"str":       true,
+	"read_file": true, "write_file": true,
 	"printf": true, "exit": true, "syscall": true,
 	"getpid": true, "me": true,
 	"print": true, "println": true, "peek32": true, "peek8": true, // builtin optimizations, not dependencies
