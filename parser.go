@@ -2587,6 +2587,10 @@ func (p *Parser) parseMatchClause() (*MatchClause, bool) {
 	isStatementToken := p.current.Type == TOKEN_RET ||
 		p.current.Type == TOKEN_ERR ||
 		p.current.Type == TOKEN_LBRACE ||
+		p.current.Type == TOKEN_FOR ||
+		p.current.Type == TOKEN_FOREACH ||
+		p.current.Type == TOKEN_WHILE ||
+		p.current.Type == TOKEN_IF ||
 		(p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS))
 
 	if isStatementToken {
@@ -2729,6 +2733,14 @@ func (p *Parser) parseMatchTarget() Expression {
 
 		// Return a JumpExpr with IsBreak semantics (ret exits loop)
 		return &JumpExpr{Label: label, Value: value, IsBreak: true}
+	case TOKEN_FOR, TOKEN_FOREACH, TOKEN_WHILE, TOKEN_IF:
+		// A loop or if statement as a match target: parse it as a statement
+		stmt := p.parseStatement()
+		if stmt != nil {
+			return &BlockExpr{Statements: []Statement{stmt}}
+		}
+		return &NumberExpr{Value: 1.0}
+
 	case TOKEN_IDENT:
 		// Check if this is an assignment statement (x <- value or x = value)
 		if p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS {
@@ -4662,7 +4674,8 @@ func (p *Parser) parsePrimary() Expression {
 			// cstruct-typed param's fields resolve in the body without manual casts.
 			if variadicParam == "" && (p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON) {
 				p.nextToken() // skip 'as' / ':'
-				if p.current.Type != TOKEN_IDENT {
+				if p.current.Value == "" || !((p.current.Value[0] >= 'a' && p.current.Value[0] <= 'z') ||
+					(p.current.Value[0] >= 'A' && p.current.Value[0] <= 'Z')) {
 					// Not a valid lambda, restore and parse as expression
 					p.restoreState(lambdaState)
 					expr := p.parseExpression()
@@ -4701,7 +4714,8 @@ func (p *Parser) parsePrimary() Expression {
 					// Optional type annotation (captured for cstruct field access).
 					if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
 						p.nextToken() // skip 'as' / ':'
-						if p.current.Type != TOKEN_IDENT {
+						if p.current.Value == "" || !((p.current.Value[0] >= 'a' && p.current.Value[0] <= 'z') ||
+							(p.current.Value[0] >= 'A' && p.current.Value[0] <= 'Z')) {
 							// Not a valid lambda, restore and parse as expression
 							p.restoreState(lambdaState)
 							expr := p.parseExpression()
