@@ -1,4 +1,4 @@
-.PHONY: install test clean cover
+.PHONY: install test bench clean cover
 
 PROGRAM := tim
 SOURCES := $(wildcard *.go)
@@ -36,6 +36,10 @@ install: $(PROGRAM)
 test:
 	@echo "Running tests..."
 	$(GO) test -mod=vendor -count=1 -timeout 5m ./...
+
+bench:
+	@echo "Benchmarks (median of 5 runs)..."
+	$(GO) run ./benchmarks
 
 cover:
 	$(GO) test -mod=vendor -coverprofile=coverage.out -coverpkg=./... ./...

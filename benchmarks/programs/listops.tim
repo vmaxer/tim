@@ -1,0 +1,9 @@
+xs := []
+for i in 0..<5000 {
+	xs <- append(xs, i)
+}
+s := 0
+for x in xs {
+	s <- s + x
+}
+println(s)

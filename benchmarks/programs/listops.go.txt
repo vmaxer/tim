@@ -1,0 +1,15 @@
+package main
+
+import "fmt"
+
+func main() {
+	xs := make([]int, 0, 5000)
+	for i := 0; i < 5000; i++ {
+		xs = append(xs, i)
+	}
+	s := 0
+	for _, x := range xs {
+		s += x
+	}
+	fmt.Println(s)
+}

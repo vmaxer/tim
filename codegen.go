@@ -5619,11 +5619,11 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				fc.regTracker.FreeXMM(listReg)
 				fc.regTracker.FreeXMM(countReg)
 
-				// Calculate new size: 16 + (count + 1) * 16
+				// Calculate new size: 16 + (count + 1) * 16 + 8 (capacity word)
 				fc.out.MovRegToReg("rdx", "rcx")
 				fc.out.AddImmToReg("rdx", 1)
 				fc.out.ShlImmReg("rdx", 4)
-				fc.out.AddImmToReg("rdx", 16)
+				fc.out.AddImmToReg("rdx", 24)
 
 				// Allocate new list
 				fc.out.MovRegToReg("rdi", "rdx")
@@ -5645,6 +5645,12 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 				fc.out.MovImmToReg("rdx", fmt.Sprint(math.Float64bits(tagList)))
 				fc.out.MovRegToMem("rdx", "rax", 0)
 				fc.out.MovXmmToMem(newCountReg, "rax", 8)
+				// capacity = count, at [16 + 16*count]
+				fc.out.MovRegToReg("rdx", "r10")
+				fc.out.ShlImmReg("rdx", 4)
+				fc.out.AddImmToReg("rdx", 16)
+				fc.out.AddRegToReg("rdx", "rax")
+				fc.out.MovXmmToMem(newCountReg, "rdx", 0)
 				fc.regTracker.FreeXMM(newCountReg)
 
 				// Copy old elements if count > 0
@@ -5975,13 +5981,11 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			labelName := fmt.Sprintf("empty_list_%d", fc.stringCounter)
 			fc.stringCounter++
 
-			// Create empty list data: tag + count = 0.0
+			// Create empty list data: tag + count + capacity
 			var listData []byte
 			listData = append(listData, f64le(tagList)...)
-			countBits := uint64(0)
-			for i := range 8 {
-				listData = append(listData, byte((countBits>>(i*8))&ByteMask))
-			}
+			listData = append(listData, f64le(0)...)
+			listData = append(listData, f64le(0)...)
 
 			fc.eb.Define(labelName, string(listData))
 			fc.out.LeaSymbolToReg("rax", labelName)
@@ -6000,6 +6004,11 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			for i := range 8 {
 				listData = append(listData, byte((countBits>>(i*8))&ByteMask))
 			}
+
+			// capacity = count (exact fit; append(xs!, x) grows in place)
+			defer func() {
+				listData = append(listData, f64le(float64(count))...)
+			}()
 
 			// Write [key, value] pairs
 			for i, elem := range e.Elements {
@@ -6033,7 +6042,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		runtimeAllocation:
 			// Dynamic list: allocate memory and populate at runtime
 			// Size: 16 + (count * 16) bytes
-			size := 16 + (count * 16)
+			size := 16 + (count * 16) + 8 // + capacity word
 
 			// Allocate memory using arena allocator
 			fc.out.MovImmToReg("rdi", fmt.Sprintf("%d", size))
@@ -6050,6 +6059,8 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 			fc.out.MovImmToReg("rax", fmt.Sprintf("%d", count))
 			fc.out.Cvtsi2sd("xmm0", "rax")
 			fc.out.MovXmmToMem("xmm0", "rbx", 8)
+			// capacity = count (exact fit)
+			fc.out.MovXmmToMem("xmm0", "rbx", int(16+16*count))
 
 			// Write each [key, value] pair
 			for i, elem := range e.Elements {
@@ -8032,6 +8043,13 @@ func (fc *TimCompiler) compileParallelExpr(expr *ParallelExpr) {
 	fc.out.MovImmToReg("rax", fmt.Sprint(math.Float64bits(tagList)))
 	fc.out.MovRegToMem("rax", "r12", 0)
 	fc.out.MovXmmToMem("xmm0", "r12", 8)
+	// capacity = length
+	fc.out.MovMemToXmm("xmm1", "r13", 8)
+	fc.out.Cvttsd2si("rdx", "xmm1")
+	fc.out.ShlImmReg("rdx", 4)
+	fc.out.AddImmToReg("rdx", 16)
+	fc.out.AddRegToReg("rdx", "r12")
+	fc.out.MovXmmToMem("xmm0", "rdx", 0)
 
 	// Initialize loop counter to 0
 	fc.out.XorRegWithReg("r15", "r15") // r15 = index
@@ -8170,7 +8188,7 @@ func (fc *TimCompiler) generateLambdaFunctions() {
 		// Frame: 8(rbx) + 8(align) + params*16 + captured*16 + 2048(temp space)
 		// Temp space: Large buffer for local variables and expression temporaries
 		// This accounts for: local variable definitions, nested arithmetic, function calls, etc.
-		frameSize := 16 + paramCount*16 + capturedCount*16 + 4096
+		frameSize := 16 + paramCount*16 + capturedCount*16 + 1024
 		// Ensure 16-byte alignment for external function calls
 		frameSize = (frameSize + 15) & ^15
 
@@ -9870,6 +9888,12 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		fc.out.MovRegToMem("rax", "r10", 0)
 		fc.out.Cvtsi2sd("xmm0", "rbx")
 		fc.out.MovXmmToMem("xmm0", "r10", 8)
+		// capacity = count, at [16 + 16*count]
+		fc.out.MovRegToReg("rdx", "rbx")
+		fc.out.ShlImmReg("rdx", 4)
+		fc.out.AddImmToReg("rdx", 16)
+		fc.out.AddRegToReg("rdx", "r10")
+		fc.out.MovXmmToMem("xmm0", "rdx", 0)
 
 		fc.out.XorRegWithReg("rcx", "rcx") // next key
 		fc.out.LeaMemToReg("rdi", "r10", 16)
@@ -10736,29 +10760,53 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		// rdi now contains new_capacity
 		fc.out.MovRegToReg("r9", "rdi") // r9 = new_capacity (update)
 
-		// Check if new capacity exceeds max (1GB)
-		fc.out.MovImmToReg("rax", "1073741824") // 1GB max
-		fc.out.CmpRegToReg("r9", "rax")
-		arenaMaxExceeded := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpGreater, 0) // jg to error if > 1GB
-
 		// Grow the arena buffer
 		var arenaErrorJump int
 		if fc.eb.target.OS() == OSLinux {
-			// Use mremap syscall on Linux
+			// Grow in place with mremap (flags 0 = never move: arena pointers
+			// handed out earlier must stay valid).
 			// syscall 25: mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...)
-			// MREMAP_MAYMOVE = 1
 			fc.out.MovRegToReg("rdi", "r8")     // rdi = old buffer_ptr
 			fc.out.MovMemToReg("rsi", "rbx", 8) // rsi = old capacity from arena
 			fc.out.MovRegToReg("rdx", "r9")     // rdx = new_capacity
-			fc.out.MovImmToReg("r10", "1")      // r10 = MREMAP_MAYMOVE
+			fc.out.XorRegWithReg("r10", "r10")  // r10 = 0 (no MREMAP_MAYMOVE)
 			fc.out.MovImmToReg("rax", "25")     // rax = syscall number for mremap
 			fc.out.Syscall()
 
-			// Check if mremap failed (returns MAP_FAILED = -1 or negative on error)
-			fc.out.CmpRegToImm("rax", -1)
+			// In-place growth failed (-errno): fall back to a fresh mapping and
+			// copy; the old mapping is kept so earlier pointers stay valid.
+			fc.out.TestRegReg("rax", "rax")
+			mremapFailed := fc.eb.text.Len()
+			fc.out.JumpConditional(JumpLess, 0) // js fallback
+			jmpGrown := fc.eb.text.Len()
+			fc.out.JumpUnconditional(0)
+			fallbackLabel := fc.eb.text.Len()
+			fc.patchJumpImmediate(mremapFailed+2, int32(fallbackLabel-(mremapFailed+6)))
+
+			// mmap(new_capacity) and copy the used bytes over. mmap's own
+			// arguments clobber r8/r9 (old buffer, capacity), so park them.
+			fc.out.PushReg("r8")
+			fc.out.PushReg("r9")
+			fc.out.XorRegWithReg("rdi", "rdi") // addr = NULL
+			fc.out.MovRegToReg("rsi", "r9")    // length = new_capacity
+			fc.out.MovImmToReg("rdx", "3")     // PROT_READ|PROT_WRITE
+			fc.out.MovImmToReg("r10", "0x22")  // MAP_PRIVATE|MAP_ANONYMOUS
+			fc.out.MovImmToReg("r8", "-1")     // fd = -1
+			fc.out.XorRegWithReg("r9", "r9")   // offset = 0
+			fc.out.MovImmToReg("rax", "9")     // sys_mmap
+			fc.out.Syscall()
+			fc.out.PopReg("r9")
+			fc.out.PopReg("r8")
+			fc.out.TestRegReg("rax", "rax")
 			arenaErrorJump = fc.eb.text.Len()
-			fc.out.JumpConditional(JumpEqual, 0) // je to error (mremap failed)
+			fc.out.JumpConditional(JumpLess, 0) // js to error (mmap failed)
+			// copy aligned_offset bytes from the old buffer to the new one
+			fc.out.MovRegToReg("rdi", "rax")      // dest = new buffer
+			fc.out.MovRegToReg("rsi", "r8")       // src = old buffer
+			fc.out.MovRegToReg("rcx", "r13")      // count = used bytes
+			fc.out.Emit([]byte{0xF3, 0x48, 0xA4}) // rep movsb
+			grownLabel := fc.eb.text.Len()
+			fc.patchJumpImmediate(jmpGrown+1, int32(grownLabel-(jmpGrown+5)))
 		} else {
 			// Use realloc on Windows/macOS
 			shadowSpace := fc.allocateShadowSpace()
@@ -10798,7 +10846,6 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		// Error path: realloc failed or max size exceeded
 		arenaErrorLabel := fc.eb.text.Len()
 		fc.patchJumpImmediate(arenaErrorJump+2, int32(arenaErrorLabel-(arenaErrorJump+6)))
-		fc.patchJumpImmediate(arenaMaxExceeded+2, int32(arenaErrorLabel-(arenaMaxExceeded+6)))
 		fc.eb.MarkLabel("_arena_alloc_error")
 
 		// Print error message and exit(1)
@@ -10941,6 +10988,12 @@ func (fc *TimCompiler) generateRuntimeHelpers() {
 		fc.out.LeaMemToReg("rcx", "r14", 1)
 		fc.out.Cvtsi2sd("xmm0", "rcx")
 		fc.out.MovXmmToMem("xmm0", "r15", 8)
+		// capacity = count + 1
+		fc.out.MovRegToReg("rdx", "rcx")
+		fc.out.ShlImmReg("rdx", 4)
+		fc.out.AddImmToReg("rdx", 16)
+		fc.out.AddRegToReg("rdx", "r15")
+		fc.out.MovXmmToMem("xmm0", "rdx", 0)
 
 		// Entry 0: key 0.0, value = element
 		fc.out.XorRegWithReg("rcx", "rcx")
@@ -14203,6 +14256,12 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 			fc.out.MovRegToMem("rax", "r9", 0)
 			fc.out.Cvtsi2sd("xmm2", "r8")
 			fc.out.MovXmmToMem("xmm2", "r9", 8)
+			// capacity = new count
+			fc.out.MovRegToReg("rdx", "r8")
+			fc.out.ShlImmReg("rdx", 4)
+			fc.out.AddImmToReg("rdx", 16)
+			fc.out.AddRegToReg("rdx", "r9")
+			fc.out.MovXmmToMem("xmm2", "rdx", 0)
 
 			// Loop to copy elements: i from 0 to new_count-1
 			// new_list[8 + i*16] = i (key as uint64)
@@ -15376,11 +15435,11 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		fc.out.MovMemToXmm("xmm2", "rsi", 8) // xmm2 = count (as float)
 		fc.out.Cvttsd2si("rcx", "xmm2")      // rcx = count (as int)
 
-		// Calculate new size: 16 + (count + 1) * 16
+		// Calculate new size: 16 + (count + 1) * 16 + 8 (capacity word)
 		fc.out.MovRegToReg("rdx", "rcx")
 		fc.out.AddImmToReg("rdx", 1)  // rdx = count + 1
 		fc.out.ShlImmReg("rdx", 4)    // rdx = (count + 1) * 16
-		fc.out.AddImmToReg("rdx", 16) // rdx = new size
+		fc.out.AddImmToReg("rdx", 24) // rdx = new size
 
 		// Allocate new list
 		fc.out.MovRegToReg("rdi", "rdx")
@@ -15507,6 +15566,12 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		fc.out.MovRegToMem("rax", "r14", 0)
 		fc.out.Cvtsi2sd("xmm3", "r13")
 		fc.out.MovXmmToMem("xmm3", "r14", 8)
+		// capacity = new count
+		fc.out.MovRegToReg("rdx", "r13")
+		fc.out.ShlImmReg("rdx", 4)
+		fc.out.AddImmToReg("rdx", 16)
+		fc.out.AddRegToReg("rdx", "r14")
+		fc.out.MovXmmToMem("xmm3", "rdx", 0)
 
 		// Copy elements to new_list if new count > 0
 		fc.out.TestRegReg("r13", "r13")
@@ -20313,12 +20378,12 @@ func CompileTim(inputPath string, outputPath string, platform Platform) (err err
 }
 
 func CompileTimWithOptions(inputPath string, outputPath string, platform Platform, wpoTimeout float64, verbose bool, depsOnly bool) (err error) {
-	// The ARM64 and RISC-V64 backends walk containers with the old flat/offset
-	// layouts and would silently misread the tagged v2 format. Refuse to emit
-	// for them until they are migrated (the cross-arch suite verifies the
-	// migration where qemu is available).
-	if platform.Arch == ArchARM64 || platform.Arch == ArchRiscv64 {
-		return fmt.Errorf("%s backend is pending the container format v2 migration; build for x86-64 meanwhile", platform.Arch)
+	// The ARM64 backend walks containers with the old flat/offset layout and
+	// would silently misread the tagged v2 format. Refuse to emit for it until
+	// it is migrated (the cross-arch suite verifies the migration where qemu
+	// is available).
+	if platform.Arch == ArchARM64 {
+		return fmt.Errorf("%s backend is pending the container format v2 migration; build for x86-64 or RISC-V64 meanwhile", platform.Arch)
 	}
 
 	// Set verbose mode

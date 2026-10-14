@@ -214,6 +214,9 @@ func rvCollectNames(node any, add func(name string, update bool)) {
 		rvCollectNames(n.Expr, add)
 	case *LoopStmt:
 		add(n.Iterator, false)
+		if n.KeyVar != "" {
+			add(n.KeyVar, false)
+		}
 		rvCollectNames(n.Iterable, add)
 		for _, s := range n.Body {
 			rvCollectNames(s, add)
@@ -508,9 +511,9 @@ func (g *rvGen) emitHelpers() {
 	loop, done = g.newLabel(), g.newLabel()
 	g.addi(rvSP, rvSP, -16)
 	g.sd(rvRA, rvSP, 8)
-	g.fld(rvFT0, rvA0, 0)
+	g.fld(rvFT0, rvA0, 8)
 	g.fcvtLD(rvT3, rvFT0, 1)
-	g.addi(rvT4, rvA0, 16)
+	g.addi(rvT4, rvA0, 24)
 	g.bind(loop)
 	g.beqz(rvT3, done)
 	g.fld(rvFT0, rvT4, 0)
@@ -627,23 +630,25 @@ func (g *rvGen) emitHelpers() {
 	g.sd(rvS3, rvSP, 8)
 	g.mv(rvS2, rvA0)
 	g.mv(rvS3, rvA1)
-	g.fld(rvFT0, rvS2, 0)
-	g.fld(rvFT1, rvS3, 0)
+	g.fld(rvFT0, rvS2, 8)
+	g.fld(rvFT1, rvS3, 8)
 	g.fop(0x01, 7, rvFT0, rvFT0, rvFT1)
 	g.fsd(rvFT0, rvSP, 0)
 	g.fcvtLD(rvA1, rvFT0, 1)
 	g.slli(rvA1, rvA1, 4)
-	g.addi(rvA1, rvA1, 8)
+	g.addi(rvA1, rvA1, 16)
 	g.call(l["alloc"])
+	g.li(rvT0, int64(math.Float64bits(tagString)))
+	g.sd(rvT0, rvA0, 0)
 	g.fld(rvFT0, rvSP, 0)
-	g.fsd(rvFT0, rvA0, 0)
-	g.addi(rvT2, rvA0, 8)
+	g.fsd(rvFT0, rvA0, 8)
+	g.addi(rvT2, rvA0, 16)
 	g.li(rvT3, 0)
 	for _, src := range []uint32{rvS2, rvS3} {
 		loop, next := g.newLabel(), g.newLabel()
-		g.fld(rvFT0, src, 0)
+		g.fld(rvFT0, src, 8)
 		g.fcvtLD(rvT0, rvFT0, 1)
-		g.addi(rvT1, src, 16)
+		g.addi(rvT1, src, 24)
 		g.bind(loop)
 		g.beqz(rvT0, next)
 		g.sd(rvT3, rvT2, 0)
@@ -670,28 +675,32 @@ func (g *rvGen) emitHelpers() {
 	g.sd(rvS3, rvSP, 8)
 	g.mv(rvS2, rvA0)
 	g.mv(rvS3, rvA1)
-	g.fld(rvFT0, rvS2, 0)
-	g.fld(rvFT1, rvS3, 0)
+	g.fld(rvFT0, rvS2, 8)
+	g.fld(rvFT1, rvS3, 8)
 	g.fop(0x01, 7, rvFT0, rvFT0, rvFT1)
 	g.fsd(rvFT0, rvSP, 0)
 	g.fcvtLD(rvA1, rvFT0, 1)
-	g.slli(rvA1, rvA1, 3)
-	g.addi(rvA1, rvA1, 8)
+	g.slli(rvA1, rvA1, 4)
+	g.addi(rvA1, rvA1, 16)
 	g.call(l["alloc"])
+	g.li(rvT0, int64(math.Float64bits(tagList)))
+	g.sd(rvT0, rvA0, 0)
 	g.fld(rvFT0, rvSP, 0)
-	g.fsd(rvFT0, rvA0, 0)
-	g.addi(rvT2, rvA0, 8)
+	g.fsd(rvFT0, rvA0, 8)
+	g.addi(rvT2, rvA0, 16)
 	for _, src := range []uint32{rvS2, rvS3} {
 		loop, next := g.newLabel(), g.newLabel()
-		g.fld(rvFT0, src, 0)
+		g.fld(rvFT0, src, 8)
 		g.fcvtLD(rvT0, rvFT0, 1)
-		g.addi(rvT1, src, 8)
+		g.addi(rvT1, src, 16)
 		g.bind(loop)
 		g.beqz(rvT0, next)
-		g.fld(rvFT0, rvT1, 0)
-		g.fsd(rvFT0, rvT2, 0)
-		g.addi(rvT1, rvT1, 8)
-		g.addi(rvT2, rvT2, 8)
+		g.ld(rvT4, rvT1, 0)
+		g.sd(rvT4, rvT2, 0)
+		g.fld(rvFT0, rvT1, 8)
+		g.fsd(rvFT0, rvT2, 8)
+		g.addi(rvT1, rvT1, 16)
+		g.addi(rvT2, rvT2, 16)
 		g.addi(rvT0, rvT0, -1)
 		g.j(loop)
 		g.bind(next)
@@ -715,27 +724,31 @@ func (g *rvGen) emitHelpers() {
 	g.br(5, rvS3, 0, nonneg)
 	g.li(rvS3, 0)
 	g.bind(nonneg)
-	g.fld(rvFT0, rvS2, 0)
+	g.fld(rvFT0, rvS2, 8)
 	g.fcvtLD(rvS4, rvFT0, 1)
 	g.op(1, 0, rvA1, rvS4, rvS3)
 	g.sd(rvA1, rvSP, 0)
-	g.slli(rvA1, rvA1, 3)
-	g.addi(rvA1, rvA1, 8)
+	g.slli(rvA1, rvA1, 4)
+	g.addi(rvA1, rvA1, 16)
 	g.call(l["alloc"])
+	g.li(rvT0, int64(math.Float64bits(tagList)))
+	g.sd(rvT0, rvA0, 0)
 	g.ld(rvT0, rvSP, 0)
 	g.fcvtDL(rvFT0, rvT0)
-	g.fsd(rvFT0, rvA0, 0)
-	g.addi(rvT2, rvA0, 8)
+	g.fsd(rvFT0, rvA0, 8)
+	g.addi(rvT2, rvA0, 16)
 	g.bind(outer)
 	g.beqz(rvS3, rdone)
 	g.mv(rvT0, rvS4)
-	g.addi(rvT1, rvS2, 8)
+	g.addi(rvT1, rvS2, 16)
 	g.bind(inner)
 	g.beqz(rvT0, next)
-	g.fld(rvFT0, rvT1, 0)
-	g.fsd(rvFT0, rvT2, 0)
-	g.addi(rvT1, rvT1, 8)
-	g.addi(rvT2, rvT2, 8)
+	g.ld(rvT4, rvT1, 0)
+	g.sd(rvT4, rvT2, 0)
+	g.fld(rvFT0, rvT1, 8)
+	g.fsd(rvFT0, rvT2, 8)
+	g.addi(rvT1, rvT1, 16)
+	g.addi(rvT2, rvT2, 16)
 	g.addi(rvT0, rvT0, -1)
 	g.j(inner)
 	g.bind(next)
@@ -762,7 +775,7 @@ func (g *rvGen) emitHelpers() {
 	g.li(rvA0, '[')
 	g.call(l["putc"])
 	g.bind(loop)
-	g.fld(rvFT0, rvS2, 0)
+	g.fld(rvFT0, rvS2, 8)
 	g.fcvtLD(rvT0, rvFT0, 1)
 	g.br(5, rvS3, rvT0, done)
 	g.beqz(rvS3, first)
@@ -771,9 +784,9 @@ func (g *rvGen) emitHelpers() {
 	g.li(rvA0, ' ')
 	g.call(l["putc"])
 	g.bind(first)
-	g.slli(rvT0, rvS3, 3)
+	g.slli(rvT0, rvS3, 4)
 	g.op(0, 0, rvT0, rvT0, rvS2)
-	g.fld(rvFA0, rvT0, 8)
+	g.fld(rvFA0, rvT0, 24)
 	g.li(rvA0, numOpStr)
 	g.call(l["num"])
 	g.fmvXD(rvA0, rvFA0)
@@ -1142,10 +1155,12 @@ func (g *rvGen) number(v float64) {
 }
 
 func (g *rvGen) timString(s string) *rvLabel {
-	b := binary.LittleEndian.AppendUint64(nil, math.Float64bits(float64(len(s))))
-	for i := range len(s) {
+	runes := []rune(s)
+	b := binary.LittleEndian.AppendUint64(nil, math.Float64bits(tagString))
+	b = binary.LittleEndian.AppendUint64(b, math.Float64bits(float64(len(runes))))
+	for i, r := range runes {
 		b = binary.LittleEndian.AppendUint64(b, uint64(i))
-		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(float64(s[i])))
+		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(float64(r)))
 	}
 	return g.constData(b)
 }
@@ -1517,7 +1532,7 @@ func (g *rvGen) unary(op string, operand Expression) error {
 			return err
 		}
 		g.fmvXD(rvT0, rvFA0)
-		g.fld(rvFA0, rvT0, 0)
+		g.fld(rvFA0, rvT0, 8)
 	case "~b":
 		if err := g.expr(operand); err != nil {
 			return err
@@ -1553,16 +1568,16 @@ func (g *rvGen) bitwise(e *BinaryExpr) error {
 		g.op(0, 7, rvA0, rvA0, rvA1)
 	case "^b":
 		g.op(0, 4, rvA0, rvA0, rvA1)
-	case "<<b":
+	case "<<", "<<b":
 		g.op(0, 1, rvA0, rvA0, rvA1)
 	case "?b":
 		g.op(0, 5, rvA0, rvA0, rvA1)
 		g.andi(rvA0, rvA0, 1)
-	case ">>b":
+	case ">>", ">>b":
 		g.op(0, 5, rvA0, rvA0, rvA1)
-	case "<<<b", ">>>b":
+	case "<<<", "<<<b", ">>>", ">>>b":
 		g.op(0x20, 0, rvA2, 0, rvA1)
-		if e.Operator == "<<<b" {
+		if strings.HasPrefix(e.Operator, "<<<") {
 			g.op(0, 1, rvT0, rvA0, rvA1)
 			g.op(0, 5, rvT1, rvA0, rvA2)
 		} else {
@@ -1930,19 +1945,25 @@ func (g *rvGen) list(e *ListExpr) error {
 	mark := g.sc.ntmp
 	defer func() { g.sc.ntmp = mark }()
 	p := g.tmp()
-	g.li(rvA1, int64(8+8*len(e.Elements)))
+	g.li(rvA1, int64(16+16*len(e.Elements)))
 	g.call(g.l["alloc"])
 	g.sd(rvA0, rvS0, p)
+	g.li(rvT0, int64(math.Float64bits(tagList)))
+	g.ld(rvT1, rvS0, p)
+	g.sd(rvT0, rvT1, 0)
 	g.number(float64(len(e.Elements)))
-	g.fsd(rvFA0, rvA0, 0)
+	g.ld(rvT1, rvS0, p)
+	g.fsd(rvFA0, rvT1, 8)
 	for i, el := range e.Elements {
 		if err := g.expr(el); err != nil {
 			return err
 		}
 		g.ld(rvT0, rvS0, p)
-		g.li(rvT1, int64(8+8*i))
+		g.li(rvT1, int64(16+16*i))
 		g.op(0, 0, rvT0, rvT0, rvT1)
-		g.fsd(rvFA0, rvT0, 0)
+		g.li(rvT1, int64(i))
+		g.sd(rvT1, rvT0, 0)   // key = index
+		g.fsd(rvFA0, rvT0, 8) // value
 	}
 	g.ld(rvT0, rvS0, p)
 	g.fmvDX(rvFA0, rvT0)
@@ -1951,12 +1972,12 @@ func (g *rvGen) list(e *ListExpr) error {
 
 // elemAddr leaves the address of list element a0 in t0, or branches to oob.
 func (g *rvGen) elemAddr(list uint32, oob *rvLabel) {
-	g.fld(rvFT0, list, 0)
+	g.fld(rvFT0, list, 8)
 	g.fcvtLD(rvT1, rvFT0, 1)
 	g.br(7, rvA0, rvT1, oob)
-	g.slli(rvT0, rvA0, 3)
+	g.slli(rvT0, rvA0, 4)
 	g.op(0, 0, rvT0, rvT0, list)
-	g.addi(rvT0, rvT0, 8)
+	g.addi(rvT0, rvT0, 24)
 }
 
 func (g *rvGen) index(e *IndexExpr) error {
@@ -2027,6 +2048,14 @@ func (g *rvGen) listLoop(s *LoopStmt) error {
 		return err
 	}
 	g.setVarType(s.Iterator, "")
+	var kbase uint32
+	var koff int32
+	if s.KeyVar != "" {
+		if kbase, koff, err = g.varRef(s.KeyVar); err != nil {
+			return err
+		}
+		g.setVarType(s.KeyVar, "")
+	}
 	top, lp := g.newLabel(), rvLoop{g.newLabel(), g.newLabel()}
 	g.bind(top)
 	g.ld(rvT2, rvS0, p)
@@ -2034,6 +2063,11 @@ func (g *rvGen) listLoop(s *LoopStmt) error {
 	g.elemAddr(rvT2, lp.brk)
 	g.fld(rvFA0, rvT0, 0)
 	g.fsd(rvFA0, base, off)
+	if s.KeyVar != "" {
+		g.ld(rvT0, rvS0, i)
+		g.fcvtDL(rvFT1, rvT0)
+		g.fsd(rvFT1, kbase, koff)
+	}
 	g.sc.loops = append(g.sc.loops, lp)
 	if err := g.stmts(s.Body); err != nil {
 		return err
