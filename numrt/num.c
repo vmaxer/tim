@@ -31,7 +31,8 @@ enum {
 	OP_ADD = 1, OP_SUB, OP_MUL, OP_DIV, OP_MOD, OP_POW,
 	OP_LT, OP_LE, OP_GT, OP_GE, OP_EQ, OP_NE,
 	OP_STR, OP_FLOAT, OP_FLOOR, OP_CEIL, OP_ROUND, OP_TRUNC, OP_ABS,
-	OP_TO_I64, OP_FROM_I64, OP_FROM_U64, OP_EXACT,
+	OP_TO_I64, OP_FROM_I64, OP_FROM_U64, OP_EXACT, OP_INT_CAST, OP_INT_WRAP,
+	OP_FLOAT_CAST, OP_FLOAT_WRAP,
 };
 
 void *memcpy(void *d, const void *s, u64 n) {
@@ -967,7 +968,7 @@ static u64 to_string(Ctx *c, u64 v) {
 	s[0] = 0x3FF0000000000000ull; /* 1.0 = string tag */
 	s[1] = bits_of((double)(i64)b.n);
 	for (u64 i = 0; i < b.n; i++) {
-		s[2 + 2 * i] = i;
+		s[2 + 2 * i] = bits_of((double)(i64)i);
 		s[3 + 2 * i] = bits_of((double)(i64)(unsigned char)b.p[i]);
 	}
 	return (u64)s;
@@ -993,18 +994,128 @@ static u64 to_i64(Ctx *c, u64 v) {
 	return q.neg ? 0 - m : m;
 }
 
+static u64 from_u64(Ctx *c, u64 a, int neg) {
+	Int v = {mag_from_u64(c, neg ? 0 - a : a), neg};
+	return encode_int(c, &v);
+}
+
+// int_cast converts v to a `bits`-bit integer, signed when bit 8 of kind is
+// set. Checked, a fraction is an argument error and a value outside the
+// type's range an overflow error; wrapping rounds like round() and keeps the
+// low bits.
+static u64 int_cast(Ctx *c, u64 v, u64 kind, int wrap) {
+	u64 bits = kind & 0xff;
+	int sgn = (kind >> 8) & 1, fits;
+	u64 low;
+	if (wrap)
+		v = rounding(c, OP_ROUND, v);
+	if (!is_exact(v)) {
+		double x = double_of(v);
+		if (x != x)
+			return v;
+		if (x - x != 0.0)
+			return ERR_OVF;
+		double t = trunc_d(x);
+		if (t != x)
+			return ERR_ARG;
+		fits = sgn ? t >= neg_d(pow2(bits - 1)) && t < pow2(bits - 1) : t >= 0.0 && t < pow2(bits);
+		double r = t - trunc_d(t / pow2(64)) * pow2(64);
+		low = r < 0.0 ? 0 - (u64)neg_d(r) : r >= pow2(63) ? (u64)(i64)(r - pow2(63)) + SIGN_BIT : (u64)(i64)r;
+	} else {
+		Rat a;
+		load(v, &a);
+		if (!mag_is_one(&a.den))
+			return ERR_ARG;
+		Int q = a.num;
+		u64 m = q.m.n ? q.m.d[0] : 0, lim = sgn ? 1ull << (bits - 1) : bits == 64 ? 0 : 1ull << bits;
+		low = q.neg ? 0 - m : m;
+		if (q.m.n > 1)
+			fits = 0;
+		else if (sgn)
+			fits = q.neg ? m <= lim : m < lim;
+		else
+			fits = (!q.neg || m == 0) && (bits == 64 || m < lim);
+	}
+	if (!fits && !wrap)
+		return ERR_OVF;
+	if (bits < 64) {
+		u64 mask = (1ull << bits) - 1;
+		low &= mask;
+		if (sgn && (low >> (bits - 1)) & 1)
+			low |= ~mask;
+	}
+	return sgn ? from_u64(c, low, (i64)low < 0) : from_u64(c, low, 0);
+}
+
+// mag_sigbits is the number of bits between the highest and lowest set bit.
+static u64 mag_sigbits(const Mag *m) {
+	u64 tz = 0, i = 0;
+	while (i < m->n && !m->d[i]) {
+		tz += 64;
+		i++;
+	}
+	if (i < m->n) {
+		u64 w = m->d[i];
+		while (!(w & 1)) {
+			w >>= 1;
+			tz++;
+		}
+	}
+	return mag_bitlen(m) - tz;
+}
+
+static double round_float32(double x) { return (double)(float)x; }
+
+// float_cast converts v to the nearest float64 (or float32, when bits is 32).
+// Checked, a value the float cannot hold exactly is an argument error, and
+// one beyond its range an overflow error.
+static u64 float_cast(Ctx *c, u64 v, u64 bits, int wrap) {
+	double d;
+	int fits;
+	if (!is_exact(v)) {
+		d = double_of(v);
+		if (d != d)
+			return v;
+		if (bits == 32)
+			d = round_float32(d);
+		fits = d == double_of(v);
+	} else {
+		Rat a;
+		load(v, &a);
+		d = to_double(c, v);
+		if (bits == 32)
+			d = round_float32(d);
+		fits = a.den.n == 1 && (a.den.d[0] & (a.den.d[0] - 1)) == 0 &&
+			mag_sigbits(&a.num.m) <= (bits == 32 ? 24 : 53) && (d != 0.0 || a.num.m.n == 0);
+	}
+	if (!wrap && d - d != 0.0)
+		return ERR_OVF;
+	if (!wrap && !fits)
+		return ERR_ARG;
+	return bits_of(d);
+}
+
+u64 tim_num(u64 op, u64 a, u64 b, alloc_fn alloc, void *ctx);
+
+#include "val.c"
+
 u64 tim_num(u64 op, u64 a, u64 b, alloc_fn alloc, void *ctx) {
 	Ctx c = {alloc, ctx};
+	if (op >= V_STR)
+		return tim_val(&c, op, a, b);
 	switch (op) {
 	case OP_STR: return to_string(&c, a);
 	case OP_FLOAT: return bits_of(to_double(&c, a));
 	case OP_TO_I64: return to_i64(&c, a);
 	case OP_FROM_I64:
-	case OP_FROM_U64: {
-		int neg = op == OP_FROM_I64 && (i64)a < 0;
-		Int v = {mag_from_u64(&c, neg ? 0 - a : a), neg};
-		return encode_int(&c, &v);
-	}
+	case OP_FROM_U64:
+		return from_u64(&c, a, op == OP_FROM_I64 && (i64)a < 0);
+	case OP_INT_CAST:
+	case OP_INT_WRAP:
+		return int_cast(&c, a, b, op == OP_INT_WRAP);
+	case OP_FLOAT_CAST:
+	case OP_FLOAT_WRAP:
+		return float_cast(&c, a, b, op == OP_FLOAT_WRAP);
 	case OP_EXACT:
 		return bits_of((double)is_exact(a));
 	case OP_FLOOR:

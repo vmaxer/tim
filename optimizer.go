@@ -1160,18 +1160,6 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 		for _, stmt := range e.Body {
 			collectUsedVariables(stmt, usedVars)
 		}
-	case *MultiLambdaExpr:
-		// For multi-lambda, collect variables from all lambda bodies
-		for _, lambda := range e.Lambdas {
-			collectUsedVariablesExpr(lambda.Body, usedVars)
-		}
-	case *SendExpr:
-		// SendExpr has Target and Message
-		collectUsedVariablesExpr(e.Target, usedVars)
-		collectUsedVariablesExpr(e.Message, usedVars)
-	case *ReceiveExpr:
-		// ReceiveExpr has Source
-		collectUsedVariablesExpr(e.Source, usedVars)
 	case *UnsafeExpr:
 		// UnsafeExpr has architecture-specific blocks
 		for _, stmt := range e.X86_64Block {
@@ -1183,8 +1171,6 @@ func collectUsedVariablesExpr(expr Expression, usedVars map[string]bool) {
 		for _, stmt := range e.RISCV64Block {
 			collectUsedVariables(stmt, usedVars)
 		}
-	case *LoopStateExpr:
-		// LoopStateExpr doesn't reference variables
 	case *JumpExpr:
 		// JumpExpr doesn't reference variables directly
 	case *FMAExpr:
@@ -1474,6 +1460,10 @@ func collectCapturedVarsExpr(expr Expression, paramSet map[string]bool, captured
 		collectCapturedVarsExpr(e.Left, paramSet, captured)
 		collectCapturedVarsExpr(e.Right, paramSet, captured)
 	case *CallExpr:
+		// A called local is a function value the closure must capture too
+		if !e.IsCFFI && !paramSet[e.Function] {
+			captured[e.Function] = true
+		}
 		for _, arg := range e.Args {
 			collectCapturedVarsExpr(arg, paramSet, captured)
 		}
@@ -1717,7 +1707,7 @@ func collectInlineCandidates(stmt Statement, candidates map[string]*LambdaExpr) 
 				// Only inline simple lambdas (single expression body, no blocks)
 				selfCalls := make(map[string]int)
 				countCallsExpr(lambda.Body, selfCalls)
-				if !isComplexExpression(lambda.Body) && selfCalls[s.Name] == 0 {
+				if !isComplexExpression(lambda.Body) && selfCalls[s.Name] == 0 && substitutable(lambda.Body) {
 					// Store a copy to avoid mutation
 					candidates[s.Name] = &LambdaExpr{
 						Params:            lambda.Params,
@@ -2030,7 +2020,7 @@ func deepCopyExpr(expr Expression) Expression {
 			newKeys[i] = deepCopyExpr(e.Keys[i])
 			newValues[i] = deepCopyExpr(e.Values[i])
 		}
-		return &MapExpr{Keys: newKeys, Values: newValues}
+		return &MapExpr{Keys: newKeys, Values: newValues, KeyNames: e.KeyNames}
 	case *IndexExpr:
 		return &IndexExpr{
 			List:  deepCopyExpr(e.List),
@@ -2322,7 +2312,15 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 			newKeys[i] = substituteParamsExpr(e.Keys[i], substMap)
 			newValues[i] = substituteParamsExpr(e.Values[i], substMap)
 		}
-		return &MapExpr{Keys: newKeys, Values: newValues}
+		return &MapExpr{Keys: newKeys, Values: newValues, KeyNames: e.KeyNames}
+	case *InExpr:
+		return &InExpr{Value: substituteParamsExpr(e.Value, substMap), Container: substituteParamsExpr(e.Container, substMap)}
+	case *RangeExpr:
+		return &RangeExpr{Start: substituteParamsExpr(e.Start, substMap), End: substituteParamsExpr(e.End, substMap),
+			Inclusive: e.Inclusive, Step: substituteOptional(e.Step, substMap)}
+	case *SliceExpr:
+		return &SliceExpr{List: substituteParamsExpr(e.List, substMap), Start: substituteOptional(e.Start, substMap),
+			End: substituteOptional(e.End, substMap), Step: substituteOptional(e.Step, substMap)}
 	case *IndexExpr:
 		return &IndexExpr{
 			List:  substituteParamsExpr(e.List, substMap),
@@ -2332,8 +2330,8 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 		newClauses := make([]*MatchClause, len(e.Clauses))
 		for i, clause := range e.Clauses {
 			newClause := &MatchClause{
-				Guard:  nil,
-				Result: substituteParamsExpr(clause.Result, substMap),
+				Result:       substituteParamsExpr(clause.Result, substMap),
+				IsValueMatch: clause.IsValueMatch,
 			}
 			if clause.Guard != nil {
 				newClause.Guard = substituteParamsExpr(clause.Guard, substMap)
@@ -2345,9 +2343,10 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 			newDefault = substituteParamsExpr(e.DefaultExpr, substMap)
 		}
 		return &MatchExpr{
-			Condition:   substituteParamsExpr(e.Condition, substMap),
-			Clauses:     newClauses,
-			DefaultExpr: newDefault,
+			Condition:       substituteParamsExpr(e.Condition, substMap),
+			Clauses:         newClauses,
+			DefaultExpr:     newDefault,
+			DefaultExplicit: e.DefaultExplicit,
 		}
 	case *LambdaExpr:
 		// Don't substitute inside nested lambdas' parameters
@@ -2381,9 +2380,9 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 		}
 	case *CastExpr:
 		return &CastExpr{
-			Expr:       substituteParamsExpr(e.Expr, substMap),
-			Type:       e.Type,
-			RawBitcast: e.RawBitcast,
+			Expr: substituteParamsExpr(e.Expr, substMap),
+			Type: e.Type,
+			Wrap: e.Wrap,
 		}
 	case *UnaryExpr:
 		return &UnaryExpr{Operator: e.Operator, Operand: substituteParamsExpr(e.Operand, substMap)}
@@ -2399,6 +2398,29 @@ func substituteParamsExpr(expr Expression, substMap map[string]Expression) Expre
 		// Literals (NumberExpr, StringExpr, etc.) are returned as-is
 		return expr
 	}
+}
+
+func substituteOptional(e Expression, substMap map[string]Expression) Expression {
+	if e == nil {
+		return nil
+	}
+	return substituteParamsExpr(e, substMap)
+}
+
+// substitutable reports whether substituteParamsExpr rewrites every node of
+// expr, so a call to a lambda with this body can be inlined.
+func substitutable(expr Expression) bool {
+	ok := true
+	astVisit(expr, true, func(n any) {
+		switch n.(type) {
+		case *IdentExpr, *BinaryExpr, *CallExpr, *ListExpr, *MapExpr, *InExpr, *RangeExpr,
+			*SliceExpr, *IndexExpr, *MatchExpr, *MatchClause, *FMAExpr, *FieldAccessExpr, *CastExpr,
+			*UnaryExpr, *LengthExpr, *NumberExpr, *StringExpr, *BooleanExpr:
+		default:
+			ok = false
+		}
+	})
+	return ok
 }
 
 func substituteParamsStmt(stmt Statement, substMap map[string]Expression) Statement {

@@ -36,7 +36,69 @@ const (
 	numOpFromI64
 	numOpFromU64
 	numOpExact
+	numOpIntCast
+	numOpIntWrap
+	numOpFloatCast
+	numOpFloatWrap
 )
+
+// floatCastBits is the width of a float type, 0 for other types.
+func floatCastBits(t string) uint64 {
+	switch t {
+	case "float32", "f32", "float":
+		return 32
+	case "float64", "f64", "double":
+		return 64
+	}
+	return 0
+}
+
+// intCastKind encodes an integer type for numOpIntCast and numOpIntWrap: its
+// width in bits, plus 256 when it is signed.
+func intCastKind(t string) (uint64, bool) {
+	switch t {
+	case "int8", "char":
+		return 8 | 256, true
+	case "int16", "short":
+		return 16 | 256, true
+	case "int32", "int":
+		return 32 | 256, true
+	case "int64", "long", "ssize_t", "ptrdiff_t":
+		return 64 | 256, true
+	case "uint8", "uchar":
+		return 8, true
+	case "uint16", "ushort":
+		return 16, true
+	case "uint32", "uint":
+		return 32, true
+	case "uint64", "ulong", "size_t":
+		return 64, true
+	}
+	return 0, false
+}
+
+// floatCastExact reports whether a float of the given width holds n exactly.
+func floatCastExact(n *NumberExpr, bits uint64) bool {
+	if n.Exact == nil {
+		return bits == 64 || float64(float32(n.Value)) == n.Value
+	}
+	if bits == 32 {
+		_, exact := n.Exact.Float32()
+		return exact
+	}
+	_, exact := n.Exact.Float64()
+	return exact
+}
+
+// intCastFits reports whether the integer v is in the range of the type.
+func intCastFits(v float64, kind uint64) bool {
+	bits := float64(kind & 0xff)
+	if kind&256 != 0 {
+		limit := math.Exp2(bits - 1)
+		return v >= -limit && v < limit
+	}
+	return v >= 0 && v < math.Exp2(bits)
+}
 
 const (
 	numTagBig = 0xFFF9
@@ -400,6 +462,60 @@ func (fc *TimCompiler) emitNumBinop(op string) {
 	fc.out.AddImmToReg("rsp", 16)
 }
 
+// emitScalarFMA231 emits vfmadd231sd/vfmsub231sd xmm0, a, b (xmm0 = a*b +/- xmm0).
+// The VEX.128 scalar form leaves no dirty upper vector state, so it mixes with
+// the surrounding SSE code without transition penalties.
+func (fc *TimCompiler) emitScalarFMA231(sub bool, a, b string) {
+	ra, _ := GetRegister(ArchX86_64, a)
+	rb, _ := GetRegister(ArchX86_64, b)
+	vex1 := uint8(0xC2)
+	if rb.Encoding&8 == 0 {
+		vex1 |= 0x20
+	}
+	op := uint8(0xB9)
+	if sub {
+		op = 0xBB
+	}
+	fc.out.Emit([]byte{0xC4, vex1, 0x81 | uint8(^ra.Encoding&0x0F)<<3, op, 0xC0 | uint8(rb.Encoding&7)})
+}
+
+// isNumericType reports whether a static type is definitely a number.
+func (fc *TimCompiler) isNumericType(t string) bool { return t == "number" || t == "bool" }
+
+// emitValBinop computes xmm0 = xmm0 op xmm1 for +, *, comparisons and
+// equality on operands that may be strings, lists or maps: numbers take the
+// usual fast path, anything holding a container goes through the container
+// runtime.
+func (fc *TimCompiler) emitValBinop(op string) {
+	slowOp, ordering := map[string]int{"+": valAdd, "*": valRepeat, "==": valEq, "!=": valNe}[op]
+	ordering = !ordering
+	if ordering {
+		slowOp = valCmp
+	}
+	slow, done := fc.newNumLabel(), fc.newNumLabel()
+	for _, r := range []string{"xmm0", "xmm1"} {
+		fc.out.MovqXmmToReg("rax", r)
+		fc.out.SubImmFromReg("rax", 1)
+		fc.out.ShrRegByImm("rax", 52)
+		slow.jcc(JumpEqual)
+	}
+	fc.emitNumBinop(op)
+	done.jmp()
+	slow.bind()
+	fc.emitNumCall(slowOp)
+	if ordering {
+		// order in {-1, 0, 1}; compare order+1 against 1 unsigned
+		fc.out.Cvttsd2si("rdx", "xmm0")
+		fc.out.AddImmToReg("rdx", 1)
+		fc.out.CmpRegToImm("rdx", 1)
+		fc.out.MovImmToReg("rax", "0")
+		fc.out.MovImmToReg("rcx", "1")
+		map[string]func(string, string){"<": fc.out.Cmovb, "<=": fc.out.Cmovbe, ">": fc.out.Cmova, ">=": fc.out.Cmovae}[op]("rax", "rcx")
+		fc.out.Cvtsi2sd("xmm0", "rax")
+	}
+	done.bind()
+}
+
 // emitNumUnaryIfBoxed applies a runtime unary op when xmm0 is NaN (a boxed
 // exact number or an error); otherwise leaves xmm0 for the inline path and
 // jumps nowhere. Returns the label the inline path must bind when done.
@@ -462,7 +578,7 @@ func (fc *TimCompiler) emitNumFromI64() {
 	done.bind()
 }
 
-var numBitwiseOps = map[string]bool{"|b": true, "&b": true, "^b": true, "<<b": true, ">>b": true, "<<<b": true, ">>>b": true, "?b": true, "<<": true, ">>": true, "<<<": true, ">>>": true}
+var numBitwiseOps = map[string]bool{"|b": true, "&b": true, "^b": true, "?b": true, "<<": true, ">>": true, "<<<": true, ">>>": true}
 
 // emitBitwise computes xmm0 = xmm0 op xmm1 on 64-bit two's complement integers.
 func (fc *TimCompiler) emitBitwise(op string) {
@@ -482,13 +598,13 @@ func (fc *TimCompiler) emitBitwise(op string) {
 		fc.out.AndRegWithReg("rax", "rcx")
 	case "^b":
 		fc.out.XorRegWithReg("rax", "rcx")
-	case "<<", "<<b":
+	case "<<":
 		fc.out.ShlClReg("rax", "cl")
-	case ">>", ">>b":
+	case ">>":
 		fc.out.ShrClReg("rax", "cl")
-	case "<<<", "<<<b":
+	case "<<<":
 		fc.out.RolClReg("rax", "cl")
-	case ">>>", ">>>b":
+	case ">>>":
 		fc.out.RorClReg("rax", "cl")
 	case "?b":
 		fc.out.BtRegReg("rax", "rcx")
@@ -689,19 +805,26 @@ func (fc *TimCompiler) compileDynamicMap(e *MapExpr) {
 	fc.out.MovImmToReg("rcx", fmt.Sprint(math.Float64bits(float64(n))))
 	fc.out.MovRegToMem("rcx", "rax", 8)
 	for i := range e.Keys {
-		keyIsString := fc.getExprType(e.Keys[i]) == "string"
 		fc.compileExpression(e.Keys[i])
 		fc.out.MovMemToReg("rax", "rsp", 0)
-		fc.out.MovXmmToMem("xmm0", "rax", 16+16*i)
-		// A string key doubles as its own name
-		if keyIsString {
-			fc.out.MovMemToReg("rax", "rsp", 0)
+		switch {
+		case i < len(e.KeyNames) && e.KeyNames[i] != "":
+			label := fmt.Sprintf("mapkey_%d", fc.stringCounter)
+			fc.stringCounter++
+			fc.eb.Define(label, string(stringMapBytes(e.KeyNames[i])))
+			fc.out.LeaSymbolToReg("rdx", label)
+			fc.out.MovRegToMem("rdx", "rax", 16+16*n+8*i)
+		case fc.getExprType(e.Keys[i]) == "string":
+			// A string key is stored as its symbolic hash and kept as the name
 			fc.out.MovXmmToMem("xmm0", "rax", 16+16*n+8*i)
-		} else {
+			fc.trackFunctionCall("_tim_hash_string")
+			fc.out.CallSymbol("_tim_hash_string")
 			fc.out.MovMemToReg("rax", "rsp", 0)
+		default:
 			fc.out.MovImmToReg("rcx", "0")
 			fc.out.MovRegToMem("rcx", "rax", 16+16*n+8*i)
 		}
+		fc.out.MovXmmToMem("xmm0", "rax", 16+16*i)
 		fc.compileExpression(e.Values[i])
 		fc.out.MovMemToReg("rax", "rsp", 0)
 		fc.out.MovXmmToMem("xmm0", "rax", 24+16*i)

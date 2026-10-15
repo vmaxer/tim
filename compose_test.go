@@ -89,7 +89,7 @@ printf("g(3) = %f\n", g(3))
 			source: `
 negate := x -> -x
 abs_value := x -> {
-    | x < 0 -> -x
+    | x < 0 => -x
     ~> x
 }
 

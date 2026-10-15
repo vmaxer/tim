@@ -8,7 +8,7 @@ import (
 // compileExitfSyscall compiles exitf() using syscalls to stderr (fd=2)
 // Simplified version that handles the common case: exitf("Error: %s\n", c_string)
 func (fc *TimCompiler) compileExitfSyscall(call *CallExpr, formatStr *StringExpr) {
-	processedFormat := processEscapeSequences(formatStr.Value)
+	processedFormat := formatStr.Value
 
 	argIndex := 0
 	i := 0
@@ -66,6 +66,7 @@ func (fc *TimCompiler) compileExitfSyscall(call *CallExpr, formatStr *StringExpr
 	}
 
 	fc.out.MovImmToReg("rdi", "1")
+	fc.emitFlushStdout()
 	fc.callFunction("exit", "")
 	fc.hasExplicitExit = true
 }
@@ -85,6 +86,8 @@ func (fc *TimCompiler) emitStderrWriteLiteral(labelName string, length int, isWi
 		fc.out.MovImmToReg("rdi", "2")
 		fc.out.LeaSymbolToReg("rsi", labelName)
 		fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", length))
+		fc.emitFlushStdout()
+		fc.out.MovImmToReg("rax", "1")
 		fc.out.Syscall()
 	}
 }
@@ -103,6 +106,8 @@ func (fc *TimCompiler) emitStderrWriteRegBuf(isWindows bool) {
 	} else {
 		fc.out.MovImmToReg("rax", "1")
 		fc.out.MovImmToReg("rdi", "2")
+		fc.emitFlushStdout()
+		fc.out.MovImmToReg("rax", "1")
 		fc.out.Syscall()
 	}
 }
@@ -116,6 +121,8 @@ func (fc *TimCompiler) emitStderrLiteral(str string) {
 	fc.out.MovImmToReg("rdi", "2") // stderr
 	fc.out.LeaSymbolToReg("rsi", labelName)
 	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", len(str)))
+	fc.emitFlushStdout()
+	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 }
 
@@ -128,6 +135,8 @@ func (fc *TimCompiler) emitStderrChar(ch rune) {
 	fc.out.MovImmToReg("rdi", "2") // stderr
 	fc.out.MovRegToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "1")
+	fc.emitFlushStdout()
+	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 	fc.out.AddImmToReg("rsp", 8)
 }
@@ -182,6 +191,8 @@ func (fc *TimCompiler) emitStderrInteger() {
 	fc.out.MovImmToReg("rdi", "2") // stderr
 	fc.out.MovRegToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "1")
+	fc.emitFlushStdout()
+	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 	fc.out.AddImmToReg("rsp", 8)
 	fc.out.PopReg("rax")
@@ -216,6 +227,8 @@ func (fc *TimCompiler) emitStderrInteger() {
 	fc.out.MovImmToReg("rax", "1")
 	fc.out.MovImmToReg("rdi", "2") // stderr
 	fc.out.MovRegToReg("rsi", "rbx")
+	fc.emitFlushStdout()
+	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 
 	fc.out.AddImmToReg("rsp", 32)

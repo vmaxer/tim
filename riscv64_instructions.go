@@ -204,99 +204,6 @@ func (r *RiscvOut) Move(dest, src string) error {
 	return r.AddImm(dest, src, 0)
 }
 
-// LI (load immediate, pseudo-instruction)
-func (r *RiscvOut) LoadImm(dest string, imm int64) error {
-	rd, ok := riscvGPRegs[dest]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", dest)
-	}
-
-	// For small immediates, use ADDI
-	if imm >= -2048 && imm <= 2047 {
-		return r.AddImm(dest, "zero", int32(imm))
-	}
-
-	// For larger immediates, use LUI + ADDI
-	// LUI loads upper 20 bits, ADDI adds lower 12 bits
-	upper := uint32((imm + 0x800) >> 12) // Add 0x800 for sign extension compensation
-	lower := int32(imm & 0xfff)
-
-	// LUI: opcode=0110111
-	instr := r.encodeUType(0x37, rd, upper<<12)
-	r.encodeInstr(instr)
-
-	// ADDI to add lower bits (if non-zero)
-	if lower != 0 {
-		instr = r.encodeIType(0x13, 0x0, rd, rd, lower)
-		r.encodeInstr(instr)
-	}
-
-	return nil
-}
-
-// LD: ld rd, offset(rs1)
-func (r *RiscvOut) Load64(dest, base string, offset int32) error {
-	rd, ok := riscvGPRegs[dest]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", dest)
-	}
-	rs1, ok := riscvGPRegs[base]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", base)
-	}
-
-	if offset < -2048 || offset > 2047 {
-		return fmt.Errorf("load offset out of range: %d", offset)
-	}
-
-	// LD: opcode=0000011, funct3=011
-	instr := r.encodeIType(0x03, 0x3, rd, rs1, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
-// SD: sd rs2, offset(rs1)
-func (r *RiscvOut) Store64(src, base string, offset int32) error {
-	rs2, ok := riscvGPRegs[src]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", src)
-	}
-	rs1, ok := riscvGPRegs[base]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", base)
-	}
-
-	if offset < -2048 || offset > 2047 {
-		return fmt.Errorf("store offset out of range: %d", offset)
-	}
-
-	// SD: opcode=0100011, funct3=011
-	instr := r.encodeSType(0x23, 0x3, rs1, rs2, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
-// JAL: jal rd, offset
-func (r *RiscvOut) JumpAndLink(dest string, offset int32) error {
-	rd, ok := riscvGPRegs[dest]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", dest)
-	}
-
-	// Offset must be even and within ±1MB
-	if offset%2 != 0 {
-		return fmt.Errorf("JAL offset must be even: %d", offset)
-	}
-	if offset < -(1<<20) || offset >= (1<<20) {
-		return fmt.Errorf("JAL offset out of range: %d", offset)
-	}
-
-	// JAL: opcode=1101111
-	instr := r.encodeJType(0x6f, rd, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
 // JALR: jalr rd, offset(rs1)
 func (r *RiscvOut) JumpAndLinkRegister(dest, base string, offset int32) error {
 	rd, ok := riscvGPRegs[dest]
@@ -318,65 +225,9 @@ func (r *RiscvOut) JumpAndLinkRegister(dest, base string, offset int32) error {
 	return nil
 }
 
-// BEQ: beq rs1, rs2, offset
-func (r *RiscvOut) BranchEqual(src1, src2 string, offset int32) error {
-	rs1, ok := riscvGPRegs[src1]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", src1)
-	}
-	rs2, ok := riscvGPRegs[src2]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", src2)
-	}
-
-	// Offset must be even and within ±4KB
-	if offset%2 != 0 {
-		return fmt.Errorf("branch offset must be even: %d", offset)
-	}
-	if offset < -(1<<12) || offset >= (1<<12) {
-		return fmt.Errorf("branch offset out of range: %d", offset)
-	}
-
-	// BEQ: opcode=1100011, funct3=000
-	instr := r.encodeBType(0x63, 0x0, rs1, rs2, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
-// BNE: bne rs1, rs2, offset
-func (r *RiscvOut) BranchNotEqual(src1, src2 string, offset int32) error {
-	rs1, ok := riscvGPRegs[src1]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", src1)
-	}
-	rs2, ok := riscvGPRegs[src2]
-	if !ok {
-		return fmt.Errorf("invalid RISC-V register: %s", src2)
-	}
-
-	if offset%2 != 0 {
-		return fmt.Errorf("branch offset must be even: %d", offset)
-	}
-	if offset < -(1<<12) || offset >= (1<<12) {
-		return fmt.Errorf("branch offset out of range: %d", offset)
-	}
-
-	// BNE: opcode=1100011, funct3=001
-	instr := r.encodeBType(0x63, 0x1, rs1, rs2, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
 // RET (pseudo-instruction): jalr zero, 0(ra)
 func (r *RiscvOut) Return() error {
 	return r.JumpAndLinkRegister("zero", "ra", 0)
-}
-
-// ECALL: system call
-func (r *RiscvOut) Ecall() {
-	// ECALL: opcode=1110011, funct3=000, imm=0
-	instr := r.encodeIType(0x73, 0x0, 0, 0, 0)
-	r.encodeInstr(instr)
 }
 
 // Multiply/Divide Instructions (RV64M extension)
@@ -820,19 +671,6 @@ func (r *RiscvOut) Fld(dest, base string, offset int32) error {
 	}
 	// FLD: opcode=0000111, funct3=011
 	instr := r.encodeIType(0x07, 0x3, fd, rs1, offset)
-	r.encodeInstr(instr)
-	return nil
-}
-
-// FSD: mem[rs1 + offset] = fs2 (store double)
-func (r *RiscvOut) Fsd(src, base string, offset int32) error {
-	fs2, ok1 := riscvFPRegs[src]
-	rs1, ok2 := riscvGPRegs[base]
-	if !ok1 || !ok2 {
-		return fmt.Errorf("invalid register in fsd %s, %s", src, base)
-	}
-	// FSD: opcode=0100111, funct3=011
-	instr := r.encodeSType(0x27, 0x3, rs1, fs2, offset)
 	r.encodeInstr(instr)
 	return nil
 }

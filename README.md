@@ -1,6 +1,6 @@
 # Tim
 
-**Tim** is a fully vibecoded compiler for an experimental programming language. It compiles directly to machine code for Linux (x86_64) and Windows (x86_64). Linux (aarch64 and riscv64) and macOS support is experimental. This entire compiler is experimental. The Tim programming language is experimental too.
+**Tim** is a fully vibecoded compiler for an experimental programming language. It compiles directly to machine code for Linux (x86_64 and riscv64) and Windows (x86_64). Linux (aarch64) and macOS support is experimental. This entire compiler is experimental. The Tim programming language is experimental too.
 
 ## Features
 
@@ -11,7 +11,7 @@
     *   **SIMD & FMA**
 *   **Minimalist Syntax**:
     *   Unified syntax for functions, lambdas, and pattern matching.
-    *   The `for` keyword handles all loops (range, while, infinite, for-each).
+    *   `for` covers ranges, collections, counted and infinite loops; `while` covers condition loops.
 *   **One Number Type**: `num` holds exact integers of any size, exact rationals and inexact floats. `0.1 + 0.2 == 0.3`, `2 ** 200` is exact, and `7 / 2` is `3.5`, not `3`.
 *   **Compact & Standalone**: "Hello World" is ~21KB on Linux. No `libc` dependency on Linux (uses direct syscalls).
 *   **Manual Memory Management w/ Safety**: First-class **Arena** allocators for bulk deallocation and `defer` for resource cleanup. No Garbage Collector pauses.
@@ -70,23 +70,36 @@ run = { println("Running...") }
 Pattern matching and lambdas share syntax.
 
 ```go
-// Value matching
-sign = x {
+// Matching on a value
+grade = score -> score {
+    >= 90 => "A"
+    in 75..<90 => "B"
+    ~> "C"
+}
+
+// Guards
+sign = x -> {
     | x > 0 => "positive"
     | x < 0 => "negative"
     ~> "zero"
 }
 
-// Range Loop
+// Range loop
 for i in 0..<10 {
     println(i)
 }
 
-// While Loop (condition loops require a `!` bound)
-for count > 0 ! 1000 {
+// Condition loops
+count := 3
+while count > 0 {
     count <- count - 1
 }
+for count < 10 ! 1000 {     // at most 1000 iterations
+    count += 1
+}
 ```
+
+The full grammar is in [GRAMMAR.md](GRAMMAR.md).
 
 ### Error Handling (`or!`)
 

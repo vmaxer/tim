@@ -100,3 +100,4 @@ _tmptest/
 _tmptest_*
 /tim
 coverage.out
+qemu_*.core

@@ -1,1082 +1,646 @@
-// Completion: 95% - Core lexer complete, supports all Tim 3.0 tokens
 package main
 
 import (
 	"strconv"
 	"strings"
 	"unicode"
+	"unicode/utf8"
 )
 
-// Token types for Tim language
 type TokenType int
 
 const (
 	TOKEN_EOF TokenType = iota
+	TOKEN_ILLEGAL
 	TOKEN_IDENT
 	TOKEN_NUMBER
 	TOKEN_STRING
-	TOKEN_FSTRING // f"..." interpolated string
+	TOKEN_FSTRING
+
+	TOKEN_NEWLINE
+	TOKEN_SEMICOLON
+	TOKEN_COMMA
+	TOKEN_COLON
+	TOKEN_DOT
+	TOKEN_LPAREN
+	TOKEN_RPAREN
+	TOKEN_LBRACE
+	TOKEN_RBRACE
+	TOKEN_LBRACKET
+	TOKEN_RBRACKET
+
 	TOKEN_PLUS
 	TOKEN_MINUS
 	TOKEN_STAR
-	TOKEN_POWER // ** (exponentiation)
-	TOKEN_CARET // ^ (exponentiation alias)
 	TOKEN_SLASH
 	TOKEN_MOD
+	TOKEN_POWER
+	TOKEN_INCREMENT
+	TOKEN_DECREMENT
+	TOKEN_HASH
+
 	TOKEN_EQUALS
 	TOKEN_COLON_EQUALS
-	TOKEN_EQUALS_QUESTION     // =? (immutable assignment with error propagation)
-	TOKEN_LEFT_ARROW_QUESTION // <-? (mutable update with error propagation)
-	TOKEN_PLUS_EQUALS         // +=
-	TOKEN_MINUS_EQUALS        // -=
-	TOKEN_STAR_EQUALS         // *=
-	TOKEN_POWER_EQUALS        // **=
-	TOKEN_SLASH_EQUALS        // /=
-	TOKEN_MOD_EQUALS          // %=
-	TOKEN_LPAREN
-	TOKEN_RPAREN
-	TOKEN_COMMA
-	TOKEN_COLON
-	TOKEN_SEMICOLON
-	TOKEN_NEWLINE
-	TOKEN_LT              // <
-	TOKEN_GT              // >
-	TOKEN_LE              // <= (less than or equal - comparison operator)
-	TOKEN_GE              // >=
-	TOKEN_EQ              // ==
-	TOKEN_NE              // !=
-	TOKEN_TILDE           // ~
-	TOKEN_DEFAULT_ARROW   // ~>
-	TOKEN_AT              // @
-	TOKEN_AT_AT           // || (parallel loop with all cores)
-	TOKEN_AT_PLUSPLUS     // @++
-	TOKEN_AT_LABEL        // @1, @2, ... (loop label, digits attached)
-	TOKEN_FOR             // for (loop keyword)
-	TOKEN_IN              // in keyword
-	TOKEN_LBRACE          // {
-	TOKEN_RBRACE          // }
-	TOKEN_LBRACKET        // [
-	TOKEN_RBRACKET        // ]
-	TOKEN_ARROW           // -> (lambda arrow, can be inferred in assignment context)
-	TOKEN_FAT_ARROW       // => (match arm)
-	TOKEN_LEFT_ARROW      // <- (update operator and ENet send/receive)
-	TOKEN_COLONCOLON      // :: (list append/cons operator)
-	TOKEN_AMPERSAND       // & (address operator)
-	TOKEN_ADDRESS_LITERAL // &8080 or &host:port (ENet address literal)
-	TOKEN_PIPE            // |
-	TOKEN_PIPEPIPE        // ||
-	TOKEN_HASH            // #
-	TOKEN_AND             // and keyword
-	TOKEN_OR              // or keyword
-	TOKEN_NOT             // not keyword
-	TOKEN_XOR             // xor keyword
-	TOKEN_INCREMENT       // ++
-	TOKEN_DECREMENT       // --
-	TOKEN_FMA             // *+ (fused multiply-add)
-	TOKEN_BANG            // ! (move operator - transfers ownership)
-	TOKEN_OR_BANG         // or! (error handling / railway-oriented programming)
-	TOKEN_AND_BANG        // and! (success handler)
-	TOKEN_ERR_QUESTION    // err? (check if expression is error)
-	TOKEN_VAL_QUESTION    // val? (check if expression has value)
-	// TOKEN_ME and TOKEN_CME removed - recursive calls now use mandatory max
-	TOKEN_RET         // ret keyword (return value from function/lambda)
-	TOKEN_ERR         // err keyword (return error from function/lambda)
-	TOKEN_FUN         // fun keyword (optional function definition marker)
-	TOKEN_IF          // if keyword
-	TOKEN_ELIF        // elif keyword
-	TOKEN_ELSE        // else keyword
-	TOKEN_BREAK       // break keyword (alias for ret @)
-	TOKEN_CONTINUE    // continue keyword (alias for ret @ [])
-	TOKEN_FOREACH     // foreach keyword (alias for @ ... in)
-	TOKEN_WHILE       // while keyword (condition loop without explicit bound)
-	TOKEN_MALLOC      // malloc keyword (arena allocator sugar)
-	TOKEN_FREE        // free keyword (no-op, arena cleanup)
-	TOKEN_AT_FIRST    // @first (first iteration)
-	TOKEN_AT_LAST     // @last (last iteration)
-	TOKEN_AT_COUNTER  // @counter (iteration counter)
-	TOKEN_AT_I        // @i (current element/item)
-	TOKEN_PIPE_B      // |b (bitwise OR)
-	TOKEN_AMP_B       // &b (bitwise AND)
-	TOKEN_CARET_B     // ^b (bitwise XOR)
-	TOKEN_TILDE_B     // ~b (bitwise NOT)
-	TOKEN_AMP         // & (used in unsafe blocks, not for lists)
-	TOKEN_UNDERSCORE  // _ (wildcard for default match)
-	TOKEN_DOLLAR      // $ (address value operator)
-	TOKEN_MU          // µ (memory ownership/movement operator)
-	TOKEN_LTLT        // << (shift left)
-	TOKEN_LTLTLT      // <<< (rotate left)
-	TOKEN_SHL_ASSIGN  // =<< (shift left, assign)
-	TOKEN_ROTL_ASSIGN // =<<< (rotate left, assign)
-	TOKEN_LTLT_B      // <<b (shift left)
-	TOKEN_GTGT        // >> (shift right)
-	TOKEN_GTGTGT      // >>> (rotate right)
-	TOKEN_SHR_ASSIGN  // =>> (shift right, assign)
-	TOKEN_ROTR_ASSIGN // =>>> (rotate right, assign)
-	TOKEN_GTGT_B      // >>b (shift right)
-	TOKEN_LTLTLT_B    // <<<b (rotate left)
-	TOKEN_GTGTGT_B    // >>>b (rotate right)
-	TOKEN_QUESTION_B  // ?b (bit test)
-	TOKEN_QUESTION    // ? (ternary conditional: cond ? a : b)
-	TOKEN_AS          // as (type casting)
-	// Integer type keywords (signed)
-	TOKEN_I8   // i8
-	TOKEN_I16  // i16
-	TOKEN_I32  // i32
-	TOKEN_I64  // i64
-	TOKEN_I128 // i128
-	TOKEN_I256 // i256
-	TOKEN_I512 // i512
-	// Integer type keywords (unsigned)
-	TOKEN_U8   // u8
-	TOKEN_U16  // u16
-	TOKEN_U32  // u32
-	TOKEN_U64  // u64
-	TOKEN_U128 // u128
-	TOKEN_U256 // u256
-	TOKEN_U512 // u512
-	TOKEN_BYTE // byte (alias for u8)
-	TOKEN_RUNE // rune (Unicode code point, i32)
-	// Float type keywords
-	TOKEN_F32  // f32
-	TOKEN_F64  // f64
-	TOKEN_F128 // f128
-	// Complex type keywords
-	TOKEN_COMPLEX64  // complex64
-	TOKEN_COMPLEX128 // complex128
-	TOKEN_QUATERNION // quaternion
-	// String type keywords
-	TOKEN_STR   // str (UTF-8 string, default)
-	TOKEN_UTF8  // utf8 (UTF-8 string, explicit)
-	TOKEN_UTF16 // utf16 (UTF-16 string)
-	TOKEN_UTF32 // utf32 (UTF-32 string)
-	// Collection type keywords
-	TOKEN_ARRAY // array (fixed-size array)
-	TOKEN_SLICE // slice (dynamic slice)
-	TOKEN_LIST  // list (linked list)
-	TOKEN_MAP   // map (hash map)
-	TOKEN_SET   // set (hash set)
-	TOKEN_TREE  // tree (binary tree)
-	// Legacy C type keywords
-	TOKEN_CSTR // cstr
-	TOKEN_CPTR // cptr (C pointer)
-	// Legacy Tim type keywords
-	TOKEN_NUM      // num (legacy number type)
-	TOKEN_CSTRING  // cstring (C char*)
-	TOKEN_CINT     // cint (C int)
-	TOKEN_CLONG    // clong (C long/int64_t)
-	TOKEN_CFLOAT   // cfloat (C float)
-	TOKEN_CDOUBLE  // cdouble (C double)
-	TOKEN_CBOOL    // cbool (C bool)
-	TOKEN_CVOID    // cvoid (C void)
-	TOKEN_USE      // use (import)
-	TOKEN_IMPORT   // import (with git URL)
-	TOKEN_EXPORT   // export (export functions for import)
-	TOKEN_DOT      // . (for namespaced calls)
-	TOKEN_DOTDOT   // .. (inclusive range operator)
-	TOKEN_DOTDOTLT // ..< (exclusive range operator)
-	TOKEN_ELLIPSIS // ... (variadic parameter marker)
-	TOKEN_UNSAFE   // unsafe (architecture-specific code blocks)
-	TOKEN_SYSCALL  // syscall (system call in unsafe blocks)
-	TOKEN_ARENA    // arena (arena memory blocks)
-	TOKEN_WITH     // with (subject-injection block: with x { f() } => f(x))
-	TOKEN_DEFER    // defer (deferred execution)
-	TOKEN_INF      // inf (infinity, for unlimited iterations or numeric infinity)
-	TOKEN_CSTRUCT  // cstruct (C-compatible struct definition)
-	TOKEN_PACKED   // packed (no padding modifier for cstruct)
-	TOKEN_ALIGNED  // aligned (alignment modifier for cstruct)
-	TOKEN_ALIAS    // alias (create keyword aliases for language packs)
-	TOKEN_ORBANG   // or! (unwrap with default value)
-	TOKEN_SPAWN    // spawn (spawn background process with fork)
-	TOKEN_HAS      // has (type/class definitions)
-	TOKEN_CLASS    // class (class definition)
-	TOKEN_LTGT     // <> (composition operator)
-	TOKEN_RANDOM   // ?? (random number operator)
-	TOKEN_SHADOW   // shadow (explicit shadowing declaration)
-	TOKEN_YES      // yes (boolean true)
-	TOKEN_NO       // no (boolean false)
-	TOKEN_BOOL     // bool (boolean type annotation)
+	TOKEN_LEFT_ARROW
+	TOKEN_PLUS_EQUALS
+	TOKEN_MINUS_EQUALS
+	TOKEN_STAR_EQUALS
+	TOKEN_SLASH_EQUALS
+	TOKEN_MOD_EQUALS
+	TOKEN_POWER_EQUALS
+	TOKEN_SHL_ASSIGN
+	TOKEN_SHR_ASSIGN
+	TOKEN_ROTL_ASSIGN
+	TOKEN_ROTR_ASSIGN
+
+	TOKEN_EQ
+	TOKEN_NE
+	TOKEN_LT
+	TOKEN_GT
+	TOKEN_LE
+	TOKEN_GE
+
+	TOKEN_ARROW
+	TOKEN_FAT_ARROW
+	TOKEN_DEFAULT_ARROW
+	TOKEN_PIPE
+	TOKEN_PIPEPIPE
+	TOKEN_LTGT
+	TOKEN_COLONCOLON
+	TOKEN_DOTDOT
+	TOKEN_DOTDOTLT
+	TOKEN_ELLIPSIS
+	TOKEN_QUESTION
+	TOKEN_RANDOM
+	TOKEN_BANG
+	TOKEN_AMP
+	TOKEN_AT
+	TOKEN_AT_LABEL
+	TOKEN_UNDERSCORE
+
+	TOKEN_AMP_B
+	TOKEN_PIPE_B
+	TOKEN_CARET_B
+	TOKEN_TILDE_B
+	TOKEN_QUESTION_B
+	TOKEN_LTLT
+	TOKEN_GTGT
+	TOKEN_LTLTLT
+	TOKEN_GTGTGT
+
+	TOKEN_AND
+	TOKEN_OR
+	TOKEN_XOR
+	TOKEN_NOT
+	TOKEN_OR_BANG
+	TOKEN_AS_BANG
+	TOKEN_IN
+	TOKEN_AS
+	TOKEN_YES
+	TOKEN_NO
+	TOKEN_INF
+	TOKEN_BOOL
+	TOKEN_RET
+	TOKEN_ERR
+	TOKEN_FUN
+	TOKEN_IF
+	TOKEN_ELIF
+	TOKEN_ELSE
+	TOKEN_FOR
+	TOKEN_WHILE
+	TOKEN_BREAK
+	TOKEN_CONTINUE
+	TOKEN_DEFER
+	TOKEN_SHADOW
+	TOKEN_WITH
+	TOKEN_ARENA
+	TOKEN_UNSAFE
+	TOKEN_SYSCALL
+	TOKEN_CSTRUCT
+	TOKEN_PACKED
+	TOKEN_ALIGNED
+	TOKEN_SPAWN
+	TOKEN_IMPORT
+	TOKEN_EXPORT
 )
 
-// Code generation constants
 const (
-	// Jump instruction sizes on x86-64
-	UnconditionalJumpSize = 5 // Size of JumpUnconditional (0xe9 + 4-byte offset)
-	ConditionalJumpSize   = 6 // Size of JumpConditional (0x0f 0x8X + 4-byte offset)
-
-	// Stack layout
-	StackSlotSize = 8 // Size of a stack slot (8 bytes for float64/pointer)
-
-	// Byte manipulation
-	ByteMask = 0xFF // Mask for extracting a single byte
+	UnconditionalJumpSize = 5
+	ConditionalJumpSize   = 6
+	StackSlotSize         = 8
+	ByteMask              = 0xFF
 )
 
 type Token struct {
 	Type   TokenType
 	Value  string
 	Line   int
-	Column int // Column position (1-indexed) where the token starts
+	Column int
 }
 
-// isHexDigit checks if a byte is a valid hexadecimal digit
-func isHexDigit(ch byte) bool {
-	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+var keywords = map[string]TokenType{
+	"and":      TOKEN_AND,
+	"or":       TOKEN_OR,
+	"xor":      TOKEN_XOR,
+	"not":      TOKEN_NOT,
+	"in":       TOKEN_IN,
+	"as":       TOKEN_AS,
+	"yes":      TOKEN_YES,
+	"true":     TOKEN_YES,
+	"no":       TOKEN_NO,
+	"false":    TOKEN_NO,
+	"inf":      TOKEN_INF,
+	"bool":     TOKEN_BOOL,
+	"ret":      TOKEN_RET,
+	"return":   TOKEN_RET,
+	"err":      TOKEN_ERR,
+	"fun":      TOKEN_FUN,
+	"if":       TOKEN_IF,
+	"elif":     TOKEN_ELIF,
+	"else":     TOKEN_ELSE,
+	"for":      TOKEN_FOR,
+	"while":    TOKEN_WHILE,
+	"break":    TOKEN_BREAK,
+	"continue": TOKEN_CONTINUE,
+	"defer":    TOKEN_DEFER,
+	"shadow":   TOKEN_SHADOW,
+	"with":     TOKEN_WITH,
+	"arena":    TOKEN_ARENA,
+	"unsafe":   TOKEN_UNSAFE,
+	"syscall":  TOKEN_SYSCALL,
+	"cstruct":  TOKEN_CSTRUCT,
+	"packed":   TOKEN_PACKED,
+	"aligned":  TOKEN_ALIGNED,
+	"spawn":    TOKEN_SPAWN,
+	"import":   TOKEN_IMPORT,
+	"export":   TOKEN_EXPORT,
 }
 
-// processEscapeSequences converts escape sequences in a string to their actual characters
-func processEscapeSequences(s string) string {
-	// Handle UTF-8 properly by converting to runes first
-	var result strings.Builder
-	runes := []rune(s)
-	for i := 0; i < len(runes); i++ {
-		if runes[i] == '\\' && i+1 < len(runes) {
-			switch runes[i+1] {
-			case 'n':
-				result.WriteRune('\n')
-			case 't':
-				result.WriteRune('\t')
-			case 'r':
-				result.WriteRune('\r')
-			case '\\':
-				result.WriteRune('\\')
-			case '"':
-				result.WriteRune('"')
-			case 'x':
-				if i+3 < len(runes) {
-					if v, err := strconv.ParseUint(string(runes[i+2:i+4]), 16, 32); err == nil {
-						result.WriteRune(rune(v))
-						i += 2
-						i++
-						continue
-					}
-				}
-				result.WriteRune(runes[i])
-				result.WriteRune(runes[i+1])
-			case 'u':
-				if i+5 < len(runes) {
-					if v, err := strconv.ParseUint(string(runes[i+2:i+6]), 16, 32); err == nil {
-						result.WriteRune(rune(v))
-						i += 4
-						i++
-						continue
-					}
-				}
-				result.WriteRune(runes[i])
-				result.WriteRune(runes[i+1])
-			default:
-				// Unknown escape sequence - keep backslash and the character
-				result.WriteRune(runes[i])
-				result.WriteRune(runes[i+1])
-			}
-			i++ // Skip the escaped character
-		} else {
-			result.WriteRune(runes[i])
-		}
-	}
-	return result.String()
+type operator struct {
+	text string
+	typ  TokenType
+	word bool
 }
 
-// Lexer for Tim language
+var operators = []operator{
+	{"<<<=", TOKEN_ROTL_ASSIGN, false},
+	{">>>=", TOKEN_ROTR_ASSIGN, false},
+	{"<<=", TOKEN_SHL_ASSIGN, false},
+	{">>=", TOKEN_SHR_ASSIGN, false},
+	{"**=", TOKEN_POWER_EQUALS, false},
+	{"<<<", TOKEN_LTLTLT, false},
+	{">>>", TOKEN_GTGTGT, false},
+	{"...", TOKEN_ELLIPSIS, false},
+	{"..<", TOKEN_DOTDOTLT, false},
+	{"..=", TOKEN_DOTDOT, false},
+	{"..", TOKEN_DOTDOT, false},
+	{"**", TOKEN_POWER, false},
+	{"++", TOKEN_INCREMENT, false},
+	{"--", TOKEN_DECREMENT, false},
+	{"+=", TOKEN_PLUS_EQUALS, false},
+	{"-=", TOKEN_MINUS_EQUALS, false},
+	{"*=", TOKEN_STAR_EQUALS, false},
+	{"/=", TOKEN_SLASH_EQUALS, false},
+	{"%=", TOKEN_MOD_EQUALS, false},
+	{"->", TOKEN_ARROW, false},
+	{"=>", TOKEN_FAT_ARROW, false},
+	{"~>", TOKEN_DEFAULT_ARROW, false},
+	{"<-", TOKEN_LEFT_ARROW, false},
+	{"<>", TOKEN_LTGT, false},
+	{"<<", TOKEN_LTLT, false},
+	{">>", TOKEN_GTGT, false},
+	{"<=", TOKEN_LE, false},
+	{">=", TOKEN_GE, false},
+	{"==", TOKEN_EQ, false},
+	{"!=", TOKEN_NE, false},
+	{":=", TOKEN_COLON_EQUALS, false},
+	{"::", TOKEN_COLONCOLON, false},
+	{"||", TOKEN_PIPEPIPE, false},
+	{"??", TOKEN_RANDOM, false},
+	{"&b", TOKEN_AMP_B, true},
+	{"|b", TOKEN_PIPE_B, true},
+	{"^b", TOKEN_CARET_B, true},
+	{"~b", TOKEN_TILDE_B, true},
+	{"?b", TOKEN_QUESTION_B, true},
+	{"+", TOKEN_PLUS, false},
+	{"-", TOKEN_MINUS, false},
+	{"*", TOKEN_STAR, false},
+	{"/", TOKEN_SLASH, false},
+	{"%", TOKEN_MOD, false},
+	{"=", TOKEN_EQUALS, false},
+	{"<", TOKEN_LT, false},
+	{">", TOKEN_GT, false},
+	{"|", TOKEN_PIPE, false},
+	{"&", TOKEN_AMP, false},
+	{"!", TOKEN_BANG, false},
+	{"?", TOKEN_QUESTION, false},
+	{"#", TOKEN_HASH, false},
+	{"@", TOKEN_AT, false},
+	{":", TOKEN_COLON, false},
+	{".", TOKEN_DOT, false},
+	{",", TOKEN_COMMA, false},
+	{";", TOKEN_SEMICOLON, false},
+	{"(", TOKEN_LPAREN, false},
+	{")", TOKEN_RPAREN, false},
+	{"{", TOKEN_LBRACE, false},
+	{"}", TOKEN_RBRACE, false},
+	{"[", TOKEN_LBRACKET, false},
+	{"]", TOKEN_RBRACKET, false},
+}
+
+var illegalHints = map[string]string{
+	"^": "'^' is not an operator: use ** for powers and ^b for bitwise xor",
+}
+
 type Lexer struct {
 	input     string
 	pos       int
 	line      int
-	column    int // Current column (1-indexed)
-	lineStart int // Position where current line starts
-	// unterminatedString records the position of the opening quote of a string
-	// literal that reached EOF without a closing quote. The parser reports it
-	// as a precise error instead of a misleading "expected '}'" at EOF.
+	lineStart int
+	// unterminatedString records the opening quote of a string literal that
+	// reached EOF, so the parser reports it instead of a symptom at EOF.
 	unterminatedString *Token
+	errs               *lexErrors
+}
+
+type lexError struct {
+	tok Token
+	msg string
+}
+
+// lexErrors is shared by a lexer and its clones, so a bad token seen during
+// lookahead is reported once.
+type lexErrors struct {
+	seen     map[[2]int]bool
+	list     []lexError
+	reported int
+}
+
+type LexerState struct {
+	pos, line, lineStart int
 }
 
 func NewLexer(input string) *Lexer {
-	l := &Lexer{input: input, pos: 0, line: 1, column: 1, lineStart: 0}
-
-	// Skip shebang line if present (#!/usr/bin/tim)
-	if len(input) >= 2 && input[0] == '#' && input[1] == '!' {
-		// Skip until newline
-		for l.pos < len(l.input) && l.input[l.pos] != '\n' {
-			l.pos++
-		}
-		if l.pos < len(l.input) && l.input[l.pos] == '\n' {
-			l.pos++ // Skip the newline too
-			l.line++
-			l.lineStart = l.pos
-			l.column = 1
+	l := &Lexer{input: input, line: 1, errs: &lexErrors{seen: map[[2]int]bool{}}}
+	if strings.HasPrefix(input, "#!") {
+		l.pos = strings.IndexByte(input, '\n')
+		if l.pos < 0 {
+			l.pos = len(input)
 		}
 	}
-
 	return l
 }
 
-func (l *Lexer) peek() byte {
-	if l.pos+1 < len(l.input) {
-		return l.input[l.pos+1]
+func (l *Lexer) save() LexerState { return LexerState{l.pos, l.line, l.lineStart} }
+
+func (l *Lexer) restore(s LexerState) { l.pos, l.line, l.lineStart = s.pos, s.line, s.lineStart }
+
+func (l *Lexer) clone() *Lexer {
+	c := *l
+	c.unterminatedString = nil
+	return &c
+}
+
+func (l *Lexer) column() int { return l.pos - l.lineStart + 1 }
+
+func (l *Lexer) newline(at int) {
+	l.line++
+	l.lineStart = at + 1
+}
+
+func (l *Lexer) skipSpaceAndComments() {
+	for l.pos < len(l.input) {
+		switch c := l.input[l.pos]; {
+		case c == ' ' || c == '\t' || c == '\r':
+			l.pos++
+		case strings.HasPrefix(l.input[l.pos:], "//"):
+			for l.pos < len(l.input) && l.input[l.pos] != '\n' {
+				l.pos++
+			}
+		default:
+			return
+		}
 	}
-	return 0
 }
 
-// LexerState represents a saved lexer state for lookahead
-type LexerState struct {
-	pos       int
-	line      int
-	column    int
-	lineStart int
-}
+func isIdentStart(r rune) bool { return unicode.IsLetter(r) }
 
-// save returns the current lexer state
-func (l *Lexer) save() LexerState {
-	return LexerState{pos: l.pos, line: l.line, column: l.column, lineStart: l.lineStart}
-}
+func isIdentPart(r rune) bool { return r == '_' || unicode.IsLetter(r) || unicode.IsDigit(r) }
 
-// restore restores a previously saved lexer state
-func (l *Lexer) restore(state LexerState) {
-	l.pos = state.pos
-	l.line = state.line
-	l.column = state.column
-	l.lineStart = state.lineStart
+func (l *Lexer) runeAt(i int) rune {
+	if i >= len(l.input) {
+		return 0
+	}
+	r, _ := utf8.DecodeRuneInString(l.input[i:])
+	return r
 }
 
 func (l *Lexer) NextToken() Token {
-	// Update column based on current position
-	l.column = l.pos - l.lineStart + 1
-
-	// Skip whitespace (except newlines)
-	for l.pos < len(l.input) && (l.input[l.pos] == ' ' || l.input[l.pos] == '\t' || l.input[l.pos] == '\r') {
-		l.pos++
-	}
-
-	// Skip comments (lines starting with //)
-	if l.pos < len(l.input)-1 && l.input[l.pos] == '/' && l.input[l.pos+1] == '/' {
-		for l.pos < len(l.input) && l.input[l.pos] != '\n' {
-			l.pos++
-		}
-		// Recursively get the next token after the comment
-		return l.NextToken()
-	}
-
-	// Record token start column
-	tokenColumn := l.pos - l.lineStart + 1
-
+	l.skipSpaceAndComments()
+	tok := Token{Line: l.line, Column: l.column()}
 	if l.pos >= len(l.input) {
-		return Token{Type: TOKEN_EOF, Line: l.line, Column: tokenColumn}
-	}
-	ch := l.input[l.pos]
-
-	// Newline
-	if ch == '\n' {
-		tok := Token{Type: TOKEN_NEWLINE, Line: l.line, Column: tokenColumn}
-		l.pos++
-		l.line++
-		l.lineStart = l.pos
-		l.column = 1
+		tok.Type = TOKEN_EOF
 		return tok
 	}
-
-	// String literal
-	if ch == '"' {
-		openLine, openColumn := l.line, tokenColumn
+	start := l.pos
+	c := l.input[l.pos]
+	switch {
+	case c == '\n':
+		l.newline(l.pos)
 		l.pos++
-		start := l.pos
-		for l.pos < len(l.input) && l.input[l.pos] != '"' {
-			// Skip escaped characters (including escaped quotes)
-			if l.input[l.pos] == '\\' && l.pos+1 < len(l.input) {
-				l.pos += 2 // Skip backslash and next character
-			} else {
-				// Track newlines inside multi-line strings so line/column
-				// positions of all subsequent tokens stay accurate.
-				if l.input[l.pos] == '\n' {
-					l.line++
-					l.lineStart = l.pos + 1
-				}
-				l.pos++
-			}
-		}
-		if l.pos >= len(l.input) && l.unterminatedString == nil {
-			l.unterminatedString = &Token{Type: TOKEN_STRING, Line: openLine, Column: openColumn}
-		}
-		value := l.input[start:l.pos]
-		l.pos++ // skip closing "
-		// Process escape sequences like \n, \t, etc.
-		value = processEscapeSequences(value)
-		return Token{Type: TOKEN_STRING, Value: value, Line: l.line, Column: tokenColumn}
+		tok.Type = TOKEN_NEWLINE
+		return tok
+	case c == '"':
+		return l.lexString(tok, false)
+	case c >= '0' && c <= '9':
+		return l.lexNumber(tok)
 	}
-
-	// Number (including hex 0x... and binary 0b...)
-	if unicode.IsDigit(rune(ch)) {
-		start := l.pos
-
-		// Check for hex or binary prefix
-		if ch == '0' && l.pos+1 < len(l.input) {
-			next := l.input[l.pos+1]
-			if next == 'x' || next == 'X' {
-				// Hexadecimal: 0x[0-9a-fA-F]+
-				l.pos += 2 // skip '0x'
-				if l.pos >= len(l.input) || !isHexDigit(l.input[l.pos]) {
-					// Invalid hex literal
-					return Token{Type: TOKEN_NUMBER, Value: "0", Line: l.line, Column: tokenColumn}
-				}
-				for l.pos < len(l.input) && isHexDigit(l.input[l.pos]) {
-					l.pos++
-				}
-				return Token{Type: TOKEN_NUMBER, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-			} else if next == 'b' || next == 'B' {
-				// Binary: 0b[01]+
-				l.pos += 2 // skip '0b'
-				if l.pos >= len(l.input) || (l.input[l.pos] != '0' && l.input[l.pos] != '1') {
-					// Invalid binary literal
-					return Token{Type: TOKEN_NUMBER, Value: "0", Line: l.line, Column: tokenColumn}
-				}
-				for l.pos < len(l.input) && (l.input[l.pos] == '0' || l.input[l.pos] == '1') {
-					l.pos++
-				}
-				return Token{Type: TOKEN_NUMBER, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-			}
+	if r := l.runeAt(l.pos); isIdentStart(r) {
+		for l.pos < len(l.input) && isIdentPart(l.runeAt(l.pos)) {
+			_, n := utf8.DecodeRuneInString(l.input[l.pos:])
+			l.pos += n
 		}
-
-		// Regular decimal number
-		hasDot := false
-		for l.pos < len(l.input) {
-			if unicode.IsDigit(rune(l.input[l.pos])) {
-				l.pos++
-			} else if l.input[l.pos] == '.' && !hasDot {
-				// Check if this is part of a range operator (..<  or ..=)
-				if l.pos+1 < len(l.input) && l.input[l.pos+1] == '.' {
-					// This is start of ..<  or ..=, stop number parsing
-					break
-				}
-				hasDot = true
-				l.pos++
-			} else {
-				break
-			}
+		tok.Value = l.input[start:l.pos]
+		if tok.Value == "f" && l.pos < len(l.input) && l.input[l.pos] == '"' {
+			return l.lexString(tok, true)
 		}
-		// Scientific notation: e/E, optional sign, then digits (e.g. 1e-6, 2.5E+10).
-		if l.pos < len(l.input) && (l.input[l.pos] == 'e' || l.input[l.pos] == 'E') {
-			peekPos := l.pos + 1
-			if peekPos < len(l.input) && (l.input[peekPos] == '+' || l.input[peekPos] == '-') {
-				peekPos++
+		if (tok.Value == "or" || tok.Value == "as") && l.pos < len(l.input) && l.input[l.pos] == '!' {
+			l.pos++
+			tok.Type = TOKEN_OR_BANG
+			if tok.Value == "as" {
+				tok.Type = TOKEN_AS_BANG
 			}
-			if peekPos < len(l.input) && unicode.IsDigit(rune(l.input[peekPos])) {
-				l.pos = peekPos
-				for l.pos < len(l.input) && unicode.IsDigit(rune(l.input[l.pos])) {
-					l.pos++
-				}
-			}
+			tok.Value += "!"
+			return tok
 		}
-		return Token{Type: TOKEN_NUMBER, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
+		tok.Type = TOKEN_IDENT
+		if kw, ok := keywords[tok.Value]; ok {
+			tok.Type = kw
+		}
+		return tok
 	}
+	if c == '_' {
+		l.pos++
+		if isIdentPart(l.runeAt(l.pos)) {
+			for l.pos < len(l.input) && isIdentPart(l.runeAt(l.pos)) {
+				l.pos++
+			}
+			return l.illegal(tok, "identifiers start with a letter, not '_'")
+		}
+		tok.Type, tok.Value = TOKEN_UNDERSCORE, "_"
+		return tok
+	}
+	if c == '@' && l.pos+1 < len(l.input) && l.input[l.pos+1] >= '0' && l.input[l.pos+1] <= '9' {
+		l.pos++
+		for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
+			l.pos++
+		}
+		tok.Type, tok.Value = TOKEN_AT_LABEL, l.input[start:l.pos]
+		return tok
+	}
+	rest := l.input[l.pos:]
+	for _, op := range operators {
+		if !strings.HasPrefix(rest, op.text) {
+			continue
+		}
+		if op.word && isIdentPart(l.runeAt(l.pos+len(op.text))) {
+			continue
+		}
+		l.pos += len(op.text)
+		tok.Type, tok.Value = op.typ, op.text
+		return tok
+	}
+	_, n := utf8.DecodeRuneInString(rest)
+	l.pos += n
+	if c == '^' {
+		return l.illegal(tok, "'^' is not an operator: use ** for powers and ^b for bitwise xor")
+	}
+	return l.illegal(tok, "unexpected character '"+l.input[start:l.pos]+"'")
+}
 
-	// Two-byte UTF-8 punctuation (lead byte 0xC2): ¤ (U+00A4) and µ (U+00B5).
-	// Must be handled before the identifier scan: byte 0xC2 reinterpreted as a
-	// rune is 'Â', which unicode.IsLetter would swallow into an identifier.
-	if ch == 0xC2 && l.pos+1 < len(l.input) {
+func (l *Lexer) illegal(tok Token, msg string) Token {
+	tok.Type = TOKEN_ILLEGAL
+	tok.Value = l.input[l.lineStart+tok.Column-1 : l.pos]
+	if key := [2]int{tok.Line, tok.Column}; !l.errs.seen[key] {
+		l.errs.seen[key] = true
+		l.errs.list = append(l.errs.list, lexError{tok, msg})
+	}
+	return tok
+}
+
+// forgetErrors drops the unreported errors on line between columns from and
+// to, for text that turned out not to be code.
+func (l *Lexer) forgetErrors(line, from, to int) {
+	e := l.errs
+	kept := e.list[:e.reported]
+	for _, x := range e.list[e.reported:] {
+		if x.tok.Line != line || x.tok.Column < from || x.tok.Column >= to {
+			kept = append(kept, x)
+		}
+	}
+	e.list = kept
+}
+
+// takeErrors returns the unreported lexical errors at or before line:column.
+func (l *Lexer) takeErrors(line, column int) []lexError {
+	e := l.errs
+	var out []lexError
+	for e.reported < len(e.list) {
+		t := e.list[e.reported].tok
+		if t.Line > line || t.Line == line && t.Column > column {
+			break
+		}
+		out = append(out, e.list[e.reported])
+		e.reported++
+	}
+	return out
+}
+
+func (l *Lexer) lexNumber(tok Token) Token {
+	start := l.pos
+	digits := func(ok func(byte) bool) int {
+		n := 0
+		for l.pos < len(l.input) && (ok(l.input[l.pos]) || l.input[l.pos] == '_' && n > 0) {
+			if l.input[l.pos] != '_' {
+				n++
+			}
+			l.pos++
+		}
+		return n
+	}
+	dec := func(b byte) bool { return b >= '0' && b <= '9' }
+	if l.input[l.pos] == '0' && l.pos+1 < len(l.input) {
+		var ok func(byte) bool
 		switch l.input[l.pos+1] {
-		case 0xA4: // ¤ — alias for or! (railway-oriented error handling)
-			l.pos += 2
-			return Token{Type: TOKEN_OR_BANG, Value: "or!", Line: l.line, Column: tokenColumn}
-		case 0xB5: // µ — memory ownership/movement operator
-			l.pos += 2
-			return Token{Type: TOKEN_MU, Value: "µ", Line: l.line, Column: tokenColumn}
+		case 'x', 'X':
+			ok = isHexDigit
+		case 'b', 'B':
+			ok = func(b byte) bool { return b == '0' || b == '1' }
+		case 'o', 'O':
+			ok = func(b byte) bool { return b >= '0' && b <= '7' }
 		}
-	}
-
-	// Identifier or keyword (cannot start with underscore or digit)
-	if unicode.IsLetter(rune(ch)) {
-		start := l.pos
-		for l.pos < len(l.input) && (unicode.IsLetter(rune(l.input[l.pos])) || unicode.IsDigit(rune(l.input[l.pos])) || l.input[l.pos] == '_') {
-			l.pos++
-		}
-		value := l.input[start:l.pos]
-
-		// Check for f-string: f"..."
-		if value == "f" && l.pos < len(l.input) && l.input[l.pos] == '"' {
-			openLine, openColumn := l.line, tokenColumn
-			l.pos++ // skip opening "
-			fstringStart := l.pos
-			for l.pos < len(l.input) && l.input[l.pos] != '"' {
-				// Skip escaped characters (including escaped quotes)
-				if l.input[l.pos] == '\\' && l.pos+1 < len(l.input) {
-					l.pos += 2
-				} else {
-					// Track newlines (same as plain strings) so positions stay accurate.
-					if l.input[l.pos] == '\n' {
-						l.line++
-						l.lineStart = l.pos + 1
-					}
+		if ok != nil {
+			l.pos += 2
+			if digits(ok) == 0 || isIdentPart(l.runeAt(l.pos)) {
+				for isIdentPart(l.runeAt(l.pos)) {
 					l.pos++
 				}
+				return l.illegal(tok, "malformed number literal '"+l.input[start:l.pos]+"'")
 			}
-			if l.pos >= len(l.input) && l.unterminatedString == nil {
-				l.unterminatedString = &Token{Type: TOKEN_FSTRING, Line: openLine, Column: openColumn}
-			}
-			fstringValue := l.input[fstringStart:l.pos]
-			l.pos++ // skip closing "
-			return Token{Type: TOKEN_FSTRING, Value: fstringValue, Line: l.line, Column: tokenColumn}
+			return l.number(tok, start)
 		}
-
-		// Check for keywords
-		switch value {
-		case "in":
-			return Token{Type: TOKEN_IN, Value: value, Line: l.line, Column: tokenColumn}
-		case "and":
-			// Check for and!
-			if l.pos < len(l.input) && l.input[l.pos] == '!' {
-				l.pos++ // consume the !
-				return Token{Type: TOKEN_AND_BANG, Value: "and!", Line: l.line, Column: tokenColumn}
-			}
-			return Token{Type: TOKEN_AND, Value: value, Line: l.line, Column: tokenColumn}
-		case "or":
-			// Check for or!
-			if l.pos < len(l.input) && l.input[l.pos] == '!' {
-				l.pos++ // consume the !
-				return Token{Type: TOKEN_OR_BANG, Value: "or!", Line: l.line, Column: tokenColumn}
-			}
-			return Token{Type: TOKEN_OR, Value: value, Line: l.line, Column: tokenColumn}
-		case "not":
-			return Token{Type: TOKEN_NOT, Value: value, Line: l.line, Column: tokenColumn}
-		// "me" and "cme" removed - recursive calls now use function name with mandatory max
-		case "ret", "return":
-			return Token{Type: TOKEN_RET, Value: value, Line: l.line, Column: tokenColumn}
-		case "err":
-			// Check for err?
-			if l.pos < len(l.input) && l.input[l.pos] == '?' {
-				l.pos++ // consume the ?
-				return Token{Type: TOKEN_ERR_QUESTION, Value: "err?", Line: l.line, Column: tokenColumn}
-			}
-			return Token{Type: TOKEN_ERR, Value: value, Line: l.line, Column: tokenColumn}
-		case "fun":
-			return Token{Type: TOKEN_FUN, Value: value, Line: l.line, Column: tokenColumn}
-		case "if":
-			return Token{Type: TOKEN_IF, Value: value, Line: l.line, Column: tokenColumn}
-		case "elif":
-			return Token{Type: TOKEN_ELIF, Value: value, Line: l.line, Column: tokenColumn}
-		case "else":
-			return Token{Type: TOKEN_ELSE, Value: value, Line: l.line, Column: tokenColumn}
-		case "break":
-			return Token{Type: TOKEN_BREAK, Value: value, Line: l.line, Column: tokenColumn}
-		case "continue":
-			return Token{Type: TOKEN_CONTINUE, Value: value, Line: l.line, Column: tokenColumn}
-		case "foreach":
-			return Token{Type: TOKEN_FOREACH, Value: value, Line: l.line, Column: tokenColumn}
-		case "while":
-			return Token{Type: TOKEN_WHILE, Value: value, Line: l.line, Column: tokenColumn}
-		case "for":
-			return Token{Type: TOKEN_FOR, Value: value, Line: l.line, Column: tokenColumn}
-		case "malloc":
-			return Token{Type: TOKEN_MALLOC, Value: value, Line: l.line, Column: tokenColumn}
-		case "free":
-			return Token{Type: TOKEN_FREE, Value: value, Line: l.line, Column: tokenColumn}
-		case "val":
-			// Check for val?
-			if l.pos < len(l.input) && l.input[l.pos] == '?' {
-				l.pos++ // consume the ?
-				return Token{Type: TOKEN_VAL_QUESTION, Value: "val?", Line: l.line, Column: tokenColumn}
-			}
-			return Token{Type: TOKEN_IDENT, Value: value, Line: l.line, Column: tokenColumn}
-		case "use":
-			return Token{Type: TOKEN_USE, Value: value, Line: l.line, Column: tokenColumn}
-		case "import":
-			return Token{Type: TOKEN_IMPORT, Value: value, Line: l.line, Column: tokenColumn}
-		case "export":
-			return Token{Type: TOKEN_EXPORT, Value: value, Line: l.line, Column: tokenColumn}
-		case "as":
-			return Token{Type: TOKEN_AS, Value: value, Line: l.line, Column: tokenColumn}
-		case "unsafe":
-			return Token{Type: TOKEN_UNSAFE, Value: value, Line: l.line, Column: tokenColumn}
-		case "syscall":
-			return Token{Type: TOKEN_SYSCALL, Value: value, Line: l.line, Column: tokenColumn}
-		case "arena":
-			return Token{Type: TOKEN_ARENA, Value: value, Line: l.line, Column: tokenColumn}
-		case "with":
-			return Token{Type: TOKEN_WITH, Value: value, Line: l.line, Column: tokenColumn}
-		case "defer":
-			return Token{Type: TOKEN_DEFER, Value: value, Line: l.line, Column: tokenColumn}
-		case "inf":
-			return Token{Type: TOKEN_INF, Value: value, Line: l.line, Column: tokenColumn}
-		case "cstruct":
-			return Token{Type: TOKEN_CSTRUCT, Value: value, Line: l.line, Column: tokenColumn}
-		case "packed":
-			return Token{Type: TOKEN_PACKED, Value: value, Line: l.line, Column: tokenColumn}
-		case "aligned":
-			return Token{Type: TOKEN_ALIGNED, Value: value, Line: l.line, Column: tokenColumn}
-		case "alias":
-			return Token{Type: TOKEN_ALIAS, Value: value, Line: l.line, Column: tokenColumn}
-		case "or!":
-			return Token{Type: TOKEN_ORBANG, Value: value, Line: l.line, Column: tokenColumn}
-		case "spawn":
-			return Token{Type: TOKEN_SPAWN, Value: value, Line: l.line, Column: tokenColumn}
-		case "has":
-			return Token{Type: TOKEN_HAS, Value: value, Line: l.line, Column: tokenColumn}
-		case "class":
-			return Token{Type: TOKEN_CLASS, Value: value, Line: l.line, Column: tokenColumn}
-		case "shadow":
-			return Token{Type: TOKEN_SHADOW, Value: value, Line: l.line, Column: tokenColumn}
-		case "yes", "true":
-			return Token{Type: TOKEN_YES, Value: value, Line: l.line, Column: tokenColumn}
-		case "no", "false":
-			return Token{Type: TOKEN_NO, Value: value, Line: l.line, Column: tokenColumn}
-		case "bool":
-			return Token{Type: TOKEN_BOOL, Value: value, Line: l.line, Column: tokenColumn}
-		case "xor":
-			return Token{Type: TOKEN_XOR, Value: value, Line: l.line, Column: tokenColumn}
-			// Note: All type keywords (i8-i512, u8-u512, byte, rune, f32-f128,
-			// complex64, complex128, quaternion, str, utf8, utf16, utf32,
-			// array, slice, list, map, set, tree, cptr, cstring, etc.) are contextual keywords.
-			// They are only treated as type keywords in type annotation contexts (after : or ->).
-			// Otherwise they can be used as identifiers.
-		}
-
-		return Token{Type: TOKEN_IDENT, Value: value, Line: l.line, Column: tokenColumn}
 	}
-
-	// Operators and punctuation
-	switch ch {
-	case '+':
+	digits(dec)
+	if l.pos+1 < len(l.input) && l.input[l.pos] == '.' && dec(l.input[l.pos+1]) {
 		l.pos++
-		// Check for ++
-		if l.pos < len(l.input) && l.input[l.pos] == '+' {
-			l.pos++
-			return Token{Type: TOKEN_INCREMENT, Value: "++", Line: l.line, Column: tokenColumn}
-		}
-		// Check for +=
-		if l.pos < len(l.input) && l.input[l.pos] == '=' {
-			l.pos++
-			return Token{Type: TOKEN_PLUS_EQUALS, Value: "+=", Line: l.line, Column: tokenColumn}
-		}
-		return Token{Type: TOKEN_PLUS, Value: "+", Line: l.line, Column: tokenColumn}
-	case '-':
-		// Check for -> (lambda arrow, can be inferred in assignment context)
-		if l.peek() == '>' {
-			l.pos += 2
-			return Token{Type: TOKEN_ARROW, Value: "->", Line: l.line, Column: tokenColumn}
-		}
-		// Check for --
-		if l.peek() == '-' {
-			l.pos += 2
-			return Token{Type: TOKEN_DECREMENT, Value: "--", Line: l.line, Column: tokenColumn}
-		}
-		// Check for -=
-		if l.peek() == '=' {
-			l.pos += 2
-			return Token{Type: TOKEN_MINUS_EQUALS, Value: "-=", Line: l.line, Column: tokenColumn}
-		}
-		// Always emit MINUS as separate token - let parser handle unary negation
-		l.pos++
-		return Token{Type: TOKEN_MINUS, Value: "-", Line: l.line, Column: tokenColumn}
-	case '*':
-		l.pos++
-		// Check for *+ (fused multiply-add)
-		if l.pos < len(l.input) && l.input[l.pos] == '+' {
-			l.pos++
-			return Token{Type: TOKEN_FMA, Value: "*+", Line: l.line, Column: tokenColumn}
-		}
-		// Check for ** (power) and **= (power assignment)
-		if l.pos < len(l.input) && l.input[l.pos] == '*' {
-			l.pos++
-			// Check for **=
-			if l.pos < len(l.input) && l.input[l.pos] == '=' {
-				l.pos++
-				return Token{Type: TOKEN_POWER_EQUALS, Value: "**=", Line: l.line, Column: tokenColumn}
-			}
-			return Token{Type: TOKEN_POWER, Value: "**", Line: l.line, Column: tokenColumn}
-		}
-		// Check for *=
-		if l.pos < len(l.input) && l.input[l.pos] == '=' {
-			l.pos++
-			return Token{Type: TOKEN_STAR_EQUALS, Value: "*=", Line: l.line, Column: tokenColumn}
-		}
-		return Token{Type: TOKEN_STAR, Value: "*", Line: l.line, Column: tokenColumn}
-	case '/':
-		l.pos++
-		// Check for /=
-		if l.pos < len(l.input) && l.input[l.pos] == '=' {
-			l.pos++
-			return Token{Type: TOKEN_SLASH_EQUALS, Value: "/=", Line: l.line, Column: tokenColumn}
-		}
-		return Token{Type: TOKEN_SLASH, Value: "/", Line: l.line, Column: tokenColumn}
-	case '%':
-		l.pos++
-		// Check for %=
-		if l.pos < len(l.input) && l.input[l.pos] == '=' {
-			l.pos++
-			return Token{Type: TOKEN_MOD_EQUALS, Value: "%=", Line: l.line, Column: tokenColumn}
-		}
-		return Token{Type: TOKEN_MOD, Value: "%", Line: l.line, Column: tokenColumn}
-	case ':':
-		// Check for := and :: before advancing
-		if l.peek() == '=' {
-			l.pos += 2 // skip both ':' and '='
-			return Token{Type: TOKEN_COLON_EQUALS, Value: ":=", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == ':' {
-			l.pos += 2 // skip both ':'
-			return Token{Type: TOKEN_COLONCOLON, Value: "::", Line: l.line, Column: tokenColumn}
-		}
-		// Regular colon for map literals and method calls
-		l.pos++
-		return Token{Type: TOKEN_COLON, Value: ":", Line: l.line, Column: tokenColumn}
-	case '=':
-		// Assign-forms of the shifts/rotates (longest first), then =>
-		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' &&
-			l.pos+3 < len(l.input) && l.input[l.pos+3] == '<' {
-			l.pos += 4
-			return Token{Type: TOKEN_ROTL_ASSIGN, Value: "=<<<", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' &&
-			l.pos+3 < len(l.input) && l.input[l.pos+3] == '>' {
-			l.pos += 4
-			return Token{Type: TOKEN_ROTR_ASSIGN, Value: "=>>>", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' {
-			l.pos += 3
-			return Token{Type: TOKEN_SHL_ASSIGN, Value: "=<<", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' {
-			l.pos += 3
-			return Token{Type: TOKEN_SHR_ASSIGN, Value: "=>>", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '>' {
-			l.pos += 2
-			return Token{Type: TOKEN_FAT_ARROW, Value: "=>", Line: l.line, Column: tokenColumn}
-		}
-		// Check for ==
-		if l.peek() == '=' {
-			l.pos += 2
-			return Token{Type: TOKEN_EQ, Value: "==", Line: l.line, Column: tokenColumn}
-		}
-		// Check for =?
-		if l.peek() == '?' {
-			l.pos += 2
-			return Token{Type: TOKEN_EQUALS_QUESTION, Value: "=?", Line: l.line, Column: tokenColumn}
-		}
-		l.pos++
-		return Token{Type: TOKEN_EQUALS, Value: "=", Line: l.line, Column: tokenColumn}
-	case '<':
-		// Check for <>, then <-?, then <-, then <<<b (rotate left), then <<b (shift left), then <=, then <
-		if l.peek() == '>' {
-			l.pos += 2
-			return Token{Type: TOKEN_LTGT, Value: "<>", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '-' {
-			// Check for <-?
-			if l.pos+2 < len(l.input) && l.input[l.pos+2] == '?' {
-				l.pos += 3
-				return Token{Type: TOKEN_LEFT_ARROW_QUESTION, Value: "<-?", Line: l.line, Column: tokenColumn}
-			}
-			l.pos += 2
-			return Token{Type: TOKEN_LEFT_ARROW, Value: "<-", Line: l.line, Column: tokenColumn}
-		}
-		// Check for <<<b (rotate left) - must check before <<b
-		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' &&
-			l.pos+3 < len(l.input) && l.input[l.pos+3] == 'b' {
-			l.pos += 4
-			return Token{Type: TOKEN_LTLTLT_B, Value: "<<<b", Line: l.line, Column: tokenColumn}
-		}
-		// Check for <<< (rotate left) - before <<b
-		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '<' {
-			l.pos += 3
-			return Token{Type: TOKEN_LTLTLT, Value: "<<<", Line: l.line, Column: tokenColumn}
-		}
-		// Check for <<b (shift left)
-		if l.peek() == '<' && l.pos+2 < len(l.input) && l.input[l.pos+2] == 'b' {
-			l.pos += 3
-			return Token{Type: TOKEN_LTLT_B, Value: "<<b", Line: l.line, Column: tokenColumn}
-		}
-		// Check for << (shift left)
-		if l.peek() == '<' {
-			l.pos += 2
-			return Token{Type: TOKEN_LTLT, Value: "<<", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '=' {
-			l.pos += 2
-			return Token{Type: TOKEN_LE, Value: "<=", Line: l.line, Column: tokenColumn}
-		}
-		l.pos++
-		return Token{Type: TOKEN_LT, Value: "<", Line: l.line, Column: tokenColumn}
-	case '>':
-		// Check for >>>b (rotate right), then >>b (shift right), then >=, then >
-		// Check for >>>b (rotate right) - must check before >>b
-		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' &&
-			l.pos+3 < len(l.input) && l.input[l.pos+3] == 'b' {
-			l.pos += 4
-			return Token{Type: TOKEN_GTGTGT_B, Value: ">>>b", Line: l.line, Column: tokenColumn}
-		}
-		// Check for >>> (rotate right) - before >>b
-		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '>' {
-			l.pos += 3
-			return Token{Type: TOKEN_GTGTGT, Value: ">>>", Line: l.line, Column: tokenColumn}
-		}
-		// Check for >>b (shift right)
-		if l.peek() == '>' && l.pos+2 < len(l.input) && l.input[l.pos+2] == 'b' {
-			l.pos += 3
-			return Token{Type: TOKEN_GTGT_B, Value: ">>b", Line: l.line, Column: tokenColumn}
-		}
-		// Check for >> (shift right)
-		if l.peek() == '>' {
-			l.pos += 2
-			return Token{Type: TOKEN_GTGT, Value: ">>", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == '=' {
-			l.pos += 2
-			return Token{Type: TOKEN_GE, Value: ">=", Line: l.line, Column: tokenColumn}
-		}
-		l.pos++
-		return Token{Type: TOKEN_GT, Value: ">", Line: l.line, Column: tokenColumn}
-	case '!':
-		// Check for !=, then !b
-		if l.peek() == '=' {
-			l.pos += 2
-			return Token{Type: TOKEN_NE, Value: "!=", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_TILDE_B, Value: "!b", Line: l.line, Column: tokenColumn}
-		}
-		// Standalone ! is move operator
-		l.pos++
-		return Token{Type: TOKEN_BANG, Value: "!", Line: l.line, Column: tokenColumn}
-	case '?':
-		// Check for ?b (bit test operator)
-		if l.pos+1 < len(l.input) && l.input[l.pos+1] == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_QUESTION_B, Value: "?b", Line: l.line, Column: tokenColumn}
-		}
-		// Check for ?? (random number operator)
-		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '?' {
-			l.pos += 2
-			return Token{Type: TOKEN_RANDOM, Value: "??", Line: l.line, Column: tokenColumn}
-		}
-		// Standalone ? is the ternary conditional operator (cond ? a : b)
-		l.pos++
-		return Token{Type: TOKEN_QUESTION, Value: "?", Line: l.line, Column: tokenColumn}
-	case '~':
-		// Check for ~> first, then ~b
-		if l.peek() == '>' {
-			l.pos += 2
-			return Token{Type: TOKEN_DEFAULT_ARROW, Value: "~>", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_TILDE_B, Value: "~b", Line: l.line, Column: tokenColumn}
-		}
-		l.pos++
-		return Token{Type: TOKEN_TILDE, Value: "~", Line: l.line, Column: tokenColumn}
-	case '(':
-		l.pos++
-		return Token{Type: TOKEN_LPAREN, Value: "(", Line: l.line, Column: tokenColumn}
-	case ')':
-		l.pos++
-		return Token{Type: TOKEN_RPAREN, Value: ")", Line: l.line, Column: tokenColumn}
-	case ',':
-		l.pos++
-		return Token{Type: TOKEN_COMMA, Value: ",", Line: l.line, Column: tokenColumn}
-	case ';':
-		l.pos++
-		return Token{Type: TOKEN_SEMICOLON, Value: ";", Line: l.line, Column: tokenColumn}
-	case '.':
-		// Check for ... (variadic marker) or ..< (exclusive) or .. (inclusive)
-		if l.pos+1 < len(l.input) && l.input[l.pos+1] == '.' {
-			if l.pos+2 < len(l.input) {
-				if l.input[l.pos+2] == '.' {
-					// ... (variadic parameter marker)
-					l.pos += 3
-					return Token{Type: TOKEN_ELLIPSIS, Value: "...", Line: l.line, Column: tokenColumn}
-				} else if l.input[l.pos+2] == '<' {
-					// ..<  (exclusive)
-					l.pos += 3
-					return Token{Type: TOKEN_DOTDOTLT, Value: "..<", Line: l.line, Column: tokenColumn}
-				} else if l.input[l.pos+2] == '=' {
-					// ..=  (inclusive, explicit form — same as bare ..)
-					l.pos += 3
-					return Token{Type: TOKEN_DOTDOT, Value: "..=", Line: l.line, Column: tokenColumn}
-				}
-			}
-			// Just .. is inclusive range
-			l.pos += 2
-			return Token{Type: TOKEN_DOTDOT, Value: "..", Line: l.line, Column: tokenColumn}
-		}
-		// Single .
-		l.pos++
-		return Token{Type: TOKEN_DOT, Value: ".", Line: l.line, Column: tokenColumn}
-	case '@':
-		// Check for || (parallel loop)
-		if l.peek() == '@' {
-			l.pos += 2
-			return Token{Type: TOKEN_AT_AT, Value: "@@", Line: l.line, Column: tokenColumn}
-		}
-		// Check for @++
-		if l.peek() == '+' && l.pos+2 < len(l.input) && l.input[l.pos+2] == '+' {
-			l.pos += 3
-			return Token{Type: TOKEN_AT_PLUSPLUS, Value: "@++", Line: l.line, Column: tokenColumn}
-		}
-
-		// Loop label: @ followed immediately by digits (@1, @2, @42)
-		if l.peek() >= '0' && l.peek() <= '9' {
-			start := l.pos
-			l.pos++ // skip @
-			for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-				l.pos++
-			}
-			return Token{Type: TOKEN_AT_LABEL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-		}
-
-		// Check for special keywords: @first, @last, @counter, @i
-		if (l.peek() >= 'a' && l.peek() <= 'z') || (l.peek() >= 'A' && l.peek() <= 'Z') {
-			start := l.pos
-			l.pos++ // skip @
-			value := ""
-			for l.pos < len(l.input) && ((l.input[l.pos] >= 'a' && l.input[l.pos] <= 'z') || (l.input[l.pos] >= 'A' && l.input[l.pos] <= 'Z')) {
-				l.pos++
-			}
-			if l.pos > start+1 {
-				value = l.input[start:l.pos]
-			}
-
-			if value == "@first" {
-				return Token{Type: TOKEN_AT_FIRST, Value: value, Line: l.line, Column: tokenColumn}
-			}
-			if value == "@last" {
-				return Token{Type: TOKEN_AT_LAST, Value: value, Line: l.line, Column: tokenColumn}
-			}
-			if value == "@counter" {
-				return Token{Type: TOKEN_AT_COUNTER, Value: value, Line: l.line, Column: tokenColumn}
-			}
-			if value == "@i" {
-				// Check if followed by a number (e.g., @i1, @i2)
-				if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-					numStart := l.pos
-					for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-						l.pos++
-					}
-					fullValue := value + string(l.input[numStart:l.pos])
-					return Token{Type: TOKEN_AT_I, Value: fullValue, Line: l.line, Column: tokenColumn}
-				}
-				return Token{Type: TOKEN_AT_I, Value: value, Line: l.line, Column: tokenColumn}
-			}
-
-			// Unknown @ keyword, backtrack
-			l.pos = start + 1
-		}
-
-		l.pos++
-		return Token{Type: TOKEN_AT, Value: "@", Line: l.line, Column: tokenColumn}
-	case '{':
-		l.pos++
-		return Token{Type: TOKEN_LBRACE, Value: "{", Line: l.line, Column: tokenColumn}
-	case '}':
-		l.pos++
-		return Token{Type: TOKEN_RBRACE, Value: "}", Line: l.line, Column: tokenColumn}
-	case '[':
-		l.pos++
-		return Token{Type: TOKEN_LBRACKET, Value: "[", Line: l.line, Column: tokenColumn}
-	case ']':
-		l.pos++
-		return Token{Type: TOKEN_RBRACKET, Value: "]", Line: l.line, Column: tokenColumn}
-	case '|':
-		// Check for ||, then |b, then |
-		if l.peek() == '|' {
-			l.pos += 2
-			return Token{Type: TOKEN_PIPEPIPE, Value: "||", Line: l.line, Column: tokenColumn}
-		}
-		if l.peek() == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_PIPE_B, Value: "|b", Line: l.line, Column: tokenColumn}
-		}
-		l.pos++
-		return Token{Type: TOKEN_PIPE, Value: "|", Line: l.line, Column: tokenColumn}
-	case '&':
-		// Check for &b (bitwise AND)
-		if l.peek() == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_AMP_B, Value: "&b", Line: l.line, Column: tokenColumn}
-		}
-
-		// Check for address literals: &8080, &:8080, &localhost:8080, &192.168.1.100:7777
-		nextChar := l.peek()
-		if nextChar == ':' || (nextChar >= '0' && nextChar <= '9') || (nextChar >= 'a' && nextChar <= 'z') || (nextChar >= 'A' && nextChar <= 'Z') {
-			start := l.pos
-			l.pos++ // skip &
-
-			// Check if it's a port-only address or IP address (starts with digit)
-			if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-				// Could be &8080 or &192.168.1.100:3000
-				// Parse digits and dots (for IP addresses)
-				for l.pos < len(l.input) && (l.input[l.pos] >= '0' && l.input[l.pos] <= '9' || l.input[l.pos] == '.') {
-					l.pos++
-				}
-
-				// If followed by :port, parse the port
-				if l.pos < len(l.input) && l.input[l.pos] == ':' {
-					l.pos++ // skip :
-					if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-						for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-							l.pos++
-						}
-					}
-				}
-				return Token{Type: TOKEN_ADDRESS_LITERAL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-			}
-
-			// Check if it's :port format
-			if l.pos < len(l.input) && l.input[l.pos] == ':' {
-				l.pos++ // skip :
-				if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-					for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-						l.pos++
-					}
-					return Token{Type: TOKEN_ADDRESS_LITERAL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-				}
-			}
-
-			// Parse hostname or IP address
-			if l.pos < len(l.input) && (unicode.IsLetter(rune(l.input[l.pos])) || unicode.IsDigit(rune(l.input[l.pos]))) {
-				for l.pos < len(l.input) {
-					ch := l.input[l.pos]
-					if !unicode.IsLetter(rune(ch)) && !unicode.IsDigit(rune(ch)) && ch != '.' && ch != '-' {
-						break
-					}
-					l.pos++
-				}
-
-				// Must have :port after hostname
-				if l.pos < len(l.input) && l.input[l.pos] == ':' {
-					l.pos++ // skip :
-					if l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-						for l.pos < len(l.input) && l.input[l.pos] >= '0' && l.input[l.pos] <= '9' {
-							l.pos++
-						}
-						return Token{Type: TOKEN_ADDRESS_LITERAL, Value: l.input[start:l.pos], Line: l.line, Column: tokenColumn}
-					}
-				}
-			}
-
-			// Not an address literal, backtrack to just after &
-			l.pos = start + 1
-			return Token{Type: TOKEN_AMPERSAND, Value: "&", Line: l.line, Column: tokenColumn}
-		}
-
-		l.pos++
-		return Token{Type: TOKEN_AMPERSAND, Value: "&", Line: l.line, Column: tokenColumn}
-	case '^':
-		// Check for ^b (bitwise XOR)
-		if l.peek() == 'b' {
-			l.pos += 2
-			return Token{Type: TOKEN_CARET_B, Value: "^b", Line: l.line, Column: tokenColumn}
-		}
-		// Standalone ^ is exponentiation (alias for **)
-		l.pos++
-		return Token{Type: TOKEN_CARET, Value: "^", Line: l.line, Column: tokenColumn}
-	case '#':
-		l.pos++
-		return Token{Type: TOKEN_HASH, Value: "#", Line: l.line, Column: tokenColumn}
-	case '_':
-		// Underscore used as wildcard in match expressions
-		l.pos++
-		return Token{Type: TOKEN_UNDERSCORE, Value: "_", Line: l.line, Column: tokenColumn}
-	case '$':
-		l.pos++
-		return Token{Type: TOKEN_DOLLAR, Value: "$", Line: l.line, Column: tokenColumn}
+		digits(dec)
 	}
+	if l.pos < len(l.input) && (l.input[l.pos] == 'e' || l.input[l.pos] == 'E') {
+		p := l.pos + 1
+		if p < len(l.input) && (l.input[p] == '+' || l.input[p] == '-') {
+			p++
+		}
+		if p < len(l.input) && dec(l.input[p]) {
+			l.pos = p
+			digits(dec)
+		}
+	}
+	if isIdentStart(l.runeAt(l.pos)) {
+		for isIdentPart(l.runeAt(l.pos)) {
+			l.pos++
+		}
+		return l.illegal(tok, "malformed number literal '"+l.input[start:l.pos]+"'")
+	}
+	return l.number(tok, start)
+}
 
-	return Token{Type: TOKEN_EOF, Line: l.line, Column: tokenColumn}
+func (l *Lexer) number(tok Token, start int) Token {
+	tok.Type = TOKEN_NUMBER
+	tok.Value = strings.ReplaceAll(l.input[start:l.pos], "_", "")
+	return tok
+}
+
+func (l *Lexer) lexString(tok Token, interp bool) Token {
+	l.pos++
+	body := l.pos
+	end := stringBodyEnd(l.input, body, interp)
+	for i := body; i < end; i++ {
+		if l.input[i] == '\n' {
+			l.newline(i)
+		}
+	}
+	l.pos = end
+	if end >= len(l.input) {
+		if l.unterminatedString == nil {
+			t := tok
+			t.Type = TOKEN_STRING
+			if interp {
+				t.Type = TOKEN_FSTRING
+			}
+			l.unterminatedString = &t
+		}
+	} else {
+		l.pos++
+	}
+	if interp {
+		tok.Type, tok.Value = TOKEN_FSTRING, l.input[body:end]
+	} else {
+		tok.Type, tok.Value = TOKEN_STRING, processEscapeSequences(l.input[body:end])
+	}
+	return tok
+}
+
+// stringBodyEnd returns the index of the quote that closes a string body
+// starting at i (len(s) if unterminated). In f-strings (interp), quotes inside
+// {interpolations} belong to nested strings, not to this one.
+func stringBodyEnd(s string, i int, interp bool) int {
+	for i < len(s) {
+		switch c := s[i]; {
+		case c == '\\':
+			i += 2
+		case c == '"':
+			return i
+		case interp && c == '{':
+			if i+1 < len(s) && s[i+1] == '{' {
+				i += 2
+				continue
+			}
+			i = interpolationEnd(s, i+1) + 1
+		default:
+			i++
+		}
+	}
+	return len(s)
+}
+
+// interpolationEnd returns the index of the '}' closing an f-string
+// interpolation whose expression starts at i, skipping nested strings.
+func interpolationEnd(s string, i int) int {
+	depth := 1
+	for ; i < len(s); i++ {
+		switch s[i] {
+		case '{':
+			depth++
+		case '}':
+			if depth--; depth == 0 {
+				return i
+			}
+		case '"':
+			nested := i > 0 && s[i-1] == 'f' && (i < 2 || !isIdentByte(s[i-2]))
+			i = stringBodyEnd(s, i+1, nested)
+		}
+	}
+	return len(s)
+}
+
+func isIdentByte(c byte) bool {
+	return c == '_' || c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9'
+}
+
+func isHexDigit(ch byte) bool {
+	return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F')
+}
+
+var simpleEscapes = map[byte]rune{
+	'n': '\n', 't': '\t', 'r': '\r', '0': 0, 'e': 0x1b, 'a': 7, 'b': 8, 'f': 12, 'v': 11,
+	'\\': '\\', '"': '"', '\'': '\'', '{': '{', '}': '}',
+}
+
+// processEscapeSequences decodes \n \t \r \0 \e \a \b \f \v \\ \" \' \{ \}
+// \xHH \uHHHH and \u{H...}; other backslashes are kept as written.
+func processEscapeSequences(s string) string {
+	if !strings.Contains(s, "\\") {
+		return s
+	}
+	var b strings.Builder
+	for i := 0; i < len(s); i++ {
+		if s[i] != '\\' || i+1 == len(s) {
+			b.WriteByte(s[i])
+			continue
+		}
+		e := s[i+1]
+		if r, ok := simpleEscapes[e]; ok {
+			b.WriteRune(r)
+			i++
+			continue
+		}
+		hex, width := "", 0
+		switch {
+		case e == 'x' && i+4 <= len(s):
+			hex, width = s[i+2:i+4], 4
+		case e == 'u' && i+2 < len(s) && s[i+2] == '{':
+			if j := strings.IndexByte(s[i+3:], '}'); j > 0 {
+				hex, width = s[i+3:i+3+j], j+4
+			}
+		case e == 'u' && i+6 <= len(s):
+			hex, width = s[i+2:i+6], 6
+		}
+		if v, err := strconv.ParseUint(hex, 16, 32); hex != "" && err == nil && v <= unicode.MaxRune {
+			b.WriteRune(rune(v))
+			i += width - 1
+			continue
+		}
+		b.WriteByte(s[i])
+	}
+	return b.String()
 }

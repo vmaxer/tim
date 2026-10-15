@@ -164,20 +164,6 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "currency_sign_or_bang_alias",
-			// ¤ is a one-character alias for or!.
-			code: `
-				main = {
-					x := 0
-					println(x ¤ { 99 })
-					y := 42
-					println(y ¤ { 7 })
-				}
-			`,
-			expectedOutput: "99\n42\n",
-			expectCompile:  true,
-		},
-		{
 			name: "cons_operator",
 			// `elem :: list` prepends (right-associative): the new list has the
 			// element at index 0 and the old elements shifted up one index.
@@ -407,15 +393,14 @@ func TestEvaluation(t *testing.T) {
 			expectCompile:  true,
 		},
 		{
-			name: "colon_as_cast_alias",
-			// `:` aliases `as` in unambiguous positions: postfix cast, lambda
-			// params, and loop iterator type — while map literals keep `:`.
+			name: "colon_annotations",
+			// `:` annotates lambda parameters and loop iterators; `as` converts.
 			code: `
 				cstruct V { x as float64, y as float64, z as float64 }
 				balls = [V(1.0,2.0,3.0), V(4.0,5.0,6.0)]
 				addx = (a: V, b: V) -> a.x + b.x
 				main = {
-					p = balls[0] : V
+					p = balls[0] as V
 					println(p.x)
 					m = { x: 10.0, y: 20.0 }
 					println(m.x)
@@ -424,7 +409,7 @@ func TestEvaluation(t *testing.T) {
 					for b: V in balls {
 						println(b.z)
 					}
-					println(addx(balls[0] : V, balls[1] : V))
+					println(addx(balls[0] as V, balls[1] as V))
 				}
 			`,
 			expectedOutput: "1\n10\n99\n3\n6\n5\n",
@@ -804,7 +789,7 @@ func TestEvaluation(t *testing.T) {
 		},
 		{
 			name: "loop_break_restores_sp",
-			// Breaking out of a loop with `cond { ret @ }` must restore sp: the
+			// Breaking out of a loop with `cond { break }` must restore sp: the
 			// value-match pushes its condition, and the break branches out before
 			// the match's stack cleanup. Without the fix this leaks sp on every
 			// break and corrupts the function epilogue (crash on return).
@@ -812,7 +797,7 @@ func TestEvaluation(t *testing.T) {
 				countdown = (n) -> {
 					total := 0.0
 					for i in 0..<100 {
-						i >= n { ret @ }
+						i >= n { break }
 						total <- total + 1.0
 					}
 					total

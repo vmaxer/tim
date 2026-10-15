@@ -70,7 +70,7 @@ printf("Result: %f\n", safe)
 			source: `
 x := 0
 result := x {
-    0 -> 10 / x
+    0 => 10 / x
     ~> 42
 }
 safe := result or! -1.0

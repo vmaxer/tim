@@ -12,7 +12,7 @@ import (
 func compileWithin(t *testing.T, src, exe string, limit time.Duration) {
 	t.Helper()
 	done := make(chan error, 1)
-	go func() { done <- CompileTimWithOptions(src, exe, GetDefaultPlatform(), 0, false, false) }()
+	go func() { done <- CompileTimWithOptions(src, exe, testPlatform(), 0, false, false) }()
 	select {
 	case err := <-done:
 		if err != nil {
@@ -82,12 +82,12 @@ println(-2.5e19)
 println(1e-7)
 println(3.25)
 println(0)
-f = 1e20 as float64
+f = 1e20 as! float64
 println(f)
-println(-2.5e19 as float64)
-println(1.5e300 as float64)
-println(1e-7 as float64)
-y := 1e308 as float64
+println(-2.5e19 as! float64)
+println(1.5e300 as! float64)
+println(1e-7 as! float64)
+y := 1e308 as! float64
 println(y * 10)
 println(-(y * 10))
 println(0 / 0)
@@ -135,7 +135,7 @@ println(round(5 / 2))
 println(abs(-1 / 3))
 println(pow(3, 40))
 println(1 / 3 < 0.34)
-println((1 / 3) as float64)
+println(1 / 3 as! float64)
 println(sqrt(1 / 4))
 println(17 % 5)
 println((10 ** 20 + 7) % 10)
@@ -186,7 +186,7 @@ println([])
 println({a: 1, b: 2})
 `
 	got := compileAndRunTopLevel(t, code)
-	for _, want := range []string{"[10, 20.5, 30]\n[10, 20.5, 30]\n", "a [10, 20.5, 30] 3\n", "[]\n", "{1, 2}\n"} {
+	for _, want := range []string{"[10, 20.5, 30]\n[10, 20.5, 30]\n", "a [10, 20.5, 30] 3\n", "[]\n", "{a: 1, b: 2}\n"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("output %q does not contain %q", got, want)
 		}
@@ -276,8 +276,8 @@ for i in 0..<3 {
 }
 
 func TestBitwiseMinMaxBounds(t *testing.T) {
-	code := `println(1 <<b 62)
-println(1 <<b 63)
+	code := `println(1 << 62)
+println(1 << 63)
 println(0xFFFFFFFFFFFFFFFF &b 0xFF)
 println((2 ** 64 + 5) &b 7)
 println(0xcbf29ce484222325 ^b 97)

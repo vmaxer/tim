@@ -204,22 +204,22 @@ func TestPrintfFormatting(t *testing.T) {
 	}{
 		{
 			name:     "printf_integer",
-			source:   `printf("%d\\n", 42)`,
+			source:   `printf("%d\n", 42)`,
 			expected: "42\n",
 		},
 		{
 			name:     "printf_float",
-			source:   `printf("%.2f\\n", 3.14159)`,
+			source:   `printf("%.2f\n", 3.14159)`,
 			expected: "3.14\n",
 		},
 		{
 			name:     "printf_string",
-			source:   `printf("%s\\n", "hello")`,
+			source:   `printf("%s\n", "hello")`,
 			expected: "hello\n",
 		},
 		{
 			name:     "printf_multiple",
-			source:   `printf("%d + %d = %d\\n", 2, 3, 5)`,
+			source:   `printf("%d + %d = %d\n", 2, 3, 5)`,
 			expected: "2 + 3 = 5\n",
 		},
 		{

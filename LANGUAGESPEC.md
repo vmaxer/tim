@@ -18,14 +18,14 @@ number type, `num`, and it grows as needed:
 1 / 3              // exact rational, prints 1/3
 0.1 + 0.2 == 0.3   // yes: decimal literals are exact
 sqrt(2)            // inexact float64: 1.414214
-x as float64       // explicit conversion to inexact
+x as! float64      // explicit conversion to the nearest float64
 ```
 
 - **Exact numbers** are integers of any size and rationals. Integer and decimal
   literals (`42`, `0.1`, `1e-7`, `0xFF`) are exact. `+ - * / % **` on exact numbers
   never overflow and never round; `/` gives a rational when the division is not even.
 - **Inexact numbers** are IEEE-754 float64. They come from `sqrt`, `sin`, `log`, `exp`
-  and friends, from C (`float`, `double`), and from `x as float64`. Any operation with
+  and friends, from C (`float`, `double`), and from `x as! float64`. Any operation with
   an inexact operand gives an inexact result.
 - Exact and inexact numbers compare numerically: `1 == 1.0`, `1 / 3 < 0.34`.
 - Rationals print as exact decimals when they terminate (`3.5`, `0.125`) and as
@@ -138,12 +138,12 @@ window := sdl.SDL_CreateWindow("Title", 640, 480, 0) or! {
 
 // Block in conditional
 value = condition {
-    1 -> {
+    1 => {
         println("Processing true case")
         process_true()
         42  // Block returns 42
     }
-    0 -> {
+    0 => {
         println("Processing false case")
         process_false()
         99  // Block returns 99
@@ -206,24 +206,24 @@ main = { println("Running") }     // Inferred: main = () -> { ... }
 
 // Only use when needed
 result = (x + y) * z              // precedence
-cond = (x > 0 and y < 10) { ... }  // complex condition grouping
+(x > 0 and y < 10) { println("both") }  // grouping a condition
 add = (x, y) -> x + y             // multiple lambda parameters
 ```
 
 ### 6. Bitwise Operators with `b` Suffix
 
-All bitwise operations are suffixed with `b` to eliminate ambiguity:
+The logical bitwise operators carry a `b` suffix, which keeps `|` free for
+pipes and `&` for addresses:
 
-```tim
-<<  >>               // Shift left and right
-<<<  >>>             // Rotate left and right
-&b |b ^b !b ~b       // Bitwise logic
-?b                   // Bit test (tests if bit at position is set)
+```text
+&b |b ^b ~b          // and, or, xor, not
+?b                   // bit test: x ?b 2 is 1 when bit 2 of x is set
+<<  >>               // shift left and right (arithmetic)
+<<<  >>>             // rotate left and right
 ```
 
-Each of the four also has an assign form: `=<<`, `=>>`, `=<<<`, `=>>>`
-(`x =<< 1` is `x = x << 1`). The `b`-suffixed forms (`<<b`, `>>>b`, ...) are
-aliases for their bare counterparts.
+The shifts and rotates have assign forms: `x <<= 1`, `>>=`, `<<<=`, `>>>=`.
+`^` is not an operator: powers are `**`.
 
 ### 7. Explicit String Encoding
 
@@ -261,7 +261,7 @@ Parallel loops use `fork()` for true isolation:
 
 ### 10. Pipe Operators for Data Flow
 
-```tim
+```text
 |    Pipe (transform)
 ||   Parallel map
 ```
@@ -271,7 +271,7 @@ Parallel loops use `fork()` for true isolation:
 ```tim
 head(xs)   // Get first element
 tail(xs)   // Get all but first element
-#xs        // Length (prefix or postfix)
+#xs        // Length
 ```
 
 **Semantics:**
@@ -342,7 +342,7 @@ bits = fetch()!         // Raw bitcast of the return value
 
 ```tim
 result = risky_operation()
-result.error { != "" -> println("Error:", result.error) }
+result.error != "" { 1 => println("Error:", result.error) }
 ```
 
 ### 18. Immutable-by-Default
@@ -411,7 +411,7 @@ same runtime, so a program prints the same numbers on every target.
 Type annotations are **optional metadata** that specify semantic intent and guide FFI conversions. They never change a value's runtime representation.
 
 **Native Tim types:**
-```tim
+```text
 num    // number (default type)
 str    // string (map of character codes)
 list   // list (map with sequential keys)
@@ -468,6 +468,45 @@ x as int32      // Cast to C int32
 ptr as cstr     // Cast to C string pointer
 val as float64  // Cast to C double
 ```
+
+Conversions to integer types with `as` must be exact. A fraction is an `arg`
+error, a value outside the type's range an `ovf` error, and a literal that
+cannot convert is a compile error:
+
+```tim
+n := 300
+n as uint8              // error "ovf"
+(n as uint8) or! 255    // 255
+f := 3.7
+f as int32              // error "arg"
+```
+
+`as!` always converts: it rounds like `round` (halves away from zero) and
+keeps the low bits, as C does for integers:
+
+```tim
+3.7 as! int8            // 4
+-2.5 as! int8           // -3
+300 as! uint8           // 44
+-1 as! uint8            // 255
+200 as! int8            // -56
+2 ** 64 + 5 as! uint64  // 5: as converts the whole sum
+```
+
+Conversions to `float64` and `float32` follow the same rule. `as` converts
+only values the float holds exactly, and `as!` rounds to the nearest one:
+
+```tim
+0.5 as float64          // 0.5
+0.1 as float64          // compile error: 0.1 is not exactly a float64
+1 / 3 as! float64       // 0.333333
+2 ** 70 + 1 as float64  // error "arg"
+16777217 as float32     // compile error; as! float32 gives 16777216
+```
+
+`as` and `as!` bind looser than arithmetic and tighter than comparisons:
+`1 / 3 as! float64` converts the quotient, `-1 as! uint8` converts -1, and
+`x as int32 == y` compares the converted value.
 
 **Supported cast types (legacy, for `unsafe` blocks):**
 ```
@@ -1022,10 +1061,6 @@ The composition operator provides a concise way to build complex transformations
 
 ### Variadic Functions
 
-> **Status: NOT YET WORKING.** Variadic functions are rejected at compile time
-> (the variadic argument-list machinery is incomplete). The design below is the
-> intended behavior; do not rely on it yet.
-
 Functions can accept a variable number of arguments using the `...` suffix on the last parameter:
 
 ```tim
@@ -1041,9 +1076,9 @@ sum = (first, rest...) -> {
 result = sum(1, 2, 3, 4, 5)  // 15
 
 // Variadic with multiple fixed parameters
-printf = (format, args...) -> {
-    // format is required, args... collects remaining arguments
-    c.printf(format, args...)
+labeled = (label, values...) -> {
+    // label is required, values... collects remaining arguments
+    println(label, values)
 }
 
 // All arguments variadic
@@ -1062,6 +1097,8 @@ log("Error:", "File not found:", filename)
 - If no extra arguments are passed, the variadic parameter is an empty list `[]`
 - Variadic parameters require parentheses: `(args...)` not `args...`
 - Can be used with fixed parameters: `(x, y, rest...)` is valid
+- Calls are matched by the function's name; spreading with `...` is only
+  available when calling a variadic Tim function (not C functions)
 
 **Variadic Parameter Passing:**
 
@@ -1075,7 +1112,7 @@ When calling a variadic function, you can:
 max = (nums...) -> {
     result := nums[0]
     for n in nums {
-        ? n > result { result <- n }
+        if n > result { result <- n }
     }
     result
 }
@@ -1154,66 +1191,22 @@ iteration: `for from, msg in ":8080" { ... }`.
 
 ### Loop Control
 
-Tim supports both traditional and modern loop control syntax:
+`break` leaves a loop and `continue` starts its next iteration. Both act on
+the innermost loop unless they name one: loops are numbered `@1`, `@2`, …
+from the outermost loop of the function inwards.
 
-**Traditional syntax** (using `ret @`):
 ```tim
-// Exit current loop
-for i in 0..<100 {
-    i > 50 { ret @ }      // Exit current loop
-    i == 42 { ret @ 42 }  // Exit loop with value 42
-    println(i)
-}
-
-// Nested loops with explicit labels
-for i in 0..<10 {           // Loop @1 (outer)
-    for j in 0..<10 {       // Loop @2 (inner)
-        j == 5 { ret @ }         // Exit inner loop (@2)
-        i == 5 { ret @1 }        // Exit outer loop (@1)
-        i == 3 and j == 7 { ret @1 42 }  // Exit outer loop with value
+for i in 0..<10 {           // loop @1
+    for j in 0..<10 {       // loop @2
+        j == 5 { break }        // leave the inner loop
+        i == 5 { break @1 }     // leave both loops
+        j % 2 == 0 { continue } // next j
         println(i, j)
     }
 }
 ```
 
-**Modern syntax sugar** (keywords `break`, `continue`, `foreach`):
-```tim
-// break/continue syntax (aliases for ret @)
-foreach i in 0..<100 {
-    i > 50 { break }       // Same as: ret @
-    i % 2 == 0 { continue } // Same as: ret @ []  (continue)
-    println(i)
-}
-
-// Nested with explicit labels
-foreach i in 0..<10 {      // Loop @1
-    foreach j in 0..<10 {  // Loop @2
-        j == 5 { break }      // Exit inner loop
-        i == 5 { break @1 }   // Exit outer loop
-        println(i, j)
-    }
-}
-
-// foreach is syntax sugar for @ ... in
-foreach x in items { process(x) }  // Same as: for x in items { process(x) }
-```
-
-**Recommendation:** Use `foreach/break/continue` for familiar C-style loops, use `for / ret @` for advanced control flow.
-
-**Loop Label Numbering:**
-
-Loops are automatically numbered from **outermost to innermost**:
-- `@1` = outermost loop
-- `@2` = second level (nested inside @1)
-- `@3` = third level (nested inside @2)
-- `@` = current/innermost loop (same as highest number)
-
-**Loop Control Syntax:**
-- `ret @` or `break` or `break @1` - Exit innermost loop
-- `ret @2` or `break @2` - Exit second loop level (jump out to @1)
-- `ret @N value` - Exit loop N with return value
-- `continue` or `continue @1` - Continue to next iteration
-- `ret value` - Return from function (not loop)
+`ret` always returns from the enclosing function, even inside a loop.
 
 ### Loop `!` Keyword
 
@@ -1256,51 +1249,47 @@ Use `||` for parallel iteration (each iteration in separate process):
 
 ```tim
 // Sequential map
-results = [1, 2, 3] | x => x * 2
+results = [1, 2, 3] | x -> x * 2
 
 // Parallel map
-results = [1, 2, 3] || x => expensive(x)
+results = [1, 2, 3] || x -> expensive(x)
 ```
 
 
 
 ## ENet Channels
 
-Tim uses **ENet-style message passing** for concurrency:
+Processes talk by sending UDP datagrams to local ports.
 
 ### Send Messages
 
 ```tim
-&8080 <- "Hello"          // Send to port 8080
-&"host:9000" <- data      // Send to remote host
+enet.send(":8080", "Hello")      // send a string; the value is the bytes sent
 ```
 
 ### Receive Messages
 
 ```tim
-msg <= &8080              // Receive from port 8080
-data <= &"server:9000"    // Receive from remote
+for port, msg in ":8080" {       // each message, with the sender's port
+    println(msg)
+}
+
+for port, msg in ":8080" ! 10 {  // at most 10 messages
+    println(msg)
+}
 ```
+
+A receive loop binds the first free port of a range written `":9000-9010"`.
 
 ### Channel Patterns
 
 ```tim
-// Worker pattern
 worker = -> {
-    for {
-        task <= &8080
-        result = process(task)
-        &8081 <- result
+    for port, task in ":8080" {
+        enet.send(":8081", process(task))
     }
 }
-
-// Pipeline pattern
-stage1 = -> for { &8080 <- generate_data() }
-stage2 = -> for { data <= &8080; &8081 <- transform(data) }
-stage3 = -> for { result <= &8081; save(result) }
 ```
-
-**Note:** ENet channels are compiled directly into machine code that uses ENet library calls.
 
 ## C FFI
 
@@ -1570,7 +1559,7 @@ ptr := c.malloc(1024) or! 0
 Chain multiple C calls with `or!` for clean error handling:
 
 ```tim
-init_graphics = () => {
+init_graphics = () -> {
     // Each call handles its own error with or!
     sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
         println("SDL_Init failed!")
@@ -1747,7 +1736,7 @@ open_file = filename -> {
 
 **LIFO Execution Order:**
 ```tim
-process = () => {
+process = () -> {
     defer println("First")   // Executes last (3rd)
     defer println("Second")  // Executes second (2nd)
     defer println("Third")   // Executes first (1st)
@@ -1757,7 +1746,7 @@ process = () => {
 
 **With C FFI (SDL3 Example):**
 ```tim
-init_sdl = () => {
+init_sdl = () -> {
     sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
         println("SDL init failed")
         ret 0
@@ -1787,7 +1776,7 @@ init_sdl = () => {
 **Railway-Oriented Pattern:**
 ```tim
 // Combine defer with or! for clean error handling
-acquire_resources = () => {
+acquire_resources = () -> {
     db := connect_db() or! {
         println("DB connection failed")
         ret error("db")
@@ -1822,21 +1811,18 @@ acquire_resources = () => {
 Transfer ownership with postfix `!`:
 
 ```tim
-large_data := [1, 2, 3, /* ... */, 1000000]
+large_data := 0..<1000000
 new_owner = large_data!  // Move, don't copy
 // large_data now invalid
 ```
 
 ### Manual Memory (C FFI)
 
-Tim does NOT provide `malloc`/`free` as builtins. Use C FFI:
+For memory outside the arena, call the C allocator and pair it with `defer`:
 
 ```tim
-unsafe ptr {
-    ptr = c.malloc(1024)
-    // Use ptr
-    c.free(ptr)
-}
+ptr := c.malloc(1024)
+defer c.free(ptr)
 ```
 
 ## Unsafe Blocks
@@ -1866,57 +1852,36 @@ See [PLATFORM_ARCHITECTURE.md](PLATFORM_ARCHITECTURE.md) for the full design rat
 | arm64-linux | arm64 | Linux | 🚧 90% (needs defer, dynamic linking) |
 | arm64-darwin | arm64 | macOS | ❌ Not started |
 | arm64-windows | arm64 | Windows | ❌ Not started |
-| riscv64-linux | riscv64 | Linux | 🚧 Subset: numbers, strings, flat lists, top-level functions, match/if, loops, printing; no closures, maps or FFI |
+| riscv64-linux | riscv64 | Linux | ✅ Complete (static binaries; dynamically linked when C FFI is used); 🚧 parallel loops run sequentially |
 
 ### Syntax
 
-```tim
+```text
 unsafe {
-    # x86_64 block
+    // x86_64 statements
 } {
-    # arm64 block
+    // arm64 statements
 } {
-    # riscv64 block
+    // riscv64 statements
 } as return_type
-
-// Or the legacy syntax (type before blocks):
-unsafe return_type {
-    # x86_64 block
-} {
-    # arm64 block
-} {
-    # riscv64 block
-}
 ```
 
 ### Examples
 
 ```tim
-// Direct memory access (3 ISA variants) - new syntax
+// Direct memory access, one block per ISA
 value = unsafe {
-    rax <- ptr           # x86_64
-    rax <- [rax + offset]
+    rax <- ptr  // x86_64
+    rax <- [rax + 8]
 } {
-    x0 <- ptr            # arm64
-    x0 <- [x0 + offset]
+    x0 <- ptr  // arm64
+    x0 <- [x0 + 8]
 } {
-    a0 <- ptr            # riscv64
-    a0 <- [a0 + offset]
+    a0 <- ptr  // riscv64
+    a0 <- [a0 + 8]
 } as float64
 
-// Or legacy syntax:
-value = unsafe float64 {
-    rax <- ptr
-    rax <- [rax + offset]
-} {
-    x0 <- ptr
-    x0 <- [x0 + offset]
-} {
-    a0 <- ptr
-    a0 <- [a0 + offset]
-}
-
-// Syscall (x86_64 only example, expand to 3 blocks in real code)
+// A write system call
 unsafe {
     rax <- 1        // sys_write (x86_64)
     rdi <- 1        // stdout
@@ -1928,13 +1893,13 @@ unsafe {
     x0 <- 1         // stdout
     x1 <- msg_ptr
     x2 <- msg_len
-    svc
+    syscall
 } {
     a7 <- 64        // sys_write (riscv64)
     a0 <- 1         // stdout
     a1 <- msg_ptr
     a2 <- msg_len
-    ecall
+    syscall
 }
 ```
 
@@ -1964,7 +1929,7 @@ While you write ISA-specific code, the compiler handles these OS differences:
 
 ### I/O
 
-```tim
+```text
 // Standard output (stdout)
 println(x)           // Print with newline to stdout
 print(x)            // Print without newline to stdout
@@ -2003,7 +1968,7 @@ eprintf("Error: invalid value %v\n", x)
 // Check result from error print
 result := eprintln("This is an error message")
 result.error {
-    "out" -> println("Successfully wrote to stderr")
+    "out" => println("Successfully wrote to stderr")
     ~> println("Unexpected error")
 }
 
@@ -2082,9 +2047,30 @@ nums = [1, 2, 3]
 nums.length         // 3
 nums[0]             // 1
 nums[1:]            // [2, 3]
+nums[::-1]          // [3, 2, 1] — slices are [start:end:step], negative positions count from the end
 nums + [4, 5]       // [1, 2, 3, 4, 5]
 0 :: nums           // [0, 1, 2, 3] — cons (prepend), right-associative
 1 :: 2 :: [3]       // [1, 2, 3]    — 1 :: (2 :: [3])
+append(nums, 4)     // [1, 2, 3, 4]
+[1, [2]] == [1, [2]] // yes — equality compares contents, nested lists and maps included
+```
+
+Lists are values: `append`, `+`, `::`, slicing and `pop` return new lists and
+never change the list they were given. Indexing outside a list yields `0`.
+
+Building a list in a loop is linear, not quadratic: when the compiler can see
+that a list variable's value is not shared while it grows, `xs <- append(xs, v)`
+(and `xs <- xs + [v]`) appends in place into spare capacity. As soon as the
+value is stored, passed on, returned or captured, the next append copies first,
+so no other reference ever observes the change:
+
+```tim
+xs := []
+for i in 0..<100000 {
+    xs <- append(xs, i)   // amortized O(1)
+}
+ys = xs
+xs <- append(xs, -1)      // copies: ys keeps 100000 elements
 ```
 
 ### Map Operations
@@ -2177,7 +2163,7 @@ m = { x: 10 }
 w = m.y                 // Error: "key " (key not found)
 
 // Custom errors
-err = error("arg")      // Create error with code "arg "
+e = error("arg")        // Create error with code "arg "
 ```
 
 ### The `.error` Accessor
@@ -2195,15 +2181,15 @@ y.error                 // Returns "dv0" (spaces stripped)
 
 // Typical usage
 result.error {
-    "" -> proceed(result)
+    "" => proceed(result)
     ~> handle_error(result.error)
 }
 
 // Match on specific errors
 result.error {
-    "" -> println("Success:", result)
-    "dv0" -> println("Division by zero")
-    "mem" -> println("Out of memory")
+    "" => println("Success:", result)
+    "dv0" => println("Division by zero")
+    "mem" => println("Out of memory")
     ~> println("Unknown error:", result.error)
 }
 ```
@@ -2250,15 +2236,8 @@ result := sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
 - Enables railway-oriented programming for C interop
 - Blocks can contain cleanup code and exits
 
-**Precedence:** Lower than logical OR, higher than send operator
-
-**The `¤` alias:** the currency sign `¤` (U+00A4, Shift+4 on Nordic keyboards)
-is a one-character alias for `or!`:
-
-```tim
-x = risky() ¤ 0                  // same as: x = risky() or! 0
-w = open_window() ¤ { exit(1) }  // same with a handler block
-```
+**Precedence:** looser than `or` and `<>`, tighter than `|`, and
+right-associative: `a or! b or! c` tries `a`, then `b`, then `c`.
 
 ### Guard Statements
 
@@ -2305,10 +2284,10 @@ safe = f(0) or! -1          // -1
 // Check and early return
 process = input -> {
     step1 = validate(input)
-    step1.error { != "" -> step1 }  // Return error early
+    step1.error != "" { 1 => ret step1 }  // Return error early
 
     step2 = transform(step1)
-    step2.error { != "" -> step2 }
+    step2.error != "" { 1 => ret step2 }
 
     finalize(step2)
 }
@@ -2320,14 +2299,8 @@ compute = input -> {
     y * 2
 }
 
-// Chained operations with error handling
-result = fetch_data()
-    | parse or! []              // Default to empty list
-    | transform
-    | validate or! error("typ") // Custom error
-
 // C FFI null pointer handling
-init_sdl = () => {
+init_sdl = () -> {
     // Initialize SDL
     sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
         println("Failed to initialize SDL!")
@@ -2374,10 +2347,10 @@ validate = x -> {
 }
 
 // Or detect errors from operations
-divide = (a, b) => {
+divide = (a, b) -> {
     result = a / b
-    result.error {
-        != "" -> result          // Propagate error
+    result.error != "" {
+        1 => result              // Propagate error
         ~> result                // Return success
     }
 }
@@ -2389,7 +2362,7 @@ The compiler tracks whether a value is a Result type:
 
 ```tim
 // Compiler knows this returns Result
-divide = (a, b) => {
+divide = (a, b) -> {
     b == 0 { ret error("dv0") }
     a / b
 }
@@ -2466,8 +2439,8 @@ The `or!` operator:
 // Good: check errors
 result = fetch_data()
 result.error {
-    "" -> process(result)
-    "net" -> retry()
+    "" => process(result)
+    "net" => retry()
     ~> fail(result.error)
 }
 
@@ -2631,8 +2604,8 @@ factorial = n -> {
 }
 
 // Tail-recursive (optimized to loop)
-factorial = (n, acc) => n == 0 {
-    -> acc
+factorial = (n, acc) -> n == 0 {
+    1 => acc
     ~> factorial(n-1, n*acc)
 }
 
@@ -2644,17 +2617,12 @@ println(factorial(5, 1))  // 120
 
 ```tim
 for i in 1..100 {
-    result = i % 15 {
-        0 -> "FizzBuzz"
-        ~> i % 3 {
-            0 -> "Fizz"
-            ~> i % 5 {
-                0 -> "Buzz"
-                ~> i
-            }
-        }
-    }
-    println(result)
+    println({
+        | i % 15 == 0 => "FizzBuzz"
+        | i % 3 == 0 => "Fizz"
+        | i % 5 == 0 => "Buzz"
+        ~> i
+    })
 }
 ```
 
@@ -2676,95 +2644,56 @@ println(f"Evens: {evens}")
 ### Pattern Matching
 
 ```tim
-// Value match
 classify_number = x -> x {
-    0 -> "zero"
-    1 -> "one"
-    2 -> "two"
+    0 => "zero"
+    1 => "one"
+    < 0 => "negative"
+    in 2..9 => "a few"
     ~> "many"
 }
 
-// Guard match
 classify_age = age -> {
-    | age < 13 -> "child"
-    | age < 18 -> "teen"
-    | age < 65 -> "adult"
+    | age < 13 => "child"
+    | age < 18 => "teen"
+    | age < 65 => "adult"
     ~> "senior"
 }
 
-// Nested match
-check_value = x -> x {
-    0 -> "zero"
-    ~> x > 0 {
-        1 -> "positive"
-        0 -> "negative"
-    }
-}
+println(classify_number(5), classify_age(40))
 ```
 
 ### Error Handling
 
 ```tim
-// Division with error handling
-safe_divide = (a, b) => {
-    result = a / b
-    result.error {
-        "" -> f"Result: {result}"
-        ~> f"Error: {result.error}"
-    }
+safe_divide = (a, b) -> {
+    | b == 0 => err "dv0"
+    a / b
 }
 
-println(safe_divide(10, 2))   // "Result: 5"
-println(safe_divide(10, 0))   // "Error: dv0"
-
-// With or! operator
-compute = (a, b) => {
-    x = a / b or! 1.0     // Default to 1.0 on error
-    y = x * 2
-    y
+describe = r -> r.error {
+    "" => f"Result: {r}"
+    ~> f"Error: {r.error}"
 }
+
+println(describe(safe_divide(10, 2)))   // Result: 5
+println(describe(safe_divide(10, 0)))   // Error: dv0
+println(safe_divide(1, 0) or! -1)       // -1
 ```
 
 ### Parallel Processing
 
 ```tim
-data = [1, 2, 3, 4, 5, 6, 7, 8]
-
-// Process in parallel
-results = data || x -> expensive_computation(x)
-
-println(f"Results: {results}")
+square = x -> x * x
+println([1, 2, 3, 4] || square)
 ```
 
-### Web Server (ENet)
+### Echo Server (ENet)
 
 ```tim
-// Simple echo server
-server =>> {
-    for {
-        request <= &8080
-        println(f"Received: {request}")
-        &8080 <- f"Echo: {request}"
-    }
+for port, request in ":8080" {
+    println(f"Received: {request}")
+    enet.send(f":{port}", f"Echo: {request}")
 }
-
-// HTTP-like handler
-handle_request = req -> {
-    method = req.method
-    path = req.path
-
-    method {
-        "GET" -> path {
-            "/" -> "Welcome!"
-            "/api" -> "{status: ok}"
-            ~> "Not found"
-        }
-        "POST" -> process_post(req)
-        ~> "Method not allowed"
-    }
-}
-
-server()
 ```
 
 ### C Interop
@@ -2792,9 +2721,9 @@ create_buffer_safe = size -> {
     Buffer(ptr, 0, size)
 }
 
-write_buffer = (buf, data) => {
+write_buffer = (buf, data) -> {
     buf.size + 1 > buf.capacity {
-        1 -> buf  // Buffer full
+        1 => buf  // Buffer full
         ~> {
             c_memcpy(buf.data + buf.size, data, 1)
             buf.size <- buf.size + 1
@@ -2819,7 +2748,7 @@ free_buffer(buf)
 import sdl3 as sdl
 
 // Initialize with railway-oriented error handling
-init_sdl = () => {
+init_sdl = () -> {
     sdl.SDL_Init(sdl.SDL_INIT_VIDEO) or! {
         println("SDL_Init failed!")
         exit(1)
@@ -2842,7 +2771,7 @@ init_sdl = () => {
 }
 
 // Main rendering loop
-main = () => {
+main = () -> {
     window, renderer = init_sdl()
 
     for frame in 0..<100 ! 200 {
@@ -2888,27 +2817,17 @@ process_requests = requests -> {
 ### Advanced: Unsafe Assembly
 
 ```tim
-// Direct syscall (Linux x86_64)
-print_fast = msg -> {
-    len = msg.length
-    unsafe {
-        rax <- 1         // sys_write
-        rdi <- 1         // stdout
-        rsi <- msg       // buffer
-        rdx <- len       // length
-        syscall
-    }
-}
-
-// Atomic compare-and-swap
-cas = (ptr, old, new) => unsafe int32 {
-    rax <- old
-    lock cmpxchg [ptr], new
+pid = unsafe {
+    rax <- 39       // getpid (x86_64)
+    syscall
 } {
-    1  // Success
+    x8 <- 172       // getpid (arm64)
+    syscall
 } {
-    0  // Failed
-}
+    a7 <- 172       // getpid (riscv64)
+    syscall
+} as int64
+println(pid)
 ```
 
 ## Design Rationale
@@ -2925,7 +2844,7 @@ truncation (`7 / 2 == 3`).
 1. **Correct by default:** integer and rational arithmetic never overflows or rounds
 2. **Nothing to choose:** literals, loop counters and money all use the same type
 3. **Fast where it matters:** small integers and floats run inline as float64
-4. **Explicit inexactness:** floats come from math functions, C, or `as float64`
+4. **Explicit inexactness:** floats come from math functions, C, or `as! float64`
 
 ### Why Direct Machine Code Generation?
 
@@ -2992,9 +2911,8 @@ Traditional approaches:
 
 **Design:**
 ```tim
-&8080 <- msg           // Send to local port
-&"host:9000" <- msg    // Send to remote host
-data <= &8080        // Receive from port
+enet.send(":8080", msg)          // send to a local port
+for port, data in ":8080" { }    // receive from a port
 ```
 
 Clean, minimal, network-inspired.
@@ -3032,8 +2950,8 @@ Many languages accumulate features:
 **Tim's approach:** Minimal, orthogonal features
 
 **Examples:**
-- One loop construct: `for`
-- One function syntax: `=>`
+- One loop construct: `for` (with `while` for plain condition loops)
+- One function syntax: `->`
 - One block syntax: `{ }`
 - Disambiguate by contents, not syntax
 
@@ -3062,8 +2980,7 @@ x and y       // Clearly logical AND
 x | transform // Clearly pipe
 x |b mask     // Clearly bitwise OR
 not x         // Clearly logical NOT
-!b x          // Clearly bitwise NOT
-~b x          // Also bitwise NOT (alternative syntax)
+~b x          // Clearly bitwise NOT
 x ?b 5        // Bit test: is bit 5 set?
 ```
 

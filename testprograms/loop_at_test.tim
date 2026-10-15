@@ -1,4 +1,4 @@
 for i in 0..<4 {
-	i == 2 { ret @ }
+	i == 2 { break }
 	println(i)
 }

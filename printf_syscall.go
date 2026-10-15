@@ -99,11 +99,9 @@ func (fc *TimCompiler) generatePrintfMain() {
 	fc.out.Emit([]byte{0x0f, 0x84, 0x00, 0x00, 0x00, 0x00}) // je _printf_format_spec
 
 	// Regular character - write it using syscall
-	fc.out.MovImmToReg("rdi", "1")      // stdout
 	fc.out.LeaMemToReg("rsi", "r12", 0) // current char
 	fc.out.MovImmToReg("rdx", "1")      // length
-	fc.out.MovImmToReg("rax", "1")      // sys_write
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	fc.out.IncReg("r12")
 	backToLoopPos1 := fc.eb.text.Len()
@@ -165,11 +163,9 @@ func (fc *TimCompiler) generatePrintfMain() {
 	// Handle escaped %
 	percentStart := fc.eb.text.Len()
 	fc.patchShortJump(percentJumpPos+1, percentStart)
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.LeaMemToReg("rsi", "r12", 0)
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.IncReg("r12")
 	percentJump := fc.eb.text.Len()
 	fc.out.Emit([]byte{0xe9, 0x00, 0x00, 0x00, 0x00})
@@ -494,7 +490,7 @@ func (fc *TimCompiler) patchCallOffset(offsetPos int, targetPos int) {
 // This is a simplified approach that parses the format string at compile time
 // and emits inline syscalls for each segment
 func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExpr) {
-	processedFormat := processEscapeSequences(formatStr.Value)
+	processedFormat := formatStr.Value
 
 	// Parse format string and emit inline code for each segment
 	argIndex := 0
@@ -579,10 +575,22 @@ func (fc *TimCompiler) compilePrintfSyscall(call *CallExpr, formatStr *StringExp
 				fc.emitNumToFloat()
 				fc.emitSyscallPrintFloatPrecise(precision)
 
-			case 'p': // Pointer (hex)
+			case 'p', 'x', 'X': // Pointer, hexadecimal
 				fc.compileExpression(arg)
 				fc.emitNumToI64()
-				fc.emitSyscallPrintHex()
+				fc.emitSyscallPrintHex(next == 'p', next == 'X')
+
+			case 'c': // Codepoint, printed as UTF-8
+				fc.compileExpression(arg)
+				fc.out.MovRegToReg("xmm1", "xmm0")
+				label := fmt.Sprintf("printf_empty_%d", fc.stringCounter)
+				fc.stringCounter++
+				fc.eb.Define(label, string(stringMapBytes("")))
+				fc.out.LeaSymbolToReg("rax", label)
+				fc.out.MovqRegToXmm("xmm0", "rax")
+				fc.emitNumCall(valAppend)
+				fc.out.MovqXmmToReg("rdi", "xmm0")
+				fc.callFunction("_tim_print_syscall", "")
 
 			case 't', 'b': // Boolean (t=true/false, b=yes/no)
 				fc.compileExpression(arg)
@@ -619,11 +627,9 @@ func (fc *TimCompiler) emitSyscallPrintLiteral(str string) {
 	fc.stringCounter++
 	fc.eb.Define(labelName, str)
 
-	fc.out.MovImmToReg("rax", "1") // sys_write
-	fc.out.MovImmToReg("rdi", "1") // stdout
 	fc.out.LeaSymbolToReg("rsi", labelName)
 	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", len(str)))
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 }
 
 // emitSyscallPrintList prints the list/map whose pointer is in xmm0 as
@@ -631,6 +637,10 @@ func (fc *TimCompiler) emitSyscallPrintLiteral(str string) {
 // println and str() always agree.
 func (fc *TimCompiler) emitSyscallPrintList(isMap bool) {
 	fc.out.MovqXmmToReg("rdi", "xmm0")
+	if fc.eb.target.OS() == OSLinux {
+		fc.callFunction("_tim_print_syscall", "")
+		return
+	}
 	openLabel, closeLabel := "_ts_open_list", "_ts_close_list"
 	if isMap {
 		openLabel, closeLabel = "_ts_open_map", "_ts_close_map"
@@ -654,11 +664,9 @@ func (fc *TimCompiler) emitSyscallPrintChar(ch rune) {
 	fc.out.SubImmFromReg("rsp", 8)
 	fc.out.MovImmToReg("rax", fmt.Sprintf("%d", ch))
 	fc.out.MovRegToMem("rax", "rsp", 0)
-	fc.out.MovImmToReg("rax", "1") // sys_write
-	fc.out.MovImmToReg("rdi", "1") // stdout
 	fc.out.MovRegToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.AddImmToReg("rsp", 8)
 }
 
@@ -678,11 +686,9 @@ func (fc *TimCompiler) emitSyscallPrintInteger() {
 	fc.out.SubImmFromReg("rsp", 8)
 	fc.out.MovImmToReg("rax", "45") // '-'
 	fc.out.MovRegToMem("rax", "rsp", 0)
-	fc.out.MovImmToReg("rax", "1") // sys_write
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.AddImmToReg("rsp", 8)
 	fc.out.PopReg("rax")
 	fc.out.NegReg("rax")
@@ -712,10 +718,8 @@ func (fc *TimCompiler) emitSyscallPrintInteger() {
 	fc.out.SubRegFromReg("rdx", "rbx")
 
 	// Write using syscall
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "rbx")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	fc.out.AddImmToReg("rsp", 32)
 	fc.out.PopReg("rdx")
@@ -803,9 +807,7 @@ func (fc *TimCompiler) generatePrintString() {
 
 	// Write using syscall
 	fc.out.MovRegToReg("rsi", "rdi")
-	fc.out.MovImmToReg("rdi", "1")
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	fc.out.PopReg("rbx")
 	fc.out.Ret()
@@ -826,11 +828,9 @@ func (fc *TimCompiler) generatePrintInteger() {
 
 	// Negative: print minus and negate
 	fc.out.PushReg("rax")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.LeaSymbolToReg("rsi", "_printf_minus")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.PopReg("rax")
 	fc.out.NegReg("rax")
 
@@ -941,11 +941,9 @@ func (fc *TimCompiler) generatePrintFloat() {
 
 	// Negative
 	fc.out.PushReg("rax")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.LeaSymbolToReg("rsi", "_printf_minus")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.PopReg("rax")
 	fc.out.NegReg("rax")
 
@@ -1058,11 +1056,9 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	fc.out.PushReg("rax")
 	fc.out.MovImmToReg("r15", "45") // '-'
 	fc.out.MovRegToMem("r15", "rsp", 8)
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.LeaMemToReg("rsi", "rsp", 8)
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 	fc.out.PopReg("rax")
 	fc.out.NegReg("rax")
 
@@ -1090,10 +1086,8 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	fc.out.SubRegFromReg("rdx", "rbx")
 
 	// Write
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "rbx")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	fc.out.PopReg("rdx")
 	fc.out.PopReg("rcx")
@@ -1107,11 +1101,9 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	// ===== Print decimal point INLINE =====
 	fc.out.MovImmToReg("rax", "46") // '.'
 	fc.out.MovRegToMem("rax", "rsp", 0)
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	// ===== Fractional digits =====
 	fc.out.MovMemToReg("rax", "rsp", 144)
@@ -1126,25 +1118,24 @@ func (fc *TimCompiler) emitSyscallPrintFloatPrecise(precision int) {
 	}
 
 	// Write
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.LeaMemToReg("rsi", "rsp", 64)
 	fc.out.MovImmToReg("rdx", fmt.Sprintf("%d", precision))
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	// Clean up stack
 	fc.out.AddImmToReg("rsp", 160)
 }
 
 // emitSyscallPrintHex emits code to print an integer in rax as hex (0x...)
-func (fc *TimCompiler) emitSyscallPrintHex() {
+func (fc *TimCompiler) emitSyscallPrintHex(prefix, upper bool) {
 	fc.out.PushReg("rbx")
 	fc.out.PushReg("rcx")
 	fc.out.PushReg("rdx")
 	fc.out.PushReg("rax") // Save original value
 
-	// Print "0x"
-	fc.emitSyscallPrintLiteral("0x")
+	if prefix {
+		fc.emitSyscallPrintLiteral("0x")
+	}
 
 	fc.out.PopReg("rax") // Restore value
 
@@ -1185,7 +1176,11 @@ func (fc *TimCompiler) emitSyscallPrintHex() {
 	fc.out.Emit([]byte{0x7c, 0x00}) // jl (will patch) - if < 10
 
 	// >= 10
-	fc.out.AddImmToReg("rdx", 87) // 'a' - 10 = 97 - 10 = 87
+	letters := int64('a' - 10)
+	if upper {
+		letters = 'A' - 10
+	}
+	fc.out.AddImmToReg("rdx", letters)
 	// Jump to store
 	storeJump := fc.eb.text.Len()
 	fc.out.Emit([]byte{0xeb, 0x00}) // jmp (will patch)
@@ -1212,10 +1207,8 @@ func (fc *TimCompiler) emitSyscallPrintHex() {
 	fc.out.SubRegFromReg("rdx", "rbx")
 
 	// Write using syscall
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "rbx")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	fc.out.AddImmToReg("rsp", 32)
 

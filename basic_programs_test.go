@@ -153,7 +153,7 @@ func TestExistingBasicPrograms(t *testing.T) {
 			exePath := filepath.Join(tmpDir, name)
 
 			// Compile
-			platform := GetDefaultPlatform()
+			platform := testPlatform()
 			if err := CompileTim(srcPath, exePath, platform); err != nil {
 				t.Fatalf("Compilation failed: %v", err)
 			}

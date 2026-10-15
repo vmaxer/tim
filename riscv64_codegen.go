@@ -2,16 +2,20 @@ package main
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"math"
-	"strconv"
-	"strings"
+	"slices"
 )
 
-// The riscv64 backend emits a static, libc-free ELF with a single RWX segment:
-// [ELF header][code: _start, helpers, functions, numrt blob][rodata][data].
-// Values are NaN-boxed doubles held in fa0; temporaries and locals live in
-// s0-relative frame slots, and globals in the s1-relative data area.
+// The riscv64 backend emits a static, libc-free ELF with two segments: code
+// and read-only data (R+X), then zero-initialized globals, heap state and the
+// output buffer (R+W, page aligned so stores never share a page with code).
+// Values are NaN-boxed doubles computed in fa0. Variables live in callee-saved
+// FP registers (riscv64_regalloc.go), spilling to s0-relative frame slots like
+// temporaries; variables shared with functions are globals in the s1-relative
+// data area. Containers,
+// printing and exact numbers are handled by the shared C runtime (numrt).
 
 const (
 	rvRA, rvSP             = 1, 2
@@ -25,40 +29,70 @@ const (
 	rvFS0                  = 8
 	rvFA0, rvFA1           = 10, 11
 	rvBase                 = 0x10000
-	rvHeader               = 64 + 56
-	rvMaxSlots             = 250
+	rvPage                 = 0x1000
+	rvMaxArgs              = 8
+	rvPrologueWords        = 7
+	rvTagFunc              = 4.0
 )
 
 type rvLabel struct{ pos int }
 
 type rvFixup struct {
-	at   int
-	l    *rvLabel
-	add  int
-	pair bool // auipc+addi rather than jal
+	at     int
+	l      *rvLabel
+	add    int
+	pair   bool
+	branch bool
+}
+
+var errRVLongBranch = errors.New("riscv64: conditional branch out of range")
+
+type rvCapture struct {
+	name string
+	val  Expression
 }
 
 type rvFunc struct {
-	name       string
-	params     []string
-	paramTypes []string
-	body       Expression
-	label      *rvLabel
+	lam      *LambdaExpr
+	name     string
+	params   []string
+	body     Expression
+	label    *rvLabel
+	captures []rvCapture
+	direct   bool
+	static   *rvLabel
 }
 
 type rvScope struct {
-	fn         *rvFunc
-	vars       map[string]int32
-	types      map[string]string
-	nvars      int
-	ntmp       int
-	maxTmp     int
-	prologue   int
-	ret        *rvLabel
-	bodyStart  *rvLabel
-	loops      []rvLoop
-	tailExpr   Expression
-	isTopLevel bool
+	fn        *rvFunc
+	vars      map[string]int32
+	env       map[string]int32
+	envSlot   int32
+	numeric   map[string]bool
+	nvars     int
+	ntmp      int
+	maxTmp    int
+	prologue  int
+	ret       *rvLabel
+	bodyStart *rvLabel
+	loops     []rvLoop
+	tailExpr  Expression
+	structs   map[string]string
+	defers    []rvDefer
+	regs      map[string]uint32
+	saves     []rvSave
+	intPool   []uint32
+}
+
+type rvSave struct {
+	reg  uint32
+	slot int32
+	fp   bool
+}
+
+type rvDefer struct {
+	call Expression
+	flag int32
 }
 
 type rvLoop struct{ cont, brk *rvLabel }
@@ -69,97 +103,218 @@ type rvData struct {
 }
 
 type rvGen struct {
-	code        []byte
-	fixups      []rvFixup
-	rodata      []rvData
-	globals     map[string]int32
-	globalTypes map[string]string
-	funcs       map[string]*rvFunc
-	funcOrder   []*rvFunc
-	sc          *rvScope
-	typing      map[string]bool
-	l           map[string]*rvLabel
+	unsafeVals    map[*CastExpr]int32
+	unsafeDepth   int32
+	code          []byte
+	fixups        []rvFixup
+	rodata        []rvData
+	statics       []*rvFunc
+	top           []Statement
+	globals       map[string]int32
+	globalNum     map[string]bool
+	funcs         map[string]*rvFunc
+	pending       []*rvFunc
+	sc            *rvScope
+	longBranches  bool
+	mutable       map[string]bool
+	ffi           *rvFFI
+	dynamic       bool
+	imports       []rvImport
+	hdr           int
+	strs          map[string]*rvLabel
+	l             map[string]*rvLabel
+	nlambda       int
+	structs       map[string]*CStructDecl
+	mainLocals    map[string]bool
+	varStructs    map[string]string
+	containerVars map[string]bool
+	typing        map[string]bool
 }
 
-func compileRV64(program *Program) ([]byte, error) {
-	g := &rvGen{
-		globals:     map[string]int32{},
-		globalTypes: map[string]string{},
-		funcs:       map[string]*rvFunc{},
-		typing:      map[string]bool{},
-		l:           map[string]*rvLabel{},
+var rvDataArea = []struct {
+	name string
+	size int
+}{{"heap", 16}, {"outlen", 8}, {"outfd", 8}, {"outtty", 8}, {"outbuf", 4096}}
+
+// compileRV64 emits forward branches as single instructions, falling back to
+// branch-over-jump pairs everywhere when some branch cannot reach its target.
+func compileRV64(program *Program, ffi *rvFFI) ([]byte, error) {
+	img, err := compileRV64Branches(program, ffi, false)
+	if errors.Is(err, errRVLongBranch) {
+		return compileRV64Branches(program, ffi, true)
 	}
-	for _, name := range []string{"num", "alloc", "putc", "flush", "print_raw", "print_tstr", "print_i64", "print_fixed", "strcat", "listcat", "listrep", "print_list", "blob", "globals", "heap", "outlen", "outbuf", "main"} {
+	return img, err
+}
+
+func compileRV64Branches(program *Program, ffi *rvFFI, longBranches bool) ([]byte, error) {
+	g := &rvGen{
+		ffi:           ffi,
+		dynamic:       ffi != nil && rvUsesFFI(program, ffi),
+		longBranches:  longBranches,
+		globals:       map[string]int32{},
+		globalNum:     map[string]bool{},
+		funcs:         map[string]*rvFunc{},
+		strs:          map[string]*rvLabel{},
+		l:             map[string]*rvLabel{},
+		structs:       program.CStructs,
+		varStructs:    map[string]string{},
+		mainLocals:    map[string]bool{},
+		containerVars: map[string]bool{},
+		typing:        map[string]bool{},
+	}
+	for _, name := range []string{"num", "alloc", "putc", "flush", "print_raw", "print_val", "print_i64", "print_hex", "print_fixed", "blob", "globals", "main", "end"} {
 		g.l[name] = g.newLabel()
+	}
+	for _, d := range rvDataArea {
+		g.l[d.name] = g.newLabel()
+	}
+
+	updated := map[string]bool{}
+	for _, s := range program.Statements {
+		rvWalkAssigns(s, func(name string, update bool) {
+			if update {
+				updated[name] = true
+			}
+		})
 	}
 	var top []Statement
 	for _, s := range program.Statements {
-		if a, ok := s.(*AssignStmt); ok {
-			if lam, ok := a.Value.(*LambdaExpr); ok {
-				f := &rvFunc{name: a.Name, params: lam.Params, paramTypes: make([]string, len(lam.Params)), body: lam.Body, label: g.newLabel()}
+		if a, ok := s.(*AssignStmt); ok && !a.Mutable && !a.IsUpdate && !updated[a.Name] {
+			if lam, ok := a.Value.(*LambdaExpr); ok && lam.VariadicParam == "" {
+				if f := g.funcs[a.Name]; f != nil {
+					f.lam, f.params, f.body = lam, lam.Params, lam.Body
+					continue
+				}
+				f := &rvFunc{lam: lam, name: a.Name, params: lam.Params, body: lam.Body, label: g.newLabel(), direct: true}
 				g.funcs[a.Name] = f
-				g.funcOrder = append(g.funcOrder, f)
+				g.pending = append(g.pending, f)
 				continue
 			}
 		}
 		top = append(top, s)
 	}
+	shared := map[string]bool{}
+	astVisit(&program.Statements, true, func(n any) {
+		if lam, ok := n.(*LambdaExpr); ok {
+			astVisit(lam.Body, true, func(m any) { rvAddNames(m, shared) })
+		}
+	})
 	for _, s := range top {
 		rvCollectNames(s, func(name string, _ bool) {
-			if _, ok := g.globals[name]; !ok && g.funcs[name] == nil {
+			if g.funcs[name] != nil {
+				return
+			}
+			if !shared[name] {
+				g.mainLocals[name] = true
+				return
+			}
+			if _, ok := g.globals[name]; !ok {
 				g.globals[name] = int32(8 * len(g.globals))
 			}
 		})
 	}
-	if len(g.globals) > 255 {
-		return nil, fmt.Errorf("riscv64: more than 255 global variables")
-	}
+	g.top = top
+	g.mutable = map[string]bool{}
+	astVisit(&program.Statements, true, func(n any) {
+		switch a := n.(type) {
+		case *AssignStmt:
+			if a.Mutable && !a.IsUpdate {
+				g.mutable[a.Name] = true
+			}
+		case *MultipleAssignStmt:
+			if a.Mutable {
+				for _, name := range a.Names {
+					g.mutable[name] = true
+				}
+			}
+		}
+	})
+	g.globalNum = g.inferNumeric(program.Statements, g.globals)
+	g.inferStructVars(program.Statements)
 
 	g.emitStart()
 	g.emitHelpers()
 
 	g.bind(g.l["main"])
 	if err := g.compileBody(nil, func() error {
-		for _, s := range top {
-			if err := g.stmt(s); err != nil {
-				return err
-			}
+		if err := g.stmts(top); err != nil {
+			return err
 		}
 		if f := g.funcs["main"]; f != nil && len(f.params) == 0 && !(&TimCompiler{}).detectMainCallInTopLevel(top) {
-			return g.userCall(f, &CallExpr{Function: "main"})
+			return g.callExpr(&CallExpr{Function: "main"})
+		}
+		if g.funcs["main"] == nil {
+			g.number(0)
 		}
 		return nil
 	}); err != nil {
 		return nil, err
 	}
-	for _, f := range g.funcOrder {
+	for len(g.pending) > 0 {
+		f := g.pending[0]
+		g.pending = g.pending[1:]
 		g.bind(f.label)
 		if err := g.compileBody(f, func() error { return g.inTail(f.body, true) }); err != nil {
 			return nil, fmt.Errorf("riscv64: in %s: %w", f.name, err)
 		}
 	}
 
-	for len(g.code)%16 != 0 {
+	for len(g.code)%64 != 0 {
 		g.w(0x00000013)
 	}
 	g.bind(g.l["blob"])
 	g.code = append(g.code, numRuntimeRISCV64...)
+	for _, f := range g.statics {
+		g.align(8)
+		g.bind(f.static)
+		g.code = binary.LittleEndian.AppendUint64(g.code, math.Float64bits(rvTagFunc))
+		g.code = binary.LittleEndian.AppendUint64(g.code, 0)
+		g.code = binary.LittleEndian.AppendUint64(g.code, 0)
+	}
 	for _, d := range g.rodata {
 		g.align(8)
 		g.bind(d.l)
 		g.code = append(g.code, d.bytes...)
 	}
+	g.hdr = 64 + 2*56
+	var dyn *rvDynamic
+	if g.dynamic {
+		g.hdr = 64 + 4*56
+		dyn = g.emitDynamicTables()
+	}
+	for _, f := range g.statics {
+		binary.LittleEndian.PutUint64(g.code[f.static.pos+8:], uint64(rvBase+g.hdr+f.label.pos))
+	}
 	g.align(8)
-	for _, d := range []struct {
-		name string
-		size int
-	}{{"globals", 8 * len(g.globals)}, {"heap", 16}, {"outlen", 8}, {"outbuf", 4096}} {
-		g.bind(g.l[d.name])
-		g.code = append(g.code, make([]byte, d.size)...)
+	g.bind(g.l["end"])
+
+	data := (g.hdr+len(g.code)+rvPage-1)&^(rvPage-1) - g.hdr
+	rw := data
+	if dyn != nil {
+		data += 16 * len(dyn.entries)
+	}
+	g.l["globals"].pos = data
+	data += 8 * len(g.globals)
+	for _, d := range rvDataArea {
+		data = (data + 7) &^ 7
+		g.l[d.name].pos = data
+		data += d.size
+	}
+	for _, im := range g.imports {
+		im.slot.pos = data
+		data += 8
 	}
 
 	for _, f := range g.fixups {
 		off := f.l.pos + f.add - f.at
+		if f.branch {
+			if off < -4096 || off >= 4096 {
+				return nil, errRVLongBranch
+			}
+			ins := g.get(f.at)
+			g.put(f.at, rvB(int32(off), ins>>20&31, ins>>15&31, ins>>12&7))
+			continue
+		}
 		if f.pair {
 			hi := (off + 0x800) >> 12
 			lo := off - hi<<12
@@ -172,114 +327,193 @@ func compileRV64(program *Program) ([]byte, error) {
 		}
 		g.put(f.at, rvJ(int32(off), g.get(f.at)>>7&31))
 	}
-	return g.elf(), nil
+	return g.elf(rw, data, dyn), nil
 }
 
-func (g *rvGen) elf() []byte {
-	size := uint64(rvHeader + len(g.code))
-	b := []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+// elf lays the image out as [ELF header][code, rodata, dynamic tables] (R+X)
+// and, page aligned at rw, [.dynamic][zero-initialized data] (R+W) ending at
+// end; positions are relative to the end of the header.
+func (g *rvGen) elf(rw, end int, dyn *rvDynamic) []byte {
 	le := binary.LittleEndian
-	b = le.AppendUint16(b, 2)   // ET_EXEC
-	b = le.AppendUint16(b, 243) // EM_RISCV
+	addr := func(pos int) uint64 { return uint64(rvBase + g.hdr + pos) }
+	off := func(pos int) uint64 { return uint64(g.hdr + pos) }
+	var dynBytes []byte
+	if dyn != nil {
+		for _, e := range dyn.entries {
+			dynBytes = le.AppendUint64(dynBytes, uint64(e[0]))
+			dynBytes = le.AppendUint64(dynBytes, e[1])
+		}
+		for i, im := range g.imports {
+			at := dyn.rela + 24*i
+			le.PutUint64(g.code[at:], addr(im.slot.pos))
+			le.PutUint64(g.code[at+8:], uint64(i+1)<<32|2)
+		}
+	}
+	type seg struct {
+		typ, flags          uint32
+		off, vaddr, fsz, ms uint64
+		align               uint64
+	}
+	codeEnd := off(g.l["end"].pos)
+	var segs []seg
+	if dyn != nil {
+		segs = append(segs, seg{3, 4, off(dyn.interp), addr(dyn.interp), uint64(len(rvInterp) + 1), uint64(len(rvInterp) + 1), 1})
+	}
+	segs = append(segs,
+		seg{1, 5, 0, rvBase, codeEnd, codeEnd, rvPage},
+		seg{1, 6, off(rw), addr(rw), uint64(len(dynBytes)), uint64(end - rw), rvPage})
+	if dyn != nil {
+		segs = append(segs, seg{2, 6, off(rw), addr(rw), uint64(len(dynBytes)), uint64(len(dynBytes)), 8})
+	}
+	b := []byte{0x7f, 'E', 'L', 'F', 2, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0}
+	b = le.AppendUint16(b, 2)
+	b = le.AppendUint16(b, 243)
 	b = le.AppendUint32(b, 1)
-	b = le.AppendUint64(b, rvBase+rvHeader)
+	b = le.AppendUint64(b, rvBase+uint64(g.hdr))
 	b = le.AppendUint64(b, 64)
 	b = le.AppendUint64(b, 0)
-	b = le.AppendUint32(b, 0x5) // RVC, double-float ABI
+	b = le.AppendUint32(b, 0x5)
 	b = le.AppendUint16(b, 64)
 	b = le.AppendUint16(b, 56)
-	b = le.AppendUint16(b, 1)
+	b = le.AppendUint16(b, uint16(len(segs)))
 	b = le.AppendUint16(b, 64)
 	b = le.AppendUint16(b, 0)
 	b = le.AppendUint16(b, 0)
-	b = le.AppendUint32(b, 1) // PT_LOAD
-	b = le.AppendUint32(b, 7) // RWX
-	b = le.AppendUint64(b, 0)
-	b = le.AppendUint64(b, rvBase)
-	b = le.AppendUint64(b, rvBase)
-	b = le.AppendUint64(b, size)
-	b = le.AppendUint64(b, size)
-	b = le.AppendUint64(b, 0x1000)
-	return append(b, g.code...)
+	for _, sg := range segs {
+		b = le.AppendUint32(b, sg.typ)
+		b = le.AppendUint32(b, sg.flags)
+		b = le.AppendUint64(b, sg.off)
+		b = le.AppendUint64(b, sg.vaddr)
+		b = le.AppendUint64(b, sg.vaddr)
+		b = le.AppendUint64(b, sg.fsz)
+		b = le.AppendUint64(b, sg.ms)
+		b = le.AppendUint64(b, sg.align)
+	}
+	b = append(b, g.code...)
+	if dyn != nil {
+		b = append(b, make([]byte, int(off(rw))-len(b))...)
+		b = append(b, dynBytes...)
+	}
+	return b
 }
 
-// rvCollectNames reports every variable a statement list assigns (update is
+const rvInterp = "/lib/ld-linux-riscv64-lp64d.so.1"
+
+type rvDynamic struct {
+	interp, rela int
+	entries      [][2]uint64
+}
+
+// emitDynamicTables appends the interpreter path, dynamic string and symbol
+// tables, a symbol hash table and the GOT relocations (filled in by elf once
+// the GOT is placed) to the read-only image, and returns .dynamic's entries.
+func (g *rvGen) emitDynamicTables() *rvDynamic {
+	le := binary.LittleEndian
+	d := &rvDynamic{}
+	put := func(b []byte) int {
+		g.align(8)
+		at := len(g.code)
+		g.code = append(g.code, b...)
+		return at
+	}
+	d.interp = put(append([]byte(rvInterp), 0))
+	strs := []byte{0}
+	str := func(s string) uint64 {
+		at := len(strs)
+		strs = append(append(strs, s...), 0)
+		return uint64(at)
+	}
+	var needed []uint64
+	for _, lib := range g.neededLibs() {
+		needed = append(needed, str(lib))
+	}
+	syms := make([]byte, 24)
+	for _, im := range g.imports {
+		var sym [24]byte
+		le.PutUint32(sym[0:], uint32(str(im.sym)))
+		sym[4] = 1<<4 | 2
+		syms = append(syms, sym[:]...)
+	}
+	nsyms := len(g.imports) + 1
+	hash := le.AppendUint32(nil, 1)
+	hash = le.AppendUint32(hash, uint32(nsyms))
+	hash = le.AppendUint32(hash, 0)
+	hash = append(hash, make([]byte, 4*nsyms)...)
+	strAt := put(strs)
+	symAt := put(syms)
+	hashAt := put(hash)
+	d.rela = put(make([]byte, 24*len(g.imports)))
+	addr := func(pos int) uint64 { return uint64(rvBase + g.hdr + pos) }
+	for _, n := range needed {
+		d.entries = append(d.entries, [2]uint64{1, n})
+	}
+	d.entries = append(d.entries,
+		[2]uint64{4, addr(hashAt)},
+		[2]uint64{5, addr(strAt)},
+		[2]uint64{6, addr(symAt)},
+		[2]uint64{10, uint64(len(strs))},
+		[2]uint64{11, 24},
+		[2]uint64{7, addr(d.rela)},
+		[2]uint64{8, uint64(24 * len(g.imports))},
+		[2]uint64{9, 24},
+		[2]uint64{30, 8},
+		[2]uint64{0x6ffffffb, 1},
+		[2]uint64{21, 0},
+		[2]uint64{0, 0},
+	)
+	return d
+}
+
+// rvWalkAssigns reports every assignment target in a statement tree,
+// lambdas included.
+func rvWalkAssigns(node any, add func(name string, update bool)) {
+	rvVisit(node, true, func(n any) {
+		switch s := n.(type) {
+		case *AssignStmt:
+			add(s.Name, s.IsUpdate)
+		case *MultipleAssignStmt:
+			for _, name := range s.Names {
+				add(name, s.IsUpdate)
+			}
+		case *MapUpdateStmt:
+			add(s.MapName, true)
+		}
+	})
+}
+
+// rvCollectNames reports every variable a statement list binds (update is
 // set for <-), without descending into lambdas.
 func rvCollectNames(node any, add func(name string, update bool)) {
-	switch n := node.(type) {
-	case *AssignStmt:
-		add(n.Name, n.IsUpdate)
-		rvCollectNames(n.Value, add)
-	case *ExpressionStmt:
-		rvCollectNames(n.Expr, add)
-	case *LoopStmt:
-		add(n.Iterator, false)
-		if n.KeyVar != "" {
-			add(n.KeyVar, false)
-		}
-		rvCollectNames(n.Iterable, add)
-		for _, s := range n.Body {
-			rvCollectNames(s, add)
-		}
-	case *WhileStmt:
-		rvCollectNames(n.Condition, add)
-		for _, s := range n.Body {
-			rvCollectNames(s, add)
-		}
-	case *IfStmt:
-		for _, b := range n.Branches {
-			rvCollectNames(b.Condition, add)
-			for _, s := range b.Body {
-				rvCollectNames(s, add)
+	rvVisit(node, false, func(n any) {
+		switch s := n.(type) {
+		case *AssignStmt:
+			add(s.Name, s.IsUpdate)
+		case *MultipleAssignStmt:
+			for _, name := range s.Names {
+				add(name, s.IsUpdate)
+			}
+		case *LoopStmt:
+			add(s.Iterator, false)
+			if s.KeyVar != "" {
+				add(s.KeyVar, false)
+			}
+		case *ReceiveLoopStmt:
+			for _, name := range []string{s.MessageVar, s.SenderVar} {
+				if name != "" {
+					add(name, false)
+				}
+			}
+		case *PostfixExpr:
+			if id, ok := s.Operand.(*IdentExpr); ok {
+				add(id.Name, true)
 			}
 		}
-		for _, s := range n.ElseBody {
-			rvCollectNames(s, add)
-		}
-	case *BlockExpr:
-		for _, s := range n.Statements {
-			rvCollectNames(s, add)
-		}
-	case *MatchExpr:
-		rvCollectNames(n.Condition, add)
-		for _, c := range n.Clauses {
-			rvCollectNames(c.Guard, add)
-			rvCollectNames(c.Result, add)
-		}
-		rvCollectNames(n.DefaultExpr, add)
-	case *MapUpdateStmt:
-		rvCollectNames(n.Index, add)
-		rvCollectNames(n.Value, add)
-	case *JumpStmt:
-		rvCollectNames(n.Value, add)
-	case *BinaryExpr:
-		rvCollectNames(n.Left, add)
-		rvCollectNames(n.Right, add)
-	case *UnaryExpr:
-		rvCollectNames(n.Operand, add)
-	case *CastExpr:
-		rvCollectNames(n.Expr, add)
-	case *CallExpr:
-		for _, a := range n.Args {
-			rvCollectNames(a, add)
-		}
-	case *FStringExpr:
-		for _, p := range n.Parts {
-			rvCollectNames(p, add)
-		}
-	case *ListExpr:
-		for _, e := range n.Elements {
-			rvCollectNames(e, add)
-		}
-	case *IndexExpr:
-		rvCollectNames(n.List, add)
-		rvCollectNames(n.Index, add)
-	case *FMAExpr:
-		rvCollectNames(n.A, add)
-		rvCollectNames(n.B, add)
-		rvCollectNames(n.C, add)
-	}
+	})
 }
+
+// rvVisit calls f for every node of an AST subtree in source order,
+// descending into lambda bodies only when lambdas is set.
+func rvVisit(node any, lambdas bool, f func(any)) { astVisit(node, lambdas, f) }
 
 // Encoding.
 
@@ -306,6 +540,8 @@ func rvJ(imm int32, rd uint32) uint32 {
 	return u>>20&1<<31 | u>>1&0x3ff<<21 | u>>11&1<<20 | u>>12&0xff<<12 | rd<<7 | 0x6f
 }
 
+func rvFits12(v int32) bool { return v >= -2048 && v < 2048 }
+
 func (g *rvGen) w(x uint32)                      { g.code = binary.LittleEndian.AppendUint32(g.code, x) }
 func (g *rvGen) get(at int) uint32               { return binary.LittleEndian.Uint32(g.code[at:]) }
 func (g *rvGen) put(at int, x uint32)            { binary.LittleEndian.PutUint32(g.code[at:], x) }
@@ -315,10 +551,12 @@ func (g *rvGen) align(n int)                     { g.code = append(g.code, make(
 func (g *rvGen) addi(rd, rs uint32, i int32)     { g.w(rvI(i, rs, 0, rd, 0x13)) }
 func (g *rvGen) andi(rd, rs uint32, i int32)     { g.w(rvI(i, rs, 7, rd, 0x13)) }
 func (g *rvGen) xori(rd, rs uint32, i int32)     { g.w(rvI(i, rs, 4, rd, 0x13)) }
+func (g *rvGen) sltiu(rd, rs uint32, i int32)    { g.w(rvI(i, rs, 3, rd, 0x13)) }
 func (g *rvGen) slli(rd, rs uint32, sh int32)    { g.w(rvI(sh, rs, 1, rd, 0x13)) }
 func (g *rvGen) srli(rd, rs uint32, sh int32)    { g.w(rvI(sh, rs, 5, rd, 0x13)) }
 func (g *rvGen) mv(rd, rs uint32)                { g.addi(rd, rs, 0) }
 func (g *rvGen) op(f7, f3, rd, rs1, rs2 uint32)  { g.w(rvR(f7, rs2, rs1, f3, rd, 0x33)) }
+func (g *rvGen) add(rd, rs1, rs2 uint32)         { g.op(0, 0, rd, rs1, rs2) }
 func (g *rvGen) ld(rd, rs uint32, off int32)     { g.w(rvI(off, rs, 3, rd, 0x03)) }
 func (g *rvGen) lbu(rd, rs uint32, off int32)    { g.w(rvI(off, rs, 4, rd, 0x03)) }
 func (g *rvGen) sd(rs2, rs1 uint32, off int32)   { g.w(rvS(off, rs2, rs1, 3, 0x23)) }
@@ -333,7 +571,35 @@ func (g *rvGen) fcvtLD(rd, fs, rm uint32)        { g.fop(0x61, rm, rd, fs, 2) }
 func (g *rvGen) fcvtDL(fd, rs uint32)            { g.fop(0x69, 7, fd, rs, 2) }
 func (g *rvGen) feq(rd, a, b uint32)             { g.fop(0x51, 2, rd, a, b) }
 func (g *rvGen) ecall()                          { g.w(0x73) }
-func (g *rvGen) ret()                            { g.w(rvI(0, rvRA, 0, 0, 0x67)) }
+func (g *rvGen) jalr(rd, rs uint32, off int32)   { g.w(rvI(off, rs, 0, rd, 0x67)) }
+func (g *rvGen) ret()                            { g.jalr(0, rvRA, 0) }
+
+// Frame and data accesses whose offset may exceed 12 bits go through t6.
+func (g *rvGen) memOp(emit func(base uint32, off int32), base uint32, off int32) {
+	if rvFits12(off) {
+		emit(base, off)
+		return
+	}
+	g.li(rvT6, int64(off))
+	g.add(rvT6, rvT6, base)
+	emit(rvT6, 0)
+}
+
+func (g *rvGen) ldx(rd, base uint32, off int32) {
+	g.memOp(func(b uint32, o int32) { g.ld(rd, b, o) }, base, off)
+}
+
+func (g *rvGen) sdx(rs, base uint32, off int32) {
+	g.memOp(func(b uint32, o int32) { g.sd(rs, b, o) }, base, off)
+}
+
+func (g *rvGen) fldx(fd, base uint32, off int32) {
+	g.memOp(func(b uint32, o int32) { g.fld(fd, b, o) }, base, off)
+}
+
+func (g *rvGen) fsdx(fs, base uint32, off int32) {
+	g.memOp(func(b uint32, o int32) { g.fsd(fs, b, o) }, base, off)
+}
 
 func (g *rvGen) li(rd uint32, v int64) {
 	if v >= -2048 && v < 2048 {
@@ -376,7 +642,21 @@ func (g *rvGen) la(rd uint32, l *rvLabel) {
 }
 
 // br branches to l when rs1 <f3> rs2 (f3: 0 eq, 1 ne, 4 lt, 5 ge, 6 ltu, 7 geu).
+// Bound labels within reach and forward labels get a single branch (forward
+// ones are checked at link time); in long-branch mode forward branches are an
+// inverted branch around a jal.
 func (g *rvGen) br(f3, rs1, rs2 uint32, l *rvLabel) {
+	if l.pos >= 0 {
+		if off := l.pos - len(g.code); off >= -4096 {
+			g.w(rvB(int32(off), rs2, rs1, f3))
+			return
+		}
+	}
+	if !g.longBranches {
+		g.fixups = append(g.fixups, rvFixup{at: len(g.code), l: l, branch: true})
+		g.w(rvB(0, rs2, rs1, f3))
+		return
+	}
 	g.w(rvB(8, rs2, rs1, f3^1))
 	g.j(l)
 }
@@ -390,467 +670,152 @@ func (g *rvGen) constData(b []byte) *rvLabel {
 	return l
 }
 
-// Runtime.
-
-// emitStart runs the top level and exits with the value of its last expression.
-func (g *rvGen) emitStart() {
-	skip := g.newLabel()
-	g.la(rvS1, g.l["globals"])
-	g.call(g.l["main"])
-	g.li(rvS2, 0)
-	g.feq(rvT0, rvFA0, rvFA0)
-	g.beqz(rvT0, skip)
-	g.fcvtLD(rvS2, rvFA0, 1)
-	g.bind(skip)
-	g.call(g.l["flush"])
-	g.mv(rvA0, rvS2)
-	g.li(rvA7, 93)
-	g.ecall()
-}
-
-func (g *rvGen) emitHelpers() {
-	l := g.l
-
-	// num(a0 = op, fa0, fa1) -> fa0
-	g.bind(l["num"])
-	g.addi(rvSP, rvSP, -16)
-	g.sd(rvRA, rvSP, 8)
-	g.fmvXD(rvA1, rvFA0)
-	g.fmvXD(rvA2, rvFA1)
-	g.la(rvA3, l["alloc"])
-	g.li(rvA4, 0)
-	g.jal(rvRA, l["blob"], numRuntimeRISCV64Entry)
-	g.fmvDX(rvFA0, rvA0)
-	g.ld(rvRA, rvSP, 8)
-	g.addi(rvSP, rvSP, 16)
-	g.ret()
-
-	// alloc(ctx, a1 = size) -> a0: bump allocation from mmap'd chunks.
-	g.bind(l["alloc"])
-	grow, skip := g.newLabel(), g.newLabel()
-	g.addi(rvA1, rvA1, 15)
-	g.andi(rvA1, rvA1, -16)
-	g.la(rvT0, l["heap"])
-	g.ld(rvT1, rvT0, 0)
-	g.ld(rvT2, rvT0, 8)
-	g.op(0, 0, rvT3, rvT1, rvA1)
-	g.br(6, rvT2, rvT3, grow)
-	g.sd(rvT3, rvT0, 0)
-	g.mv(rvA0, rvT1)
-	g.ret()
-	g.bind(grow)
-	g.mv(rvT4, rvA1)
-	g.li(rvT5, 64<<20)
-	g.br(7, rvT5, rvT4, skip)
-	g.mv(rvT5, rvT4)
-	g.bind(skip)
-	g.mv(rvA1, rvT5)
-	g.li(rvA0, 0)
-	g.li(rvA2, 3)
-	g.li(rvA3, 0x22)
-	g.li(rvA4, -1)
-	g.li(rvA5, 0)
-	g.li(rvA7, 222)
-	g.ecall()
-	g.op(0, 0, rvT2, rvA0, rvT5)
-	g.sd(rvT2, rvT0, 8)
-	g.op(0, 0, rvT3, rvA0, rvT4)
-	g.sd(rvT3, rvT0, 0)
-	g.ret()
-
-	// putc(a0): buffered stdout. Clobbers t0-t2, a0-a2, a7.
-	g.bind(l["putc"])
-	done := g.newLabel()
-	g.la(rvT0, l["outlen"])
-	g.ld(rvT1, rvT0, 0)
-	g.la(rvT2, l["outbuf"])
-	g.op(0, 0, rvT2, rvT2, rvT1)
-	g.sb(rvA0, rvT2, 0)
-	g.addi(rvT1, rvT1, 1)
-	g.sd(rvT1, rvT0, 0)
-	g.li(rvT2, 4096)
-	g.br(6, rvT1, rvT2, done)
-	g.j(l["flush"])
-	g.bind(done)
-	g.ret()
-
-	g.bind(l["flush"])
-	done = g.newLabel()
-	g.la(rvT0, l["outlen"])
-	g.ld(rvA2, rvT0, 0)
-	g.beqz(rvA2, done)
-	g.li(rvA0, 1)
-	g.la(rvA1, l["outbuf"])
-	g.li(rvA7, 64)
-	g.ecall()
-	g.sd(0, rvT0, 0)
-	g.bind(done)
-	g.ret()
-
-	// print_raw(a0 = bytes, a1 = len)
-	g.bind(l["print_raw"])
-	loop, done := g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -16)
-	g.sd(rvRA, rvSP, 8)
-	g.mv(rvT3, rvA1)
-	g.mv(rvT4, rvA0)
-	g.bind(loop)
-	g.beqz(rvT3, done)
-	g.lbu(rvA0, rvT4, 0)
-	g.call(l["putc"])
-	g.addi(rvT4, rvT4, 1)
-	g.addi(rvT3, rvT3, -1)
-	g.j(loop)
-	g.bind(done)
-	g.ld(rvRA, rvSP, 8)
-	g.addi(rvSP, rvSP, 16)
-	g.ret()
-
-	// print_tstr(a0 = Tim string [count][key0][char0]...)
-	g.bind(l["print_tstr"])
-	loop, done = g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -16)
-	g.sd(rvRA, rvSP, 8)
-	g.fld(rvFT0, rvA0, 8)
-	g.fcvtLD(rvT3, rvFT0, 1)
-	g.addi(rvT4, rvA0, 24)
-	g.bind(loop)
-	g.beqz(rvT3, done)
-	g.fld(rvFT0, rvT4, 0)
-	g.fcvtLD(rvA0, rvFT0, 1)
-	g.call(l["putc"])
-	g.addi(rvT4, rvT4, 16)
-	g.addi(rvT3, rvT3, -1)
-	g.j(loop)
-	g.bind(done)
-	g.ld(rvRA, rvSP, 8)
-	g.addi(rvSP, rvSP, 16)
-	g.ret()
-
-	// print_i64(a0)
-	g.bind(l["print_i64"])
-	pos, digits, out, done := g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -48)
-	g.sd(rvRA, rvSP, 40)
-	g.mv(rvT3, rvA0)
-	g.br(5, rvT3, 0, pos)
-	g.li(rvA0, '-')
-	g.call(l["putc"])
-	g.op(0x20, 0, rvT3, 0, rvT3)
-	g.bind(pos)
-	g.addi(rvT4, rvSP, 32)
-	g.li(rvT5, 10)
-	g.bind(digits)
-	g.op(1, 7, rvT6, rvT3, rvT5)
-	g.op(1, 5, rvT3, rvT3, rvT5)
-	g.addi(rvT6, rvT6, '0')
-	g.addi(rvT4, rvT4, -1)
-	g.sb(rvT6, rvT4, 0)
-	g.bnez(rvT3, digits)
-	g.bind(out)
-	g.addi(rvT5, rvSP, 32)
-	g.br(0, rvT4, rvT5, done)
-	g.lbu(rvA0, rvT4, 0)
-	g.call(l["putc"])
-	g.addi(rvT4, rvT4, 1)
-	g.j(out)
-	g.bind(done)
-	g.ld(rvRA, rvSP, 40)
-	g.addi(rvSP, rvSP, 48)
-	g.ret()
-
-	// print_fixed(fa0, a0 = precision): fixed-point with round-to-nearest-even digits.
-	g.bind(l["print_fixed"])
-	pos, pow, carry, frac, done := g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -48)
-	g.sd(rvRA, rvSP, 40)
-	g.fsd(rvFS0, rvSP, 32)
-	g.sd(rvS2, rvSP, 24)
-	g.sd(rvS3, rvSP, 16)
-	g.fmvD(rvFS0, rvFA0)
-	g.mv(rvS2, rvA0)
-	g.fmvDX(rvFT0, 0)
-	g.fop(0x51, 1, rvT0, rvFS0, rvFT0)
-	g.beqz(rvT0, pos)
-	g.li(rvA0, '-')
-	g.call(l["putc"])
-	g.fop(0x11, 1, rvFS0, rvFS0, rvFS0)
-	g.bind(pos)
-	g.fcvtLD(rvS3, rvFS0, 1)
-	g.li(rvT0, 1)
-	g.li(rvT2, 10)
-	g.bind(pow)
-	g.beqz(rvS2, carry)
-	g.op(1, 0, rvT0, rvT0, rvT2)
-	g.addi(rvS2, rvS2, -1)
-	g.j(pow)
-	g.bind(carry)
-	g.fcvtDL(rvFT1, rvS3)
-	g.fop(0x05, 7, rvFT1, rvFS0, rvFT1)
-	g.fcvtDL(rvFT2, rvT0)
-	g.fop(0x09, 7, rvFT1, rvFT1, rvFT2)
-	g.fcvtLD(rvT1, rvFT1, 0)
-	g.br(6, rvT1, rvT0, frac)
-	g.addi(rvS3, rvS3, 1)
-	g.op(0x20, 0, rvT1, rvT1, rvT0)
-	g.bind(frac)
-	g.sd(rvT0, rvSP, 8)
-	g.sd(rvT1, rvSP, 0)
-	g.mv(rvA0, rvS3)
-	g.call(l["print_i64"])
-	g.ld(rvS2, rvSP, 8)
-	g.ld(rvS3, rvSP, 0)
-	g.li(rvT0, 1)
-	g.br(0, rvS2, rvT0, done)
-	g.li(rvA0, '.')
-	g.call(l["putc"])
-	loop = g.newLabel()
-	g.bind(loop)
-	g.li(rvT0, 10)
-	g.op(1, 5, rvS2, rvS2, rvT0)
-	g.beqz(rvS2, done)
-	g.op(1, 5, rvA0, rvS3, rvS2)
-	g.op(1, 7, rvA0, rvA0, rvT0)
-	g.addi(rvA0, rvA0, '0')
-	g.call(l["putc"])
-	g.j(loop)
-	g.bind(done)
-	g.ld(rvRA, rvSP, 40)
-	g.fld(rvFS0, rvSP, 32)
-	g.ld(rvS2, rvSP, 24)
-	g.ld(rvS3, rvSP, 16)
-	g.addi(rvSP, rvSP, 48)
-	g.ret()
-
-	// strcat(a0, a1) -> a0: new Tim string with the second string's keys renumbered.
-	g.bind(l["strcat"])
-	g.addi(rvSP, rvSP, -32)
-	g.sd(rvRA, rvSP, 24)
-	g.sd(rvS2, rvSP, 16)
-	g.sd(rvS3, rvSP, 8)
-	g.mv(rvS2, rvA0)
-	g.mv(rvS3, rvA1)
-	g.fld(rvFT0, rvS2, 8)
-	g.fld(rvFT1, rvS3, 8)
-	g.fop(0x01, 7, rvFT0, rvFT0, rvFT1)
-	g.fsd(rvFT0, rvSP, 0)
-	g.fcvtLD(rvA1, rvFT0, 1)
-	g.slli(rvA1, rvA1, 4)
-	g.addi(rvA1, rvA1, 16)
-	g.call(l["alloc"])
-	g.li(rvT0, int64(math.Float64bits(tagString)))
-	g.sd(rvT0, rvA0, 0)
-	g.fld(rvFT0, rvSP, 0)
-	g.fsd(rvFT0, rvA0, 8)
-	g.addi(rvT2, rvA0, 16)
-	g.li(rvT3, 0)
-	for _, src := range []uint32{rvS2, rvS3} {
-		loop, next := g.newLabel(), g.newLabel()
-		g.fld(rvFT0, src, 8)
-		g.fcvtLD(rvT0, rvFT0, 1)
-		g.addi(rvT1, src, 24)
-		g.bind(loop)
-		g.beqz(rvT0, next)
-		g.sd(rvT3, rvT2, 0)
-		g.fld(rvFT0, rvT1, 0)
-		g.fsd(rvFT0, rvT2, 8)
-		g.addi(rvT1, rvT1, 16)
-		g.addi(rvT2, rvT2, 16)
-		g.addi(rvT3, rvT3, 1)
-		g.addi(rvT0, rvT0, -1)
-		g.j(loop)
-		g.bind(next)
-	}
-	g.ld(rvRA, rvSP, 24)
-	g.ld(rvS2, rvSP, 16)
-	g.ld(rvS3, rvSP, 8)
-	g.addi(rvSP, rvSP, 32)
-	g.ret()
-
-	// listcat(a0, a1) -> a0: flat lists [count][elem0][elem1]...
-	g.bind(l["listcat"])
-	g.addi(rvSP, rvSP, -32)
-	g.sd(rvRA, rvSP, 24)
-	g.sd(rvS2, rvSP, 16)
-	g.sd(rvS3, rvSP, 8)
-	g.mv(rvS2, rvA0)
-	g.mv(rvS3, rvA1)
-	g.fld(rvFT0, rvS2, 8)
-	g.fld(rvFT1, rvS3, 8)
-	g.fop(0x01, 7, rvFT0, rvFT0, rvFT1)
-	g.fsd(rvFT0, rvSP, 0)
-	g.fcvtLD(rvA1, rvFT0, 1)
-	g.slli(rvA1, rvA1, 4)
-	g.addi(rvA1, rvA1, 16)
-	g.call(l["alloc"])
-	g.li(rvT0, int64(math.Float64bits(tagList)))
-	g.sd(rvT0, rvA0, 0)
-	g.fld(rvFT0, rvSP, 0)
-	g.fsd(rvFT0, rvA0, 8)
-	g.addi(rvT2, rvA0, 16)
-	for _, src := range []uint32{rvS2, rvS3} {
-		loop, next := g.newLabel(), g.newLabel()
-		g.fld(rvFT0, src, 8)
-		g.fcvtLD(rvT0, rvFT0, 1)
-		g.addi(rvT1, src, 16)
-		g.bind(loop)
-		g.beqz(rvT0, next)
-		g.ld(rvT4, rvT1, 0)
-		g.sd(rvT4, rvT2, 0)
-		g.fld(rvFT0, rvT1, 8)
-		g.fsd(rvFT0, rvT2, 8)
-		g.addi(rvT1, rvT1, 16)
-		g.addi(rvT2, rvT2, 16)
-		g.addi(rvT0, rvT0, -1)
-		g.j(loop)
-		g.bind(next)
-	}
-	g.ld(rvRA, rvSP, 24)
-	g.ld(rvS2, rvSP, 16)
-	g.ld(rvS3, rvSP, 8)
-	g.addi(rvSP, rvSP, 32)
-	g.ret()
-
-	// listrep(a0 = list, a1 = times) -> a0
-	g.bind(l["listrep"])
-	outer, inner, next, rdone, nonneg := g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -48)
-	g.sd(rvRA, rvSP, 40)
-	g.sd(rvS2, rvSP, 32)
-	g.sd(rvS3, rvSP, 24)
-	g.sd(rvS4, rvSP, 16)
-	g.mv(rvS2, rvA0)
-	g.mv(rvS3, rvA1)
-	g.br(5, rvS3, 0, nonneg)
-	g.li(rvS3, 0)
-	g.bind(nonneg)
-	g.fld(rvFT0, rvS2, 8)
-	g.fcvtLD(rvS4, rvFT0, 1)
-	g.op(1, 0, rvA1, rvS4, rvS3)
-	g.sd(rvA1, rvSP, 0)
-	g.slli(rvA1, rvA1, 4)
-	g.addi(rvA1, rvA1, 16)
-	g.call(l["alloc"])
-	g.li(rvT0, int64(math.Float64bits(tagList)))
-	g.sd(rvT0, rvA0, 0)
-	g.ld(rvT0, rvSP, 0)
-	g.fcvtDL(rvFT0, rvT0)
-	g.fsd(rvFT0, rvA0, 8)
-	g.addi(rvT2, rvA0, 16)
-	g.bind(outer)
-	g.beqz(rvS3, rdone)
-	g.mv(rvT0, rvS4)
-	g.addi(rvT1, rvS2, 16)
-	g.bind(inner)
-	g.beqz(rvT0, next)
-	g.ld(rvT4, rvT1, 0)
-	g.sd(rvT4, rvT2, 0)
-	g.fld(rvFT0, rvT1, 8)
-	g.fsd(rvFT0, rvT2, 8)
-	g.addi(rvT1, rvT1, 16)
-	g.addi(rvT2, rvT2, 16)
-	g.addi(rvT0, rvT0, -1)
-	g.j(inner)
-	g.bind(next)
-	g.addi(rvS3, rvS3, -1)
-	g.j(outer)
-	g.bind(rdone)
-	g.ld(rvRA, rvSP, 40)
-	g.ld(rvS2, rvSP, 32)
-	g.ld(rvS3, rvSP, 24)
-	g.ld(rvS4, rvSP, 16)
-	g.addi(rvSP, rvSP, 48)
-	g.ret()
-
-	// print_list(a0): [a, b, ...]
-	g.bind(l["print_list"])
-	first := g.newLabel()
-	loop, done = g.newLabel(), g.newLabel()
-	g.addi(rvSP, rvSP, -32)
-	g.sd(rvRA, rvSP, 24)
-	g.sd(rvS2, rvSP, 16)
-	g.sd(rvS3, rvSP, 8)
-	g.mv(rvS2, rvA0)
-	g.li(rvS3, 0)
-	g.li(rvA0, '[')
-	g.call(l["putc"])
-	g.bind(loop)
-	g.fld(rvFT0, rvS2, 8)
-	g.fcvtLD(rvT0, rvFT0, 1)
-	g.br(5, rvS3, rvT0, done)
-	g.beqz(rvS3, first)
-	g.li(rvA0, ',')
-	g.call(l["putc"])
-	g.li(rvA0, ' ')
-	g.call(l["putc"])
-	g.bind(first)
-	g.slli(rvT0, rvS3, 4)
-	g.op(0, 0, rvT0, rvT0, rvS2)
-	g.fld(rvFA0, rvT0, 24)
-	g.li(rvA0, numOpStr)
-	g.call(l["num"])
-	g.fmvXD(rvA0, rvFA0)
-	g.call(l["print_tstr"])
-	g.addi(rvS3, rvS3, 1)
-	g.j(loop)
-	g.bind(done)
-	g.li(rvA0, ']')
-	g.call(l["putc"])
-	g.ld(rvRA, rvSP, 24)
-	g.ld(rvS2, rvSP, 16)
-	g.ld(rvS3, rvSP, 8)
-	g.addi(rvSP, rvSP, 32)
-	g.ret()
-}
-
 // Functions and frames.
 
 func (g *rvGen) compileBody(f *rvFunc, body func() error) error {
-	sc := &rvScope{fn: f, vars: map[string]int32{}, types: map[string]string{}, ret: g.newLabel(), bodyStart: g.newLabel(), isTopLevel: f == nil}
+	sc := &rvScope{fn: f, vars: map[string]int32{}, env: map[string]int32{}, structs: map[string]string{}, ret: g.newLabel(), bodyStart: g.newLabel()}
+	saved := g.sc
 	g.sc = sc
+	defer func() { g.sc = saved }()
 	sc.prologue = len(g.code)
-	for range 4 {
+	for range rvPrologueWords {
 		g.w(0)
 	}
 	if f != nil {
-		if len(f.params) > 8 {
-			return fmt.Errorf("more than 8 parameters")
+		if len(f.params) > rvMaxArgs {
+			return fmt.Errorf("more than %d parameters", rvMaxArgs)
 		}
-		for i, p := range f.params {
-			off := sc.newVar(p)
-			sc.types[p] = f.paramTypes[i]
-			g.fsd(uint32(rvFA0+i), rvS0, off)
+		for _, p := range f.params {
+			sc.newVar(p)
+		}
+		if len(f.captures) > 0 {
+			sc.envSlot = sc.newVar("\x00env")
+			g.sdx(rvA0, rvS0, sc.envSlot)
+			for i, c := range f.captures {
+				if _, isParam := sc.vars[c.name]; !isParam {
+					sc.env[c.name] = int32(24 + 8*i)
+				}
+			}
 		}
 		rvCollectNames(f.body, func(name string, update bool) {
 			if _, ok := sc.vars[name]; ok {
 				return
 			}
-			if _, global := g.globals[name]; !update || !global {
-				sc.newVar(name)
+			if _, ok := sc.env[name]; ok && update {
+				return
 			}
+			if _, global := g.globals[name]; update && global {
+				return
+			}
+			sc.newVar(name)
 		})
 		sc.tailExpr = f.body
+		sc.numeric = g.inferNumeric([]Statement{&ExpressionStmt{Expr: f.body}}, sc.vars)
+		for _, p := range f.params {
+			delete(sc.numeric, p)
+		}
+		if f.lam != nil {
+			for p, t := range f.lam.ParamCStructTypes {
+				if g.cstruct(t) != nil {
+					sc.structs[p] = t
+				}
+			}
+		}
+	}
+	var root any = &g.top
+	if f != nil {
+		root = f.body
+	} else {
+		for _, s := range g.top {
+			rvCollectNames(s, func(name string, _ bool) {
+				if _, ok := sc.vars[name]; !ok && g.mainLocals[name] {
+					sc.newVar(name)
+				}
+			})
+		}
+		sc.numeric = g.inferNumeric(g.top, sc.vars)
+	}
+	rvVisit(root, false, func(n any) {
+		if d, ok := n.(*DeferStmt); ok {
+			sc.defers = append(sc.defers, rvDefer{d.Call, sc.newVar(fmt.Sprintf("\x00defer%d", len(sc.defers)))})
+		}
+	})
+	g.allocRegs(root)
+	for _, sv := range sc.saves {
+		if sv.fp {
+			g.fsdx(sv.reg, rvS0, sv.slot)
+		} else {
+			g.sdx(sv.reg, rvS0, sv.slot)
+		}
+	}
+	if f != nil {
+		for i, p := range f.params {
+			if err := g.storeVar(uint32(rvFA0+i), p); err != nil {
+				return err
+			}
+		}
+	}
+	for _, d := range sc.defers {
+		g.sdx(0, rvS0, d.flag)
 	}
 	g.bind(sc.bodyStart)
 	if err := body(); err != nil {
 		return err
 	}
 	g.bind(sc.ret)
+	if len(sc.defers) > 0 {
+		saved := g.tmp()
+		g.fsdx(rvFA0, rvS0, saved)
+		for _, v := range slices.Backward(sc.defers) {
+			skip := g.newLabel()
+			g.ldx(rvT0, rvS0, v.flag)
+			g.beqz(rvT0, skip)
+			if err := g.expr(v.call); err != nil {
+				return err
+			}
+			g.bind(skip)
+		}
+		g.fldx(rvFA0, rvS0, saved)
+	}
+	for _, sv := range sc.saves {
+		if sv.fp {
+			g.fldx(sv.reg, rvS0, sv.slot)
+		} else {
+			g.ldx(sv.reg, rvS0, sv.slot)
+		}
+	}
 	g.ld(rvRA, rvS0, -8)
 	g.mv(rvT0, rvS0)
 	g.ld(rvS0, rvS0, -16)
 	g.mv(rvSP, rvT0)
 	g.ret()
 
-	slots := sc.nvars + sc.maxTmp
-	if slots > rvMaxSlots {
-		return fmt.Errorf("riscv64: function needs %d stack slots (max %d)", slots, rvMaxSlots)
+	frame := int32(16+8*(sc.nvars+sc.maxTmp)+15) &^ 15
+	words := []uint32{
+		rvI(-frame, rvSP, 0, rvSP, 0x13),
+		rvS(frame-8, rvRA, rvSP, 3, 0x23),
+		rvS(frame-16, rvS0, rvSP, 3, 0x23),
+		rvI(frame, rvSP, 0, rvS0, 0x13),
 	}
-	frame := int32(16+8*slots+15) &^ 15
-	g.put(sc.prologue, rvI(-frame, rvSP, 0, rvSP, 0x13))
-	g.put(sc.prologue+4, rvS(frame-8, rvRA, rvSP, 3, 0x23))
-	g.put(sc.prologue+8, rvS(frame-16, rvS0, rvSP, 3, 0x23))
-	g.put(sc.prologue+12, rvI(frame, rvSP, 0, rvS0, 0x13))
+	if !rvFits12(frame) {
+		hi := (frame + 0x800) >> 12
+		words = []uint32{
+			uint32(hi)&0xfffff<<12 | rvT6<<7 | 0x37,
+			rvI(frame-hi<<12, rvT6, 0, rvT6, 0x1b),
+			rvR(0x20, rvT6, rvSP, 0, rvSP, 0x33),
+			rvR(0, rvT6, rvSP, 0, rvT6, 0x33),
+			rvS(-8, rvRA, rvT6, 3, 0x23),
+			rvS(-16, rvS0, rvT6, 3, 0x23),
+			rvI(0, rvT6, 0, rvS0, 0x13),
+		}
+	}
+	for i := range rvPrologueWords {
+		ins := uint32(0x13)
+		if i < len(words) {
+			ins = words[i]
+		}
+		g.put(sc.prologue+4*i, ins)
+	}
 	return nil
 }
 
@@ -870,91 +835,194 @@ func (g *rvGen) tmp() int32 {
 	return int32(-16 - 8*(sc.nvars+sc.ntmp))
 }
 
+func (g *rvGen) tmps(n int) int32 {
+	var last int32
+	for range n {
+		last = g.tmp()
+	}
+	return last
+}
+
 // Variables.
 
-func (g *rvGen) varRef(name string) (base uint32, off int32, err error) {
+func (g *rvGen) isVar(name string) bool {
+	if _, ok := g.sc.vars[name]; ok {
+		return true
+	}
+	if _, ok := g.sc.env[name]; ok {
+		return true
+	}
+	_, ok := g.globals[name]
+	return ok
+}
+
+func (g *rvGen) loadVar(fd uint32, name string) error {
+	if r, ok := g.sc.regs[name]; ok {
+		if r != fd {
+			g.fmvD(fd, r)
+		}
+		return nil
+	}
 	if off, ok := g.sc.vars[name]; ok {
-		return rvS0, off, nil
+		g.fldx(fd, rvS0, off)
+		return nil
+	}
+	if off, ok := g.sc.env[name]; ok {
+		g.ldx(rvT0, rvS0, g.sc.envSlot)
+		g.fld(fd, rvT0, off)
+		return nil
 	}
 	if off, ok := g.globals[name]; ok {
-		return rvS1, off, nil
+		g.fldx(fd, rvS1, off)
+		return nil
 	}
-	return 0, 0, fmt.Errorf("riscv64: undefined variable %s", name)
+	if f := g.funcs[name]; f != nil {
+		g.la(rvT0, g.staticClosure(f))
+		g.fmvDX(fd, rvT0)
+		return nil
+	}
+	return fmt.Errorf("riscv64: undefined variable %s", name)
 }
 
-func (g *rvGen) varType(name string) string {
-	if _, ok := g.sc.vars[name]; ok {
-		return g.sc.types[name]
-	}
-	return g.globalTypes[name]
-}
-
-func (g *rvGen) setVarType(name, t string) {
-	if _, ok := g.sc.vars[name]; ok {
-		g.sc.types[name] = t
-	} else {
-		g.globalTypes[name] = t
-	}
-}
-
-func (g *rvGen) exprType(e Expression) string {
-	switch e := e.(type) {
-	case *StringExpr, *FStringExpr:
-		return "string"
-	case *ListExpr:
-		return "list"
-	case *IdentExpr:
-		return g.varType(e.Name)
-	case *BinaryExpr:
-		if l := g.exprType(e.Left); e.Operator == "+" && (l == "string" || l == "list") && g.exprType(e.Right) == l {
-			return l
+func (g *rvGen) storeVar(fs uint32, name string) error {
+	if r, ok := g.sc.regs[name]; ok {
+		if r != fs {
+			g.fmvD(r, fs)
 		}
-		if e.Operator == "*" && g.exprType(e.Left) == "list" {
-			return "list"
+		return nil
+	}
+	if off, ok := g.sc.vars[name]; ok {
+		g.fsdx(fs, rvS0, off)
+		return nil
+	}
+	if off, ok := g.sc.env[name]; ok {
+		g.ldx(rvT0, rvS0, g.sc.envSlot)
+		g.fsd(fs, rvT0, off)
+		return nil
+	}
+	if off, ok := g.globals[name]; ok {
+		g.fsdx(fs, rvS1, off)
+		return nil
+	}
+	return fmt.Errorf("riscv64: undefined variable %s", name)
+}
+
+func (g *rvGen) staticClosure(f *rvFunc) *rvLabel {
+	if f.static == nil {
+		f.static = g.newLabel()
+		g.statics = append(g.statics, f)
+	}
+	return f.static
+}
+
+// Static numeric inference: a variable is numeric when every value bound to
+// it is. Used only to skip container checks on arithmetic fast paths.
+
+func (g *rvGen) inferNumeric(stmts []Statement, vars map[string]int32) map[string]bool {
+	num := map[string]bool{}
+	for name := range vars {
+		num[name] = true
+	}
+	for changed := true; changed; {
+		changed = false
+		kill := func(name string) {
+			if num[name] {
+				num[name] = false
+				changed = true
+			}
+		}
+		for _, s := range stmts {
+			rvVisit(s, true, func(n any) {
+				switch s := n.(type) {
+				case *AssignStmt:
+					if !rvIsNum(s.Value, num) {
+						kill(s.Name)
+					}
+				case *MultipleAssignStmt:
+					for _, name := range s.Names {
+						kill(name)
+					}
+				case *LoopStmt:
+					if _, ok := s.Iterable.(*RangeExpr); !ok {
+						kill(s.Iterator)
+					}
+				case *LambdaExpr:
+					for _, p := range s.Params {
+						kill(p)
+					}
+				}
+			})
+		}
+	}
+	for name, ok := range num {
+		if !ok {
+			delete(num, name)
+		}
+	}
+	return num
+}
+
+func rvIsNum(e Expression, num map[string]bool) bool {
+	switch e := e.(type) {
+	case *NumberExpr, *BooleanExpr, *LengthExpr:
+		return true
+	case *IdentExpr:
+		return num[e.Name]
+	case *UnaryExpr:
+		return true
+	case *BinaryExpr:
+		switch e.Operator {
+		case "+", "*", "or!":
+			return rvIsNum(e.Left, num) && rvIsNum(e.Right, num)
+		case "::":
+			return false
+		}
+		return true
+	case *FMAExpr:
+		return true
+	case *CallExpr:
+		switch e.Function {
+		case "sqrt", "floor", "ceil", "round", "abs", "trunc", "float", "pow", "min", "max",
+			"sin", "cos", "tan", "asin", "acos", "atan", "atan2", "exp", "log", "log10",
+			"popcount", "clz", "ctz", "is_nan":
+			return e.Function != "min" && e.Function != "max" || rvIsNum(e.Args[0], num) && rvIsNum(e.Args[len(e.Args)-1], num)
 		}
 	case *CastExpr:
-		if e.Type == "string" || e.Type == "str" {
-			return "string"
+		switch e.Type {
+		case "string", "str", "list", "map", "ptr", "pointer", "cstr", "cstring", "addr":
+			return false
 		}
-	case *CallExpr:
-		if f := g.funcs[e.Function]; f != nil {
-			if g.typing[f.name] {
-				return ""
-			}
-			g.typing[f.name] = true
-			defer delete(g.typing, f.name)
-			saved := g.sc
-			g.sc = &rvScope{vars: map[string]int32{}, types: map[string]string{}}
-			for i, p := range f.params {
-				g.sc.vars[p] = 0
-				g.sc.types[p] = f.paramTypes[i]
-			}
-			t := g.exprType(f.body)
-			g.sc = saved
-			return t
-		}
-		if e.Function == "str" {
-			return "string"
-		}
+		return true
 	case *MatchExpr:
 		for _, c := range e.Clauses {
-			if c.Result != nil {
-				if t := g.exprType(c.Result); t != "" {
-					return t
-				}
+			if c.Result != nil && !rvIsNum(c.Result, num) {
+				return false
 			}
 		}
-		if e.DefaultExpr != nil {
-			return g.exprType(e.DefaultExpr)
-		}
+		return e.DefaultExpr == nil || rvIsNum(e.DefaultExpr, num)
 	case *BlockExpr:
 		if n := len(e.Statements); n > 0 {
 			if s, ok := e.Statements[n-1].(*ExpressionStmt); ok {
-				return g.exprType(s.Expr)
+				return rvIsNum(s.Expr, num)
 			}
 		}
 	}
-	return ""
+	return false
+}
+
+func (g *rvGen) isNum(e Expression) bool {
+	num := map[string]bool{}
+	for name := range g.globalNum {
+		_, local := g.sc.vars[name]
+		_, env := g.sc.env[name]
+		if !local && !env {
+			num[name] = true
+		}
+	}
+	for name := range g.sc.numeric {
+		num[name] = true
+	}
+	return rvIsNum(e, num)
 }
 
 // Statements.
@@ -971,28 +1039,36 @@ func (g *rvGen) stmts(list []Statement) error {
 // stmt compiles a statement, leaving its value (0 when it has none) in fa0.
 func (g *rvGen) stmt(s Statement) error {
 	switch s.(type) {
-	case *LoopStmt, *WhileStmt, *IfStmt, *MapUpdateStmt:
+	case *LoopStmt, *WhileStmt, *IfStmt, *MapUpdateStmt, *MultipleAssignStmt, *ReceiveLoopStmt:
 		defer g.number(0)
 	}
 	switch s := s.(type) {
 	case *ExpressionStmt:
+		if p, ok := s.Expr.(*PostfixExpr); ok {
+			return g.postfix(p)
+		}
 		return g.expr(s.Expr)
 	case *AssignStmt:
-		if _, ok := s.Value.(*LambdaExpr); ok {
-			return fmt.Errorf("riscv64: nested functions and closures are not supported")
+		if f := g.funcs[s.Name]; f != nil && g.sc.fn == nil {
+			return nil
+		}
+		if (s.IsUpdate || s.IsReuseMutable) && !g.mutable[s.Name] {
+			return fmt.Errorf("cannot update immutable variable '%s' (use <- only for mutable variables)", s.Name)
+		}
+		if lam, ok := s.Value.(*LambdaExpr); ok {
+			return g.closure(lam, s.Name)
 		}
 		if err := g.expr(s.Value); err != nil {
 			return err
 		}
-		base, off, err := g.varRef(s.Name)
-		if err != nil {
-			return err
-		}
-		g.fsd(rvFA0, base, off)
-		g.setVarType(s.Name, g.exprType(s.Value))
-		return nil
+		return g.storeVar(rvFA0, s.Name)
+	case *MultipleAssignStmt:
+		return g.multiAssign(s)
 	case *LoopStmt:
-		return g.rangeLoop(s)
+		if r, ok := s.Iterable.(*RangeExpr); ok {
+			return g.rangeLoop(s, r)
+		}
+		return g.containerLoop(s)
 	case *WhileStmt:
 		return g.whileLoop(s)
 	case *IfStmt:
@@ -1017,14 +1093,77 @@ func (g *rvGen) stmt(s Statement) error {
 	case *JumpStmt:
 		return g.jump(s.Label, s.IsBreak, s.Value)
 	case *MapUpdateStmt:
-		return g.listUpdate(s)
-	case *CStructDecl:
+		if !g.mutable[s.MapName] {
+			return fmt.Errorf("cannot modify immutable list '%s'", s.MapName)
+		}
+		if s.KeyName != "" {
+			if f := g.lookupField(g.varStructs[s.MapName], s.KeyName); f != nil && g.varStructs[s.MapName] != "" {
+				return g.fieldStore(s, f)
+			}
+		}
+		return g.update(s)
+	case *ArenaStmt:
+		return g.stmts(s.Body)
+	case *WithStmt:
+		return g.stmts(s.Body)
+	case *DeferStmt:
+		for _, d := range g.sc.defers {
+			if d.call == s.Call {
+				g.li(rvT0, 1)
+				g.sdx(rvT0, rvS0, d.flag)
+				return nil
+			}
+		}
+		return fmt.Errorf("riscv64: defer outside of a function body")
+	case *ReceiveLoopStmt:
+		return g.receiveLoop(s)
+	case *CStructDecl, *CImportStmt:
 		return nil
 	}
 	return fmt.Errorf("riscv64: %T statements are not supported yet", s)
 }
 
+func (g *rvGen) postfix(p *PostfixExpr) error {
+	id, ok := p.Operand.(*IdentExpr)
+	if !ok {
+		return fmt.Errorf("riscv64: %s needs a variable", p.Operator)
+	}
+	if !g.mutable[id.Name] {
+		return fmt.Errorf("cannot modify immutable variable '%s'", id.Name)
+	}
+	op := "+"
+	if p.Operator == "--" {
+		op = "-"
+	}
+	if err := g.expr(&BinaryExpr{Left: id, Operator: op, Right: &NumberExpr{Value: 1}}); err != nil {
+		return err
+	}
+	return g.storeVar(rvFA0, id.Name)
+}
+
+func (g *rvGen) multiAssign(s *MultipleAssignStmt) error {
+	mark := g.sc.ntmp
+	defer func() { g.sc.ntmp = mark }()
+	t := g.tmp()
+	if err := g.expr(s.Value); err != nil {
+		return err
+	}
+	g.fsdx(rvFA0, rvS0, t)
+	for i, name := range s.Names {
+		g.fldx(rvFA0, rvS0, t)
+		g.number1(rvFA1, float64(i))
+		g.numCall(valIndex)
+		if err := g.storeVar(rvFA0, name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func (g *rvGen) jump(label int, isBreak bool, value Expression) error {
+	if label == -1 || label == 0 && !isBreak {
+		label = len(g.sc.loops)
+	}
 	if label == 0 {
 		if value != nil {
 			if err := g.expr(value); err != nil {
@@ -1034,7 +1173,7 @@ func (g *rvGen) jump(label int, isBreak bool, value Expression) error {
 		g.j(g.sc.ret)
 		return nil
 	}
-	if label > len(g.sc.loops) {
+	if label < 1 || label > len(g.sc.loops) {
 		return fmt.Errorf("riscv64: jump to loop @%d outside of it", label)
 	}
 	lp := g.sc.loops[label-1]
@@ -1046,22 +1185,31 @@ func (g *rvGen) jump(label int, isBreak bool, value Expression) error {
 	return nil
 }
 
-func (g *rvGen) rangeLoop(s *LoopStmt) error {
-	r, ok := s.Iterable.(*RangeExpr)
-	if !ok {
-		if g.exprType(s.Iterable) == "list" {
-			return g.listLoop(s)
-		}
-		return fmt.Errorf("riscv64: only range and list loops are supported")
-	}
+func (g *rvGen) loopBody(lp rvLoop, body []Statement) error {
+	g.sc.loops = append(g.sc.loops, lp)
+	defer func() { g.sc.loops = g.sc.loops[:len(g.sc.loops)-1] }()
+	return g.stmts(body)
+}
+
+func (g *rvGen) rangeLoop(s *LoopStmt, r *RangeExpr) error {
 	mark := g.sc.ntmp
 	defer func() { g.sc.ntmp = mark }()
-	cnt, end := g.tmp(), g.tmp()
+	cnt, end := g.intLoc(), g.intLoc()
+	defer g.releaseInt(cnt)
+	defer g.releaseInt(end)
+	iters := g.tmp()
+	capped := s.MaxIterations > 0 && s.MaxIterations != math.MaxInt64
+	if n, ok := rvStaticCount(r); ok && n <= s.MaxIterations {
+		capped = false
+	}
+	if capped {
+		g.sdx(0, rvS0, iters)
+	}
 	if err := g.expr(r.Start); err != nil {
 		return err
 	}
 	g.toI64()
-	g.sd(rvA0, rvS0, cnt)
+	g.sdi(rvA0, cnt)
 	if err := g.expr(r.End); err != nil {
 		return err
 	}
@@ -1069,38 +1217,122 @@ func (g *rvGen) rangeLoop(s *LoopStmt) error {
 	if r.Inclusive {
 		g.addi(rvA0, rvA0, 1)
 	}
-	g.sd(rvA0, rvS0, end)
-	base, off, err := g.varRef(s.Iterator)
-	if err != nil {
-		return err
-	}
-	g.setVarType(s.Iterator, "")
+	g.sdi(rvA0, end)
 	top, lp := g.newLabel(), rvLoop{g.newLabel(), g.newLabel()}
 	g.bind(top)
-	g.ld(rvT0, rvS0, cnt)
-	g.ld(rvT1, rvS0, end)
-	g.br(5, rvT0, rvT1, lp.brk)
-	g.fcvtDL(rvFA0, rvT0)
-	g.fsd(rvFA0, base, off)
-	g.sc.loops = append(g.sc.loops, lp)
-	if err := g.stmts(s.Body); err != nil {
+	c := g.intReg(cnt, rvT0)
+	g.br(5, c, g.intReg(end, rvT1), lp.brk)
+	if capped {
+		g.ldx(rvT1, rvS0, iters)
+		g.li(rvT2, s.MaxIterations)
+		g.br(5, rvT1, rvT2, lp.brk)
+		g.addi(rvT1, rvT1, 1)
+		g.sdx(rvT1, rvS0, iters)
+	}
+	g.fcvtDL(rvFA0, c)
+	if err := g.storeVar(rvFA0, s.Iterator); err != nil {
 		return err
 	}
-	g.sc.loops = g.sc.loops[:len(g.sc.loops)-1]
+	if err := g.loopBody(lp, s.Body); err != nil {
+		return err
+	}
 	g.bind(lp.cont)
-	g.ld(rvT0, rvS0, cnt)
+	c = g.intReg(cnt, rvT0)
 	step := rangeStepValue(r)
 	if step <= 2047 {
-		g.addi(rvT0, rvT0, int32(step))
+		g.addi(c, c, int32(step))
 	} else {
 		g.li(rvT1, step)
-		g.op(0, 0, rvT0, rvT0, rvT1)
+		g.add(c, c, rvT1)
 	}
-	g.sd(rvT0, rvS0, cnt)
+	g.sdi(c, cnt)
 	g.j(top)
 	g.bind(lp.brk)
 	return nil
 }
+
+// rvStaticCount is the number of iterations of a range with literal bounds.
+func rvStaticCount(r *RangeExpr) (int64, bool) {
+	start, ok1 := r.Start.(*NumberExpr)
+	end, ok2 := r.End.(*NumberExpr)
+	if !ok1 || !ok2 || start.Exact != nil || end.Exact != nil {
+		return 0, false
+	}
+	hi := int64(end.Value)
+	if r.Inclusive {
+		hi++
+	}
+	step := rangeStepValue(r)
+	return max((hi-int64(start.Value)+step-1)/step, 0), true
+}
+
+// containerLoop walks the entries of a string, list or map; any other value
+// iterates once, as the single-entry map a number is.
+func (g *rvGen) containerLoop(s *LoopStmt) error {
+	if g.cstruct(s.IteratorType) != nil {
+		g.sc.structs[s.Iterator] = s.IteratorType
+	}
+	mark := g.sc.ntmp
+	defer func() { g.sc.ntmp = mark }()
+	i, n := g.intLoc(), g.intLoc()
+	defer g.releaseInt(i)
+	defer g.releaseInt(n)
+	p := g.tmp()
+	if err := g.expr(s.Iterable); err != nil {
+		return err
+	}
+	g.fsdx(rvFA0, rvS0, p)
+	g.sdi(0, i)
+	single, start := g.newLabel(), g.newLabel()
+	g.fmvXD(rvT0, rvFA0)
+	g.boxTest(rvT0, rvT1, single)
+	g.fld(rvFT0, rvT0, 8)
+	g.fcvtLD(rvT1, rvFT0, 1)
+	g.sdi(rvT1, n)
+	g.j(start)
+	g.bind(single)
+	g.li(rvT1, -1)
+	g.sdi(rvT1, n)
+	g.bind(start)
+	top, lp := g.newLabel(), rvLoop{g.newLabel(), g.newLabel()}
+	g.bind(top)
+	ir, nr := g.intReg(i, rvT1), g.intReg(n, rvT2)
+	notSingle, have := g.newLabel(), g.newLabel()
+	g.bge0(nr, notSingle)
+	g.bnez(ir, lp.brk)
+	g.fldx(rvFA0, rvS0, p)
+	g.j(have)
+	g.bind(notSingle)
+	g.br(5, ir, nr, lp.brk)
+	g.ldx(rvT0, rvS0, p)
+	g.slli(rvT2, ir, 4)
+	g.add(rvT0, rvT0, rvT2)
+	g.fld(rvFA0, rvT0, 24)
+	g.bind(have)
+	if err := g.storeVar(rvFA0, s.Iterator); err != nil {
+		return err
+	}
+	if s.KeyVar != "" {
+		g.fldx(rvFA0, rvS0, p)
+		g.fcvtDL(rvFA1, g.intReg(i, rvT0))
+		g.numCall(valKeyAt)
+		if err := g.storeVar(rvFA0, s.KeyVar); err != nil {
+			return err
+		}
+	}
+	if err := g.loopBody(lp, s.Body); err != nil {
+		return err
+	}
+	g.bind(lp.cont)
+	ir = g.intReg(i, rvT0)
+	g.addi(ir, ir, 1)
+	g.sdi(ir, i)
+	g.j(top)
+	g.bind(lp.brk)
+	return nil
+}
+
+func (g *rvGen) bge0(rs uint32, l *rvLabel) { g.br(5, rs, 0, l) }
 
 func (g *rvGen) whileLoop(s *WhileStmt) error {
 	mark := g.sc.ntmp
@@ -1108,976 +1340,131 @@ func (g *rvGen) whileLoop(s *WhileStmt) error {
 	bounded := s.MaxIterations != math.MaxInt64
 	cnt := g.tmp()
 	if bounded {
-		g.sd(0, rvS0, cnt)
+		g.sdx(0, rvS0, cnt)
 	}
 	lp := rvLoop{g.newLabel(), g.newLabel()}
 	g.bind(lp.cont)
 	if bounded {
-		g.ld(rvT0, rvS0, cnt)
+		g.ldx(rvT0, rvS0, cnt)
 		g.li(rvT1, s.MaxIterations)
 		g.br(5, rvT0, rvT1, lp.brk)
 		g.addi(rvT0, rvT0, 1)
-		g.sd(rvT0, rvS0, cnt)
+		g.sdx(rvT0, rvS0, cnt)
 	}
 	if err := g.truthy(s.Condition); err != nil {
 		return err
 	}
 	g.beqz(rvA0, lp.brk)
-	g.sc.loops = append(g.sc.loops, lp)
-	if err := g.stmts(s.Body); err != nil {
+	if err := g.loopBody(lp, s.Body); err != nil {
 		return err
 	}
-	g.sc.loops = g.sc.loops[:len(g.sc.loops)-1]
 	g.j(lp.cont)
 	g.bind(lp.brk)
 	return nil
 }
 
-// Expressions: the value ends up in fa0.
+// Closures: [4.0][code][capture count][captured values...]. Calls pass the
+// closure in a0; the callee keeps it in its env slot.
 
-func (g *rvGen) inTail(e Expression, tail bool) error {
-	if !tail {
-		return g.expr(e)
+func (g *rvGen) freeVars(lam *LambdaExpr) []string {
+	bound := map[string]bool{}
+	for _, p := range lam.Params {
+		bound[p] = true
 	}
-	saved := g.sc.tailExpr
-	g.sc.tailExpr = e
-	defer func() { g.sc.tailExpr = saved }()
-	return g.expr(e)
-}
-
-func (g *rvGen) number(v float64) {
-	if bits := math.Float64bits(v); bits == 0 {
-		g.fmvDX(rvFA0, 0)
-	} else {
-		g.li(rvT0, int64(bits))
-		g.fmvDX(rvFA0, rvT0)
+	rvCollectNames(lam.Body, func(name string, update bool) {
+		if !update {
+			bound[name] = true
+		}
+	})
+	var free []string
+	seen := map[string]bool{}
+	use := func(name string) {
+		if !bound[name] && !seen[name] {
+			seen[name] = true
+			free = append(free, name)
+		}
 	}
-}
-
-func (g *rvGen) timString(s string) *rvLabel {
-	runes := []rune(s)
-	b := binary.LittleEndian.AppendUint64(nil, math.Float64bits(tagString))
-	b = binary.LittleEndian.AppendUint64(b, math.Float64bits(float64(len(runes))))
-	for i, r := range runes {
-		b = binary.LittleEndian.AppendUint64(b, uint64(i))
-		b = binary.LittleEndian.AppendUint64(b, math.Float64bits(float64(r)))
-	}
-	return g.constData(b)
-}
-
-func (g *rvGen) expr(e Expression) error {
-	switch e := e.(type) {
-	case *NumberExpr:
-		if e.Exact == nil {
-			g.number(e.Value)
-			return nil
-		}
-		data, tag := numStoreInt(nil, e.Exact.Num()), int64(numTagBig)
-		if !e.Exact.IsInt() {
-			data, tag = numStoreInt(data, e.Exact.Denom()), numTagRat
-		}
-		g.la(rvT0, g.constData(data))
-		g.li(rvT1, tag<<48)
-		g.op(0, 6, rvT0, rvT0, rvT1)
-		g.fmvDX(rvFA0, rvT0)
-	case *BooleanExpr:
-		g.number(map[bool]float64{true: 1}[e.Value])
-	case *StringExpr:
-		g.la(rvT0, g.timString(processEscapeSequences(e.Value)))
-		g.fmvDX(rvFA0, rvT0)
-	case *FStringExpr:
-		return g.fstring(e)
-	case *IdentExpr:
-		if g.funcs[e.Name] != nil {
-			return fmt.Errorf("riscv64: functions are not first-class values here (%s)", e.Name)
-		}
-		base, off, err := g.varRef(e.Name)
-		if err != nil {
-			return err
-		}
-		g.fld(rvFA0, base, off)
-	case *BinaryExpr:
-		return g.binary(e)
-	case *UnaryExpr:
-		return g.unary(e.Operator, e.Operand)
-	case *LengthExpr:
-		return g.unary("#", e.Operand)
-	case *FMAExpr:
-		var prod Expression = &BinaryExpr{Left: e.A, Operator: "*", Right: e.B}
-		if e.IsNegMul {
-			prod = &UnaryExpr{Operator: "-", Operand: prod}
-		}
-		op := "+"
-		if e.IsSub {
-			op = "-"
-		}
-		return g.expr(&BinaryExpr{Left: prod, Operator: op, Right: e.C})
-	case *CastExpr:
-		if err := g.expr(e.Expr); err != nil {
-			return err
-		}
-		if (e.Type == "string" || e.Type == "str") && g.exprType(e.Expr) != "string" {
-			g.numCall(numOpStr)
-		}
-	case *ListExpr:
-		return g.list(e)
-	case *IndexExpr:
-		return g.index(e)
-	case *MatchExpr:
-		return g.match(e)
-	case *BlockExpr:
-		return g.block(e)
-	case *JumpExpr:
-		return g.jump(e.Label, e.IsBreak, e.Value)
-	case *CallExpr:
-		return g.callExpr(e)
-	default:
-		return fmt.Errorf("riscv64: %T expressions are not supported yet", e)
-	}
-	return nil
-}
-
-func (g *rvGen) block(e *BlockExpr) error {
-	tail := g.sc.tailExpr == Expression(e)
-	for i, s := range e.Statements {
-		if i == len(e.Statements)-1 {
-			switch s := s.(type) {
-			case *ExpressionStmt:
-				return g.inTail(s.Expr, tail)
-			case *AssignStmt:
-				if err := g.stmt(s); err != nil {
-					return err
-				}
-				return g.expr(&IdentExpr{Name: s.Name})
+	rvVisit(lam.Body, false, func(n any) {
+		switch e := n.(type) {
+		case *IdentExpr:
+			use(e.Name)
+		case *CallExpr:
+			use(e.Function)
+		case *AssignStmt:
+			if e.IsUpdate {
+				use(e.Name)
+			}
+		case *MapUpdateStmt:
+			use(e.MapName)
+		case *LambdaExpr:
+			for _, name := range g.freeVars(e) {
+				use(name)
 			}
 		}
-		if err := g.stmt(s); err != nil {
-			return err
-		}
-	}
-	g.number(0)
-	return nil
+	})
+	return free
 }
 
-func (g *rvGen) match(e *MatchExpr) error {
-	tail := g.sc.tailExpr == Expression(e)
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	cond := g.tmp()
-	if err := g.expr(e.Condition); err != nil {
+func (g *rvGen) closure(lam *LambdaExpr, self string) error {
+	if lam.VariadicParam != "" {
+		return fmt.Errorf("riscv64: variadic lambdas are not supported yet")
+	}
+	g.nlambda++
+	f := &rvFunc{lam: lam, name: fmt.Sprintf("lambda%d", g.nlambda), params: lam.Params, body: lam.Body, label: g.newLabel()}
+	selfSlot := -1
+	for _, name := range g.freeVars(lam) {
+		_, local := g.sc.vars[name]
+		_, env := g.sc.env[name]
+		if local || env {
+			if name == self {
+				selfSlot = len(f.captures)
+			}
+			f.captures = append(f.captures, rvCapture{name, &IdentExpr{Name: name}})
+		}
+	}
+	if self != "" {
+		f.name = self
+	}
+	if err := g.makeClosure(f); err != nil {
 		return err
 	}
-	g.fsd(rvFA0, rvS0, cond)
-	end := g.newLabel()
-	for _, c := range e.Clauses {
-		next := g.newLabel()
-		switch {
-		case c.IsValueMatch:
-			if err := g.expr(c.Guard); err != nil {
-				return err
-			}
-			g.fmvD(rvFA1, rvFA0)
-			g.fld(rvFA0, rvS0, cond)
-			g.numBinop("==")
-			g.fmvXD(rvA0, rvFA0)
-		case c.Guard != nil:
-			if err := g.truthy(c.Guard); err != nil {
-				return err
-			}
-		default:
-			g.fld(rvFA0, rvS0, cond)
-			g.truthyFA0()
-		}
-		g.beqz(rvA0, next)
-		if c.Result != nil {
-			if err := g.inTail(c.Result, tail); err != nil {
-				return err
-			}
-		} else {
-			g.number(0)
-		}
-		g.j(end)
-		g.bind(next)
-	}
-	switch {
-	case e.DefaultExpr != nil:
-		if err := g.inTail(e.DefaultExpr, tail); err != nil {
-			return err
-		}
-	case len(e.Clauses) == 0:
-		g.fld(rvFA0, rvS0, cond)
-	default:
-		g.number(0)
-	}
-	g.bind(end)
-	return nil
-}
-
-// operands evaluates l into a temporary and r into fa1, leaving l in fa0.
-func (g *rvGen) operands(l, r Expression) error {
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	t := g.tmp()
-	if err := g.expr(l); err != nil {
-		return err
-	}
-	g.fsd(rvFA0, rvS0, t)
-	if err := g.expr(r); err != nil {
-		return err
-	}
-	g.fmvD(rvFA1, rvFA0)
-	g.fld(rvFA0, rvS0, t)
-	return nil
-}
-
-func (g *rvGen) binary(e *BinaryExpr) error {
-	switch e.Operator {
-	case "and", "or":
-		short, end := g.newLabel(), g.newLabel()
-		if err := g.truthy(e.Left); err != nil {
-			return err
-		}
-		if e.Operator == "and" {
-			g.beqz(rvA0, short)
-		} else {
-			g.bnez(rvA0, short)
-		}
-		if err := g.truthy(e.Right); err != nil {
-			return err
-		}
-		g.fcvtDL(rvFA0, rvA0)
-		g.j(end)
-		g.bind(short)
-		g.number(map[bool]float64{true: 1}[e.Operator == "or"])
-		g.bind(end)
+	if self == "" {
 		return nil
-	case "xor":
-		mark := g.sc.ntmp
-		defer func() { g.sc.ntmp = mark }()
-		t := g.tmp()
-		if err := g.truthy(e.Left); err != nil {
-			return err
-		}
-		g.sd(rvA0, rvS0, t)
-		if err := g.truthy(e.Right); err != nil {
-			return err
-		}
-		g.ld(rvT0, rvS0, t)
-		g.op(0, 4, rvA0, rvA0, rvT0)
-		g.fcvtDL(rvFA0, rvA0)
-		return nil
-	case "or!":
-		// Errors (positive NaNs) and 0 take the right-hand side.
-		useDefault, end := g.newLabel(), g.newLabel()
-		if err := g.expr(e.Left); err != nil {
-			return err
-		}
+	}
+	if selfSlot >= 0 {
 		g.fmvXD(rvT0, rvFA0)
-		g.slli(rvT1, rvT0, 1)
-		g.beqz(rvT1, useDefault)
-		g.srli(rvT0, rvT0, 51)
-		g.li(rvT1, 0xFFF)
-		g.br(1, rvT0, rvT1, end)
-		g.bind(useDefault)
-		if err := g.expr(e.Right); err != nil {
-			return err
-		}
-		g.bind(end)
+		g.fsd(rvFA0, rvT0, int32(24+8*selfSlot))
+	}
+	return g.storeVar(rvFA0, self)
+}
+
+func (g *rvGen) makeClosure(f *rvFunc) error {
+	g.pending = append(g.pending, f)
+	if len(f.captures) == 0 {
+		g.la(rvT0, g.staticClosure(f))
+		g.fmvDX(rvFA0, rvT0)
 		return nil
 	}
-	if e.Operator == "*" && g.exprType(e.Left) == "list" && g.exprType(e.Right) == "" {
-		mark := g.sc.ntmp
-		defer func() { g.sc.ntmp = mark }()
-		t := g.tmp()
-		if err := g.expr(e.Left); err != nil {
-			return err
-		}
-		g.fsd(rvFA0, rvS0, t)
-		if err := g.expr(e.Right); err != nil {
-			return err
-		}
-		g.toI64()
-		g.mv(rvA1, rvA0)
-		g.ld(rvA0, rvS0, t)
-		g.call(g.l["listrep"])
-		g.fmvDX(rvFA0, rvA0)
-		return nil
-	}
-	if lt, rt := g.exprType(e.Left), g.exprType(e.Right); lt == "string" || rt == "string" || lt == "list" || rt == "list" {
-		if e.Operator != "+" || lt != rt {
-			return fmt.Errorf("riscv64: operator %s is not supported on %s and %s values", e.Operator, lt, rt)
-		}
-		if err := g.operands(e.Left, e.Right); err != nil {
-			return err
-		}
-		g.fmvXD(rvA0, rvFA0)
-		g.fmvXD(rvA1, rvFA1)
-		g.call(g.l[map[string]string{"string": "strcat", "list": "listcat"}[lt]])
-		g.fmvDX(rvFA0, rvA0)
-		return nil
-	}
-	if numBitwiseOps[e.Operator] {
-		return g.bitwise(e)
-	}
-	if _, ok := numBinops[e.Operator]; !ok {
-		return fmt.Errorf("riscv64: operator %s is not supported yet", e.Operator)
-	}
-	if err := g.operands(e.Left, e.Right); err != nil {
-		return err
-	}
-	g.numBinop(e.Operator)
-	return nil
-}
-
-func (g *rvGen) numCall(op int) {
-	g.li(rvA0, int64(op))
-	g.call(g.l["num"])
-}
-
-// fixnumCheck branches to slow unless freg holds a non-NaN value with |x| < 2^53.
-func (g *rvGen) fixnumCheck(freg uint32, slow *rvLabel) {
-	g.fmvXD(rvT0, freg)
-	g.slli(rvT0, rvT0, 1)
-	g.srli(rvT0, rvT0, 53)
-	g.li(rvT1, 0x434)
-	g.br(7, rvT0, rvT1, slow)
-}
-
-func (g *rvGen) smallIntCheck(freg uint32, no *rvLabel) {
-	g.fixnumCheck(freg, no)
-	g.fcvtLD(rvT0, freg, 1)
-	g.fcvtDL(rvFT2, rvT0)
-	g.feq(rvT1, rvFT2, freg)
-	g.beqz(rvT1, no)
-}
-
-// numBinop computes fa0 = fa0 op fa1 with exact semantics.
-func (g *rvGen) numBinop(op string) {
-	slow, done := g.newLabel(), g.newLabel()
-	switch op {
-	case "+", "-", "*":
-		g.fop(map[string]uint32{"+": 0x01, "-": 0x05, "*": 0x09}[op], 7, rvFT0, rvFA0, rvFA1)
-		g.fixnumCheck(rvFT0, slow)
-		g.fmvD(rvFA0, rvFT0)
-		g.j(done)
-	case "/":
-		notInt, inexact := g.newLabel(), g.newLabel()
-		g.fop(0x0D, 7, rvFT0, rvFA0, rvFA1)
-		g.smallIntCheck(rvFT0, notInt)
-		g.j(inexact)
-		g.bind(notInt)
-		g.smallIntCheck(rvFA0, inexact)
-		g.smallIntCheck(rvFA1, inexact)
-		g.j(slow)
-		g.bind(inexact)
-		g.fmvD(rvFA0, rvFT0)
-		g.j(done)
-	case "%", "mod":
-		g.smallIntCheck(rvFA0, slow)
-		g.smallIntCheck(rvFA1, slow)
-		g.fcvtLD(rvT0, rvFA0, 1)
-		g.fcvtLD(rvT1, rvFA1, 1)
-		g.beqz(rvT1, slow)
-		g.op(1, 6, rvT0, rvT0, rvT1)
-		g.fcvtDL(rvFA0, rvT0)
-		g.j(done)
-	case "<", "<=", ">", ">=", "==", "!=":
-		g.feq(rvT0, rvFA0, rvFA0)
-		g.beqz(rvT0, slow)
-		g.feq(rvT0, rvFA1, rvFA1)
-		g.beqz(rvT0, slow)
-		switch op {
-		case "<":
-			g.fop(0x51, 1, rvT0, rvFA0, rvFA1)
-		case "<=":
-			g.fop(0x51, 0, rvT0, rvFA0, rvFA1)
-		case ">":
-			g.fop(0x51, 1, rvT0, rvFA1, rvFA0)
-		case ">=":
-			g.fop(0x51, 0, rvT0, rvFA1, rvFA0)
-		default:
-			g.feq(rvT0, rvFA0, rvFA1)
-			if op == "!=" {
-				g.xori(rvT0, rvT0, 1)
-			}
-		}
-		g.fcvtDL(rvFA0, rvT0)
-		g.j(done)
-	}
-	g.bind(slow)
-	g.numCall(numBinops[op])
-	g.bind(done)
-}
-
-func (g *rvGen) unary(op string, operand Expression) error {
-	switch op {
-	case "-":
-		if err := g.expr(operand); err != nil {
-			return err
-		}
-		g.fmvD(rvFA1, rvFA0)
-		g.fmvDX(rvFA0, 0)
-		g.numBinop("-")
-	case "not":
-		if err := g.truthy(operand); err != nil {
-			return err
-		}
-		g.w(rvI(1, rvA0, 3, rvA0, 0x13)) // sltiu a0, a0, 1
-		g.fcvtDL(rvFA0, rvA0)
-	case "#":
-		if t := g.exprType(operand); t != "string" && t != "list" {
-			return fmt.Errorf("riscv64: # is only supported on strings and lists")
-		}
-		if err := g.expr(operand); err != nil {
-			return err
-		}
-		g.fmvXD(rvT0, rvFA0)
-		g.fld(rvFA0, rvT0, 8)
-	case "~b":
-		if err := g.expr(operand); err != nil {
-			return err
-		}
-		g.toI64()
-		g.xori(rvA0, rvA0, -1)
-		g.fromI64()
-	default:
-		return fmt.Errorf("riscv64: unary %s is not supported yet", op)
-	}
-	return nil
-}
-
-func (g *rvGen) bitwise(e *BinaryExpr) error {
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	t := g.tmp()
-	if err := g.expr(e.Left); err != nil {
-		return err
-	}
-	g.toI64()
-	g.sd(rvA0, rvS0, t)
-	if err := g.expr(e.Right); err != nil {
-		return err
-	}
-	g.toI64()
-	g.mv(rvA1, rvA0)
-	g.ld(rvA0, rvS0, t)
-	switch e.Operator {
-	case "|b":
-		g.op(0, 6, rvA0, rvA0, rvA1)
-	case "&b":
-		g.op(0, 7, rvA0, rvA0, rvA1)
-	case "^b":
-		g.op(0, 4, rvA0, rvA0, rvA1)
-	case "<<", "<<b":
-		g.op(0, 1, rvA0, rvA0, rvA1)
-	case "?b":
-		g.op(0, 5, rvA0, rvA0, rvA1)
-		g.andi(rvA0, rvA0, 1)
-	case ">>", ">>b":
-		g.op(0, 5, rvA0, rvA0, rvA1)
-	case "<<<", "<<<b", ">>>", ">>>b":
-		g.op(0x20, 0, rvA2, 0, rvA1)
-		if strings.HasPrefix(e.Operator, "<<<") {
-			g.op(0, 1, rvT0, rvA0, rvA1)
-			g.op(0, 5, rvT1, rvA0, rvA2)
-		} else {
-			g.op(0, 5, rvT0, rvA0, rvA1)
-			g.op(0, 1, rvT1, rvA0, rvA2)
-		}
-		g.op(0, 6, rvA0, rvT0, rvT1)
-	default:
-		return fmt.Errorf("riscv64: operator %s is not supported yet", e.Operator)
-	}
-	g.fromI64()
-	return nil
-}
-
-// truthyFA0 sets a0 to 1 when fa0 is truthy: non-zero numbers and boxed
-// exact numbers are, zero and error NaNs are not.
-func (g *rvGen) truthyFA0() {
-	nan, done := g.newLabel(), g.newLabel()
-	g.feq(rvT0, rvFA0, rvFA0)
-	g.beqz(rvT0, nan)
-	g.fmvDX(rvFT0, 0)
-	g.feq(rvA0, rvFA0, rvFT0)
-	g.xori(rvA0, rvA0, 1)
-	g.j(done)
-	g.bind(nan)
-	g.fmvXD(rvA0, rvFA0)
-	g.srli(rvA0, rvA0, 63)
-	g.bind(done)
-}
-
-func (g *rvGen) truthy(e Expression) error {
-	if err := g.expr(e); err != nil {
-		return err
-	}
-	g.truthyFA0()
-	return nil
-}
-
-// toI64 truncates fa0 to a signed 64-bit integer in a0.
-func (g *rvGen) toI64() {
-	inline, done := g.newLabel(), g.newLabel()
-	g.feq(rvT0, rvFA0, rvFA0)
-	g.bnez(rvT0, inline)
-	g.numCall(numOpToI64)
-	g.fmvXD(rvA0, rvFA0)
-	g.j(done)
-	g.bind(inline)
-	g.fcvtLD(rvA0, rvFA0, 1)
-	g.bind(done)
-}
-
-// fromI64 converts the signed integer in a0 to a number in fa0.
-func (g *rvGen) fromI64() {
-	slow, done := g.newLabel(), g.newLabel()
-	g.li(rvT0, numFixMax-1)
-	g.op(0, 0, rvT0, rvT0, rvA0)
-	g.li(rvT1, 2*numFixMax-2)
-	g.br(6, rvT1, rvT0, slow)
-	g.fcvtDL(rvFA0, rvA0)
-	g.j(done)
-	g.bind(slow)
-	g.fmvDX(rvFA0, rvA0)
-	g.numCall(numOpFromI64)
-	g.bind(done)
-}
-
-func (g *rvGen) toFloat() {
-	done := g.newLabel()
-	g.feq(rvT0, rvFA0, rvFA0)
-	g.bnez(rvT0, done)
-	g.numCall(numOpFloat)
-	g.bind(done)
-}
-
-func (g *rvGen) fstring(e *FStringExpr) error {
-	if len(e.Parts) == 0 {
-		return g.expr(&StringExpr{})
-	}
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	acc := g.tmp()
-	for i, p := range e.Parts {
-		if g.exprType(p) == "list" {
-			return fmt.Errorf("riscv64: lists cannot be interpolated into f-strings yet")
-		}
-		if err := g.expr(p); err != nil {
-			return err
-		}
-		if g.exprType(p) != "string" {
-			g.numCall(numOpStr)
-		}
-		if i > 0 {
-			g.fmvXD(rvA1, rvFA0)
-			g.ld(rvA0, rvS0, acc)
-			g.call(g.l["strcat"])
-			g.fmvDX(rvFA0, rvA0)
-		}
-		g.fsd(rvFA0, rvS0, acc)
-	}
-	return nil
-}
-
-// Calls.
-
-func (g *rvGen) callExpr(c *CallExpr) error {
-	name := c.Function
-	if name == "me" && g.sc.fn != nil {
-		name = g.sc.fn.name
-	}
-	if f := g.funcs[name]; f != nil {
-		return g.userCall(f, c)
-	}
-	switch name {
-	case "println", "print":
-		for i, a := range c.Args {
-			if i > 0 {
-				g.printRaw(" ")
-			}
-			if err := g.printValue(a); err != nil {
-				return err
-			}
-		}
-		if name == "println" {
-			g.printRaw("\n")
-		}
-		g.number(0)
-		return nil
-	case "printf":
-		return g.printf(c)
-	case "exit":
-		if len(c.Args) > 0 {
-			if err := g.expr(c.Args[0]); err != nil {
-				return err
-			}
-			g.toI64()
-		} else {
-			g.li(rvA0, 0)
-		}
-		g.mv(rvS2, rvA0)
-		g.call(g.l["flush"])
-		g.mv(rvA0, rvS2)
-		g.li(rvA7, 93)
-		g.ecall()
-		return nil
-	case "str":
-		if len(c.Args) == 1 {
-			return g.expr(&CastExpr{Expr: c.Args[0], Type: "string"})
-		}
-	case "pow":
-		if len(c.Args) == 2 {
-			return g.expr(&BinaryExpr{Left: c.Args[0], Operator: "**", Right: c.Args[1]})
-		}
-	case "min", "max":
-		if len(c.Args) == 2 {
-			return g.minMax(name, c.Args[0], c.Args[1])
-		}
-	case "sqrt":
-		if len(c.Args) == 1 {
-			if err := g.expr(c.Args[0]); err != nil {
-				return err
-			}
-			g.toFloat()
-			g.fop(0x2D, 7, rvFA0, rvFA0, 0)
-			return nil
-		}
-	case "floor", "ceil", "round", "abs", "trunc":
-		if len(c.Args) == 1 {
-			if err := g.expr(c.Args[0]); err != nil {
-				return err
-			}
-			op, ok := numRoundBuiltins[name]
-			if !ok {
-				op = numOpTrunc
-			}
-			g.numCall(op)
-			return nil
-		}
-	case "float":
-		if len(c.Args) == 1 {
-			if err := g.expr(c.Args[0]); err != nil {
-				return err
-			}
-			g.toFloat()
-			return nil
-		}
-	}
-	return fmt.Errorf("riscv64: function %s is not supported yet", c.Function)
-}
-
-func (g *rvGen) userCall(f *rvFunc, c *CallExpr) error {
-	if len(c.Args) != len(f.params) {
-		return fmt.Errorf("riscv64: %s takes %d arguments, got %d", f.name, len(f.params), len(c.Args))
-	}
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	slots := make([]int32, len(c.Args))
-	for i, a := range c.Args {
-		slots[i] = g.tmp()
-		if err := g.expr(a); err != nil {
-			return err
-		}
-		g.fsd(rvFA0, rvS0, slots[i])
-		if g.exprType(a) == "string" {
-			f.paramTypes[i] = "string"
-		}
-	}
-	if g.sc.fn == f && g.sc.tailExpr == Expression(c) {
-		for i, p := range f.params {
-			g.fld(rvFT0, rvS0, slots[i])
-			g.fsd(rvFT0, rvS0, g.sc.vars[p])
-		}
-		g.j(g.sc.bodyStart)
-		return nil
-	}
-	for i := range c.Args {
-		g.fld(uint32(rvFA0+i), rvS0, slots[i])
-	}
-	g.call(f.label)
-	return nil
-}
-
-func (g *rvGen) minMax(name string, a, b Expression) error {
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	ta, tb := g.tmp(), g.tmp()
-	if err := g.expr(a); err != nil {
-		return err
-	}
-	g.fsd(rvFA0, rvS0, ta)
-	if err := g.expr(b); err != nil {
-		return err
-	}
-	g.fsd(rvFA0, rvS0, tb)
-	g.fmvD(rvFA1, rvFA0)
-	g.fld(rvFA0, rvS0, ta)
-	if name == "min" {
-		g.numBinop("<=")
-	} else {
-		g.numBinop(">=")
-	}
-	pickB, done := g.newLabel(), g.newLabel()
-	g.fmvXD(rvT0, rvFA0)
-	g.beqz(rvT0, pickB)
-	g.fld(rvFA0, rvS0, ta)
-	g.j(done)
-	g.bind(pickB)
-	g.fld(rvFA0, rvS0, tb)
-	g.bind(done)
-	return nil
-}
-
-func (g *rvGen) printRaw(s string) {
-	if s == "" {
-		return
-	}
-	g.la(rvA0, g.constData([]byte(s)))
-	g.li(rvA1, int64(len(s)))
-	g.call(g.l["print_raw"])
-}
-
-func (g *rvGen) printValue(e Expression) error {
-	if s, ok := e.(*StringExpr); ok {
-		g.printRaw(processEscapeSequences(s.Value))
-		return nil
-	}
-	if err := g.expr(e); err != nil {
-		return err
-	}
-	g.fmvXD(rvA0, rvFA0)
-	switch g.exprType(e) {
-	case "string":
-		g.call(g.l["print_tstr"])
-	case "list":
-		g.call(g.l["print_list"])
-	default:
-		g.numCall(numOpStr)
-		g.fmvXD(rvA0, rvFA0)
-		g.call(g.l["print_tstr"])
-	}
-	return nil
-}
-
-func (g *rvGen) printf(c *CallExpr) error {
-	if len(c.Args) == 0 {
-		return fmt.Errorf("printf requires a format string")
-	}
-	f, ok := c.Args[0].(*StringExpr)
-	if !ok {
-		return fmt.Errorf("printf format must be a string literal")
-	}
-	format := processEscapeSequences(f.Value)
-	arg := 1
-	var lit strings.Builder
-	for i := 0; i < len(format); i++ {
-		if format[i] != '%' || i+1 >= len(format) {
-			lit.WriteByte(format[i])
-			continue
-		}
-		j := i + 1
-		for j < len(format) && strings.IndexByte("-+ #0123456789", format[j]) >= 0 {
-			j++
-		}
-		prec := 6
-		if j < len(format) && format[j] == '.' {
-			k := j + 1
-			for k < len(format) && format[k] >= '0' && format[k] <= '9' {
-				k++
-			}
-			if p, err := strconv.Atoi(format[j+1 : k]); err == nil {
-				prec = min(p, 15)
-			}
-			j = k
-		}
-		for j < len(format) && strings.IndexByte("lhLjzt", format[j]) >= 0 {
-			j++
-		}
-		if j >= len(format) {
-			lit.WriteString(format[i:])
-			break
-		}
-		conv := format[j]
-		if conv == '%' {
-			lit.WriteByte('%')
-			i = j
-			continue
-		}
-		if arg >= len(c.Args) {
-			return fmt.Errorf("printf: not enough arguments for format string")
-		}
-		g.printRaw(lit.String())
-		lit.Reset()
-		a := c.Args[arg]
-		arg++
-		switch conv {
-		case 'v', 's':
-			if err := g.printValue(a); err != nil {
-				return err
-			}
-		case 'd', 'i', 'u':
-			if err := g.expr(a); err != nil {
-				return err
-			}
-			g.toI64()
-			g.call(g.l["print_i64"])
-		case 'f', 'F', 'g', 'G', 'e', 'E':
-			if err := g.expr(a); err != nil {
-				return err
-			}
-			g.toFloat()
-			g.li(rvA0, int64(prec))
-			g.call(g.l["print_fixed"])
-		default:
-			return fmt.Errorf("riscv64: printf %%%c is not supported yet", conv)
-		}
-		i = j
-	}
-	g.printRaw(lit.String())
-	g.number(0)
-	return nil
-}
-
-// Lists are flat: [count][elem0][elem1]..., referenced by their raw address bits.
-
-func (g *rvGen) list(e *ListExpr) error {
 	mark := g.sc.ntmp
 	defer func() { g.sc.ntmp = mark }()
 	p := g.tmp()
-	g.li(rvA1, int64(16+16*len(e.Elements)))
+	g.li(rvA1, int64(24+8*len(f.captures)))
 	g.call(g.l["alloc"])
-	g.sd(rvA0, rvS0, p)
-	g.li(rvT0, int64(math.Float64bits(tagList)))
-	g.ld(rvT1, rvS0, p)
-	g.sd(rvT0, rvT1, 0)
-	g.number(float64(len(e.Elements)))
-	g.ld(rvT1, rvS0, p)
-	g.fsd(rvFA0, rvT1, 8)
-	for i, el := range e.Elements {
-		if err := g.expr(el); err != nil {
+	g.sdx(rvA0, rvS0, p)
+	g.li(rvT0, int64(math.Float64bits(rvTagFunc)))
+	g.sd(rvT0, rvA0, 0)
+	g.la(rvT0, f.label)
+	g.sd(rvT0, rvA0, 8)
+	g.li(rvT0, int64(len(f.captures)))
+	g.sd(rvT0, rvA0, 16)
+	for i, c := range f.captures {
+		if err := g.expr(c.val); err != nil {
 			return err
 		}
-		g.ld(rvT0, rvS0, p)
-		g.li(rvT1, int64(16+16*i))
-		g.op(0, 0, rvT0, rvT0, rvT1)
-		g.li(rvT1, int64(i))
-		g.sd(rvT1, rvT0, 0)   // key = index
-		g.fsd(rvFA0, rvT0, 8) // value
+		g.ldx(rvT0, rvS0, p)
+		g.fsd(rvFA0, rvT0, int32(24+8*i))
 	}
-	g.ld(rvT0, rvS0, p)
+	g.ldx(rvT0, rvS0, p)
 	g.fmvDX(rvFA0, rvT0)
-	return nil
-}
-
-// elemAddr leaves the address of list element a0 in t0, or branches to oob.
-func (g *rvGen) elemAddr(list uint32, oob *rvLabel) {
-	g.fld(rvFT0, list, 8)
-	g.fcvtLD(rvT1, rvFT0, 1)
-	g.br(7, rvA0, rvT1, oob)
-	g.slli(rvT0, rvA0, 4)
-	g.op(0, 0, rvT0, rvT0, list)
-	g.addi(rvT0, rvT0, 24)
-}
-
-func (g *rvGen) index(e *IndexExpr) error {
-	if g.exprType(e.List) != "list" {
-		return fmt.Errorf("riscv64: indexing is only supported on lists")
-	}
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	p := g.tmp()
-	if err := g.expr(e.List); err != nil {
-		return err
-	}
-	g.fsd(rvFA0, rvS0, p)
-	if err := g.expr(e.Index); err != nil {
-		return err
-	}
-	g.toI64()
-	g.ld(rvT2, rvS0, p)
-	oob, done := g.newLabel(), g.newLabel()
-	g.elemAddr(rvT2, oob)
-	g.fld(rvFA0, rvT0, 0)
-	g.j(done)
-	g.bind(oob)
-	g.number(0)
-	g.bind(done)
-	return nil
-}
-
-func (g *rvGen) listUpdate(s *MapUpdateStmt) error {
-	if g.varType(s.MapName) != "list" {
-		return fmt.Errorf("riscv64: indexed update is only supported on lists")
-	}
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	i := g.tmp()
-	if err := g.expr(s.Index); err != nil {
-		return err
-	}
-	g.toI64()
-	g.sd(rvA0, rvS0, i)
-	if err := g.expr(s.Value); err != nil {
-		return err
-	}
-	base, off, err := g.varRef(s.MapName)
-	if err != nil {
-		return err
-	}
-	g.ld(rvT2, base, off)
-	g.ld(rvA0, rvS0, i)
-	skip := g.newLabel()
-	g.elemAddr(rvT2, skip)
-	g.fsd(rvFA0, rvT0, 0)
-	g.bind(skip)
-	return nil
-}
-
-func (g *rvGen) listLoop(s *LoopStmt) error {
-	mark := g.sc.ntmp
-	defer func() { g.sc.ntmp = mark }()
-	p, i := g.tmp(), g.tmp()
-	if err := g.expr(s.Iterable); err != nil {
-		return err
-	}
-	g.fsd(rvFA0, rvS0, p)
-	g.sd(0, rvS0, i)
-	base, off, err := g.varRef(s.Iterator)
-	if err != nil {
-		return err
-	}
-	g.setVarType(s.Iterator, "")
-	var kbase uint32
-	var koff int32
-	if s.KeyVar != "" {
-		if kbase, koff, err = g.varRef(s.KeyVar); err != nil {
-			return err
-		}
-		g.setVarType(s.KeyVar, "")
-	}
-	top, lp := g.newLabel(), rvLoop{g.newLabel(), g.newLabel()}
-	g.bind(top)
-	g.ld(rvT2, rvS0, p)
-	g.ld(rvA0, rvS0, i)
-	g.elemAddr(rvT2, lp.brk)
-	g.fld(rvFA0, rvT0, 0)
-	g.fsd(rvFA0, base, off)
-	if s.KeyVar != "" {
-		g.ld(rvT0, rvS0, i)
-		g.fcvtDL(rvFT1, rvT0)
-		g.fsd(rvFT1, kbase, koff)
-	}
-	g.sc.loops = append(g.sc.loops, lp)
-	if err := g.stmts(s.Body); err != nil {
-		return err
-	}
-	g.sc.loops = g.sc.loops[:len(g.sc.loops)-1]
-	g.bind(lp.cont)
-	g.ld(rvT0, rvS0, i)
-	g.addi(rvT0, rvT0, 1)
-	g.sd(rvT0, rvS0, i)
-	g.j(top)
-	g.bind(lp.brk)
 	return nil
 }

@@ -55,6 +55,7 @@ func (fc *TimCompiler) EmitNullCheck(reg, context string) {
 
 	// Exit with code 1
 	fc.out.MovImmToReg("rdi", "1")
+	fc.emitFlushStdout()
 	fc.out.MovImmToReg("rax", "60") // exit syscall
 	fc.out.Syscall()
 
@@ -103,6 +104,7 @@ func (fc *TimCompiler) EmitStackAlignmentCheck(context string) {
 	fc.out.Syscall()
 
 	fc.out.MovImmToReg("rdi", "1")
+	fc.emitFlushStdout()
 	fc.out.MovImmToReg("rax", "60")
 	fc.out.Syscall()
 
@@ -150,6 +152,8 @@ func (fc *TimCompiler) EmitDebugPrintReg(reg, label string) {
 	fc.out.MovImmToReg("rsi", "rsp")
 	fc.out.MovImmToReg("rdx", "4")
 	fc.out.MovImmToReg("rdi", "2")
+	fc.out.MovImmToReg("rax", "1")
+	fc.emitFlushStdout()
 	fc.out.MovImmToReg("rax", "1")
 	fc.out.Syscall()
 	fc.out.AddImmToReg("rsp", 16)

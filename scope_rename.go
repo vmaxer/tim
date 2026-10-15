@@ -133,8 +133,8 @@ func walkAST(v reflect.Value, visit func(reflect.Value) bool) {
 		case reflect.Pointer:
 			walk(v.Elem())
 		case reflect.Struct:
-			for i := range v.NumField() {
-				if f := v.Field(i); f.CanInterface() {
+			for _, f := range v.Fields() {
+				if f := f; f.CanInterface() {
 					walk(f)
 				}
 			}

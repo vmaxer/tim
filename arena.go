@@ -125,47 +125,6 @@ func (fc *TimCompiler) generateArenaFree() {
 
 // Helper functions for calling C runtime
 
-func (fc *TimCompiler) callMalloc() {
-	// Import malloc if not already imported
-	if !fc.hasCFunction("malloc") {
-		fc.importCFunction("malloc", "libc.so.6")
-	}
-
-	// Call malloc through PLT
-	mallocSymbol := "malloc@plt"
-	if fc.eb.target.OS() == OSWindows {
-		mallocSymbol = "__imp_malloc"
-	}
-	fc.out.CallSymbol(mallocSymbol)
-}
-
-func (fc *TimCompiler) callRealloc() {
-	// Similar to malloc
-	if !fc.hasCFunction("realloc") {
-		fc.importCFunction("realloc", "libc.so.6")
-	}
-
-	reallocSymbol := "realloc@plt"
-	if fc.eb.target.OS() == OSWindows {
-		reallocSymbol = "__imp_realloc"
-	}
-	fc.out.CallSymbol(reallocSymbol)
-}
-
-func (fc *TimCompiler) callFree() {
-	// Import free if not already imported
-	if !fc.hasCFunction("free") {
-		fc.importCFunction("free", "libc.so.6")
-	}
-
-	// Call free through PLT
-	freeSymbol := "free@plt"
-	if fc.eb.target.OS() == OSWindows {
-		freeSymbol = "__imp_free"
-	}
-	fc.out.CallSymbol(freeSymbol)
-}
-
 // Check if C function is already imported
 func (fc *TimCompiler) hasCFunction(name string) bool {
 	// Check in imported functions
@@ -184,81 +143,6 @@ func (fc *TimCompiler) importCFunction(name, library string) {
 }
 
 // Arena-aware allocation functions
-
-// compileStringLiteral now uses arena allocation
-func (fc *TimCompiler) compileStringLiteralWithArena(s string) {
-	// Calculate size needed (length + null terminator)
-	size := len(s) + 1
-
-	// Allocate from current arena
-	fc.generateArenaAlloc(size)
-
-	// rax now points to allocated memory
-	// Copy string data
-	fc.out.MovRegToReg("rdi", "rax") // Save pointer
-
-	// Store each byte (using standard mov instructions)
-	for i, ch := range []byte(s) {
-		fc.out.MovImmToReg("rax", fmt.Sprintf("%d", ch))
-		fc.out.MovByteRegToMem("rax", "rdi", i)
-	}
-	// Null terminator
-	fc.out.XorRegWithReg("rax", "rax")
-	fc.out.MovByteRegToMem("rax", "rdi", len(s))
-
-	// Convert pointer to float64 for Tim
-	fc.out.Cvtsi2sd("xmm0", "rdi")
-}
-
-// compileListLiteral now uses arena allocation
-func (fc *TimCompiler) compileListLiteralWithArena(elements []Expression) {
-	// Lists in Tim are maps with integer keys
-	// Calculate size for map structure (simplified)
-	// For now: array of float64 values
-	size := len(elements) * 8 // 8 bytes per float64
-
-	// Allocate from current arena
-	fc.generateArenaAlloc(size)
-
-	// rax points to array
-	fc.out.MovRegToReg("r14", "rax") // Save base pointer
-
-	// Store each element
-	for i, elem := range elements {
-		fc.compileExpression(elem) // Result in xmm0
-		fc.out.MovXmmToMem("xmm0", "r14", i*8)
-	}
-
-	// Return pointer as float64
-	fc.out.Cvtsi2sd("xmm0", "r14")
-}
-
-// compileMapLiteral now uses arena allocation
-func (fc *TimCompiler) compileMapLiteralWithArena(keys, values []Expression) {
-	// Similar to list, but with key-value pairs
-	// For now: simple array of alternating keys and values
-	size := len(keys) * 16 // 16 bytes per pair (key + value)
-
-	// Allocate from current arena
-	fc.generateArenaAlloc(size)
-
-	// rax points to map data
-	fc.out.MovRegToReg("r14", "rax")
-
-	// Store key-value pairs
-	for i := range keys {
-		// Store key
-		fc.compileExpression(keys[i])
-		fc.out.MovXmmToMem("xmm0", "r14", i*16)
-
-		// Store value
-		fc.compileExpression(values[i])
-		fc.out.MovXmmToMem("xmm0", "r14", i*16+8)
-	}
-
-	// Return pointer as float64
-	fc.out.Cvtsi2sd("xmm0", "r14")
-}
 
 // Default arena sizes and growth parameters
 const (

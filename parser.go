@@ -39,14 +39,12 @@ package main
 import (
 	"fmt"
 	"math"
+	"math/big"
 	"os"
-	"runtime/debug"
 	"slices"
 	"strconv"
 	"strings"
 )
-
-var globalParseCallCount = 0
 
 // composeGensymCounter generates unique parameter names for desugared
 // `<>` function compositions. Reset per program parse for determinism.
@@ -54,11 +52,9 @@ var composeGensymCounter = 0
 var debugParser = false // Set to true for parser debugging
 
 const (
-	// Parser recursion and iteration safety limits
-	// These prevent infinite loops and stack overflows during parsing
-	maxParseRecursion  = 1000  // Maximum recursion depth for parser calls
-	maxBlockIterations = 10000 // Maximum iterations for parsing block statements
-	maxASTIterations   = 1000  // Maximum iterations for AST traversal
+	// maxParseDepth bounds expression nesting, so pathological input is an
+	// error rather than a stack overflow.
+	maxParseDepth = 1000
 
 	// Buffer sizes for runtime operations
 	stringBufferSize = 256 // Maximum string buffer size for conversions
@@ -110,7 +106,6 @@ type Parser struct {
 	loopDepth        int                     // Current loop nesting level (0 = not in loop, 1 = outer loop, etc.)
 	functionDepth    int                     // Current function nesting level (0 = module level, 1+ = inside function/lambda)
 	constants        map[string]Expression   // Compile-time constants (immutable literals)
-	aliases          map[string]TokenType    // Keyword aliases (e.g., "for" -> TOKEN_AT)
 	cstructs         map[string]*CStructDecl // CStruct declarations for metadata access
 	cImports         map[string]bool         // C import namespaces (e.g., "sdl", "c")
 	speculative      bool                    // True when in speculative parsing mode (suppress errors)
@@ -118,32 +113,25 @@ type Parser struct {
 	inMatchBlock     bool                    // True when parsing inside a match block (prevents nested match parsing)
 	matchResultDepth int                     // >0 while parsing a match-clause result: a top-level '|' starts the next guard clause, not a pipe
 	inConditionLoop  bool                    // True when parsing condition loop expression (prevents '!' bound consumption)
-	inMapKey         bool                    // True while parsing a map-literal key, so a ':' there is the key separator, not a `:`-as-`as` cast
-	inTernaryThen    bool                    // True while parsing a ternary then-branch, so a ':' there is the ternary separator, not a `:`-as-`as` cast
+	inIndex          bool                    // True inside `[...]` after an expression, where `::` separates a slice's start from its step
 	scopes           []map[string]bool       // Stack of variable scopes for shadow detection
 	lambdaParams     []string                // Temporary storage for lambda parameters being parsed
+	depth            int                     // expression nesting depth
 	pendingHoists    []Statement             // Synthesized top-level defs to inject before the current statement
 }
 
 type parserState struct {
-	lexerPos  int
-	lexerLine int
-	current   Token
-	peek      Token
+	lexer   LexerState
+	current Token
+	peek    Token
 }
 
 func (p *Parser) saveState() parserState {
-	return parserState{
-		lexerPos:  p.lexer.pos,
-		lexerLine: p.lexer.line,
-		current:   p.current,
-		peek:      p.peek,
-	}
+	return parserState{p.lexer.save(), p.current, p.peek}
 }
 
 func (p *Parser) restoreState(state parserState) {
-	p.lexer.pos = state.lexerPos
-	p.lexer.line = state.lexerLine
+	p.lexer.restore(state.lexer)
 	p.current = state.current
 	p.peek = state.peek
 }
@@ -164,13 +152,11 @@ func (p *Parser) bangIsBound() bool {
 }
 
 func NewParser(input string) *Parser {
-	globalParseCallCount = 0 // Reset global counter for each parser instance
 	p := &Parser{
 		lexer:     NewLexer(input),
 		filename:  "<input>",
 		source:    input,
 		constants: make(map[string]Expression),
-		aliases:   make(map[string]TokenType),
 		cstructs:  make(map[string]*CStructDecl),
 		cImports:  make(map[string]bool),
 		errors:    NewErrorCollector(10),
@@ -186,13 +172,11 @@ func NewParser(input string) *Parser {
 }
 
 func NewParserWithFilename(input, filename string) *Parser {
-	globalParseCallCount = 0 // Reset global counter for each parser instance
 	p := &Parser{
 		lexer:     NewLexer(input),
 		filename:  filename,
 		source:    input,
 		constants: make(map[string]Expression),
-		aliases:   make(map[string]TokenType),
 		cstructs:  make(map[string]*CStructDecl),
 		cImports:  make(map[string]bool),
 		errors:    NewErrorCollector(10),
@@ -230,29 +214,27 @@ func (p *Parser) error(msg string) {
 			Length: 1,
 		}))
 		p.lexer.unterminatedString = nil
-		if p.errors.ShouldStop() {
-			if report := p.errors.Report(true); report != "" {
-				fmt.Fprintln(os.Stderr, report)
-			}
-			panic(newReportedError(strings.TrimSpace(p.errors.Report(false))))
-		}
+		p.stopIfTooMany()
 		return
 	}
 
-	// Railway-oriented: collect error and continue if possible
-	err := SyntaxError(msg, SourceLocation{
+	if p.reportLexErrors(p.peek.Line, p.peek.Column) {
+		p.stopIfTooMany()
+		return
+	}
+	p.errors.AddError(SyntaxError(msg, SourceLocation{
 		File:   p.filename,
 		Line:   p.current.Line,
 		Column: p.current.Column,
 		Length: len(p.current.Value),
-	})
-	p.errors.AddError(err)
+	}))
+	p.stopIfTooMany()
+}
 
-	// For backwards compatibility during transition: if we hit max errors, panic
-	// This will be removed once all error handling is converted
+// stopIfTooMany aborts parsing once the error limit is reached, printing the
+// collected errors first (see ErrAlreadyReported).
+func (p *Parser) stopIfTooMany() {
 	if p.errors.ShouldStop() {
-		// Print all collected errors before aborting (see ErrAlreadyReported); the
-		// panic still carries the plain text so callers can inspect the message.
 		if report := p.errors.Report(true); report != "" {
 			fmt.Fprintln(os.Stderr, report)
 		}
@@ -276,18 +258,21 @@ func compilerError(format string, args ...any) {
 func (p *Parser) nextToken() {
 	p.current = p.peek
 	p.peek = p.lexer.NextToken()
+}
 
-	// Apply aliases: if current token is an identifier that matches an alias, replace its type
-	if p.current.Type == TOKEN_IDENT {
-		if aliasTarget, exists := p.aliases[p.current.Value]; exists {
-			p.current.Type = aliasTarget
-		}
+// reportLexErrors records the lexical errors up to line:column and reports
+// whether the parser is looking at a bad token, whose own error explains
+// anything the parser could say about it.
+func (p *Parser) reportLexErrors(line, column int) bool {
+	for _, e := range p.lexer.takeErrors(line, column) {
+		p.errors.AddError(SyntaxError(e.msg, SourceLocation{
+			File:   p.filename,
+			Line:   e.tok.Line,
+			Column: e.tok.Column,
+			Length: max(len(e.tok.Value), 1),
+		}))
 	}
-	if p.peek.Type == TOKEN_IDENT {
-		if aliasTarget, exists := p.aliases[p.peek.Value]; exists {
-			p.peek.Type = aliasTarget
-		}
-	}
+	return p.current.Type == TOKEN_ILLEGAL || p.peek.Type == TOKEN_ILLEGAL
 }
 
 // Scope management for shadow keyword detection
@@ -353,7 +338,6 @@ func (p *Parser) skipExprNewlines() {
 }
 
 func (p *Parser) ParseProgram() *Program {
-	globalParseCallCount = 0 // Reset for each program parse
 	composeGensymCounter = 0 // Reset for deterministic composition desugaring
 	program := &Program{}
 
@@ -367,11 +351,7 @@ func (p *Parser) ParseProgram() *Program {
 			p.pendingHoists = nil
 		}
 		if stmt != nil {
-			// Handle alias statements: process them immediately and don't add to AST
-			if aliasStmt, ok := stmt.(*AliasStmt); ok {
-				// Store the alias in the parser's alias map
-				p.aliases[aliasStmt.NewName] = aliasStmt.Target
-			} else if exportStmt, ok := stmt.(*ExportStmt); ok {
+			if exportStmt, ok := stmt.(*ExportStmt); ok {
 				// Handle export statements: store in program metadata
 				if exportStmt.Mode == "*" {
 					program.ExportMode = "*"
@@ -386,6 +366,11 @@ func (p *Parser) ParseProgram() *Program {
 		}
 		p.nextToken()
 		p.skipNewlines()
+	}
+
+	p.reportLexErrors(math.MaxInt, 0)
+	if err := desugarVariadics(program); err != nil {
+		p.errors.AddError(SyntaxError(err.Error(), SourceLocation{File: p.filename}))
 	}
 
 	// Check for parse errors
@@ -437,12 +422,12 @@ func (p *Parser) parseImport() Statement {
 			strings.HasSuffix(source, ".dylib")
 
 		p.nextToken()
-	} else if p.current.Type == TOKEN_IDENT {
-		// Bare identifier for library: import sdl3 as sdl
-		source = p.current.Value
-		p.nextToken()
+	} else if p.current.Type != TOKEN_NEWLINE && p.current.Type != TOKEN_EOF {
+		source = p.rawWord()
+		isLibraryFile = strings.HasSuffix(source, ".so") || strings.Contains(source, ".so.") ||
+			strings.HasSuffix(source, ".dll") || strings.HasSuffix(source, ".dylib")
 	} else {
-		p.error("expected string or identifier after 'import'")
+		p.error("expected a library, path or repository after 'import'")
 		return nil
 	}
 
@@ -496,6 +481,26 @@ func (p *Parser) parseImport() Statement {
 	// Otherwise, it's a library name (C import)
 	p.cImports[alias] = true
 	return &CImportStmt{Library: source, Alias: alias}
+}
+
+// rawWord reads the source text from the current token to the next space as
+// one word, such as the unquoted import path github.com/user/repo@v1.0, and
+// leaves current on the token after it.
+func (p *Parser) rawWord() string {
+	lineStart := 0
+	for line := 1; line < p.current.Line; line++ {
+		lineStart += strings.IndexByte(p.source[lineStart:], '\n') + 1
+	}
+	start := lineStart + p.current.Column - 1
+	end := start
+	for end < len(p.source) && !strings.ContainsRune(" \t\r\n;", rune(p.source[end])) {
+		end++
+	}
+	p.lexer.forgetErrors(p.current.Line, p.current.Column, p.current.Column+end-start)
+	p.lexer.restore(LexerState{pos: end, line: p.current.Line, lineStart: lineStart})
+	p.peek = p.lexer.NextToken()
+	p.nextToken()
+	return p.source[start:end]
 }
 
 func (p *Parser) parseExport() Statement {
@@ -803,55 +808,6 @@ func (p *Parser) parseSpawnStmt() *SpawnStmt {
 	}
 }
 
-func (p *Parser) parseAliasStmt() *AliasStmt {
-	p.nextToken() // skip 'alias'
-
-	// Parse new keyword name
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after 'alias'")
-	}
-	newName := p.current.Value
-	p.nextToken()
-
-	// Expect '='
-	if p.current.Type != TOKEN_EQUALS {
-		p.error("expected '=' in alias declaration")
-	}
-	p.nextToken()
-
-	// Parse target keyword/token
-	targetName := p.current.Value
-	targetType := p.current.Type
-
-	// Validate that target is a valid keyword or operator
-	validTargets := map[TokenType]bool{
-		TOKEN_AT: true, TOKEN_IN: true, TOKEN_RET: true, TOKEN_ERR: true,
-		TOKEN_FOR: true, TOKEN_FOREACH: true, TOKEN_WHILE: true,
-		TOKEN_BREAK: true, TOKEN_CONTINUE: true,
-		TOKEN_UNSAFE: true, TOKEN_ARENA: true, TOKEN_DEFER: true,
-		TOKEN_INF: true, TOKEN_AND: true, TOKEN_OR: true,
-		TOKEN_NOT: true, TOKEN_XOR: true, TOKEN_AT_PLUSPLUS: true,
-		TOKEN_IF: true, TOKEN_ELIF: true, TOKEN_ELSE: true,
-	}
-
-	// Special handling for @ operators (break/continue)
-	if targetName == "@-" {
-		targetType = TOKEN_AT // Break will be handled by checking targetName
-	} else if targetName == "@=" || targetName == "@++" {
-		targetType = TOKEN_AT_PLUSPLUS
-	} else if !validTargets[targetType] {
-		p.error("alias target must be a valid keyword or operator (e.g., @, @-, @=, in, ret, etc.)")
-	}
-
-	p.nextToken()
-
-	return &AliasStmt{
-		NewName:    newName,
-		TargetName: targetName,
-		Target:     targetType,
-	}
-}
-
 // cTypeAliases maps short type names to the canonical C type used internally.
 var cTypeAliases = map[string]string{
 	"i8": "int8", "i16": "int16", "i32": "int32", "i64": "int64",
@@ -1000,164 +956,13 @@ func (p *Parser) parseCStructDecl() *CStructDecl {
 	return decl
 }
 
-func (p *Parser) parseClassDecl() *ClassDecl {
-	p.nextToken() // skip 'class'
-
-	// Parse class name
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected class name after 'class'")
-	}
-	name := p.current.Value
-	p.nextToken() // skip class name
-
-	// Parse optional compositions: <> Mixin1 <> Mixin2 ...
-	compositions := []string{}
-	for p.current.Type == TOKEN_LTGT {
-		p.nextToken() // skip '<>'
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier after '<>' in class declaration")
-		}
-		compositions = append(compositions, p.current.Value)
-		p.nextToken() // skip identifier
-	}
-
-	// Expect '{'
-	if p.current.Type != TOKEN_LBRACE {
-		p.error("expected '{' after class name (and optional mixins)")
-	}
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	// Parse class body
-	classVars := make(map[string]Expression)
-	methods := make(map[string]*LambdaExpr)
-
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		// Parse identifier (for class var or method)
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected identifier in class body")
-		}
-		ident := p.current.Value
-		p.nextToken() // skip identifier
-
-		// Check for dot (class variable: ClassName.var = value)
-		if p.current.Type == TOKEN_DOT {
-			p.nextToken() // skip '.'
-			if p.current.Type != TOKEN_IDENT {
-				p.error("expected identifier after '.' in class variable")
-			}
-			varName := p.current.Value
-			p.nextToken() // skip var name
-
-			if p.current.Type != TOKEN_EQUALS {
-				p.error("expected '=' after class variable name")
-			}
-			p.nextToken() // skip '='
-
-			// Parse the value expression
-			value := p.parseExpression()
-			classVars[ident+"."+varName] = value
-			p.nextToken() // move past expression
-			p.skipNewlines()
-			continue
-		}
-
-		// Check for method definition: identifier = lambda or identifier := lambda
-		if p.current.Type == TOKEN_EQUALS || p.current.Type == TOKEN_COLON_EQUALS {
-			p.nextToken() // skip '=' or ':='
-
-			// Parse lambda expression - need to handle different lambda forms
-			var lambda *LambdaExpr
-
-			if p.current.Type == TOKEN_LPAREN {
-				// Parenthesized lambda: (x, y) => body
-				expr := p.parseExpression()
-				var ok bool
-				lambda, ok = expr.(*LambdaExpr)
-				if !ok {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
-				}
-			} else if p.current.Type == TOKEN_IDENT {
-				// Non-parenthesized lambda: x => body or x, y => body
-				expr := p.tryParseNonParenLambda()
-				if expr == nil {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
-				}
-				var ok bool
-				lambda, ok = expr.(*LambdaExpr)
-				if !ok {
-					p.error("expected lambda expression after '=' or ':=' in method definition")
-				}
-			} else {
-				p.error("expected lambda expression after '=' or ':=' in method definition")
-			}
-
-			methods[ident] = lambda
-			p.skipNewlines()
-			continue
-		}
-
-		p.error("expected '=' or ':=' for method, or '.' for class variable in class body")
-	}
-
-	// Expect '}'
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of class definition")
-	}
-
-	return &ClassDecl{
-		Name:         name,
-		ClassVars:    classVars,
-		Methods:      methods,
-		Compositions: compositions,
-	}
-}
-
-func (p *Parser) parseStructLiteral(structName string) *StructLiteralExpr {
-	p.nextToken() // skip identifier (now on '{')
-	p.nextToken() // skip '{'
-	p.skipNewlines()
-
-	fields := make(map[string]Expression)
-
-	for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-		if p.current.Type != TOKEN_IDENT {
-			p.error("expected field name in struct literal")
-		}
-		fieldName := p.current.Value
-		p.nextToken() // skip field name
-
-		if p.current.Type != TOKEN_COLON {
-			p.error("expected ':' after field name in struct literal")
-		}
-		p.nextToken() // skip ':'
-
-		fieldValue := p.parseExpression()
-		fields[fieldName] = fieldValue
-
-		p.nextToken() // move past expression
-		p.skipNewlines()
-
-		if p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip ','
-			p.skipNewlines()
-		} else if p.current.Type != TOKEN_RBRACE {
-			p.error("expected ',' or '}' in struct literal")
-		}
-	}
-
-	if p.current.Type != TOKEN_RBRACE {
-		p.error("expected '}' at end of struct literal")
-	}
-
-	return &StructLiteralExpr{
-		StructName: structName,
-		Fields:     fields,
-	}
-}
-
 // Confidence that this function is working: 100%
 func (p *Parser) parseStatement() Statement {
+	// A statement (even one inside a match arm's block) is not a match
+	// clause: `expr { ... }` here attaches a match as it does anywhere else.
+	savedInMatchBlock := p.inMatchBlock
+	p.inMatchBlock = false
+	defer func() { p.inMatchBlock = savedInMatchBlock }()
 	// Check for fun keyword (optional function definition marker)
 	if p.current.Type == TOKEN_FUN {
 		p.nextToken() // skip 'fun'
@@ -1201,25 +1006,10 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseContinueStatement()
 	}
 
-	// Check for foreach keyword (alias for @ ... in)
-	if p.current.Type == TOKEN_FOREACH {
-		return p.parseForeachStatement()
-	}
-
 	// Check for while keyword: `while cond { body }` is a condition loop with no
 	// explicit iteration bound (runs until the condition is false).
 	if p.current.Type == TOKEN_WHILE {
 		return p.parseWhileStatement()
-	}
-
-	// Check for use keyword (imports)
-	if p.current.Type == TOKEN_USE {
-		p.nextToken() // skip 'use'
-		if p.current.Type != TOKEN_STRING {
-			p.error("expected string after 'use'")
-		}
-		path := p.current.Value
-		return &UseStmt{Path: path}
 	}
 
 	// Check for export keyword
@@ -1237,11 +1027,6 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseCStructDecl()
 	}
 
-	// Check for class keyword (class definition)
-	if p.current.Type == TOKEN_CLASS {
-		return p.parseClassDecl()
-	}
-
 	// Check for arena keyword
 	if p.current.Type == TOKEN_ARENA {
 		return p.parseArenaStmt()
@@ -1257,11 +1042,6 @@ func (p *Parser) parseStatement() Statement {
 		return p.parseDeferStmt()
 	}
 
-	// Check for alias keyword
-	if p.current.Type == TOKEN_ALIAS {
-		return p.parseAliasStmt()
-	}
-
 	// Check for spawn keyword (spawn process)
 	if p.current.Type == TOKEN_SPAWN {
 		return p.parseSpawnStmt()
@@ -1269,20 +1049,6 @@ func (p *Parser) parseStatement() Statement {
 
 	// Check for ret/err keywords (but not if followed by assignment operator)
 	if p.current.Type == TOKEN_RET || p.current.Type == TOKEN_ERR {
-		// If TOKEN_RET followed by assignment operator, treat as identifier for assignment
-		if p.current.Type == TOKEN_RET &&
-			(p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_EQUALS ||
-				p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_COLON ||
-				p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-				p.peek.Type == TOKEN_SHL_ASSIGN || p.peek.Type == TOKEN_SHR_ASSIGN ||
-				p.peek.Type == TOKEN_ROTL_ASSIGN || p.peek.Type == TOKEN_ROTR_ASSIGN ||
-				p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS ||
-				p.peek.Type == TOKEN_MOD_EQUALS) {
-			// Treat TOKEN_RET as TOKEN_IDENT for assignment purposes
-			// by converting the token type temporarily
-			p.current.Type = TOKEN_IDENT
-			return p.parseAssignment()
-		}
 		return p.parseJumpStatement()
 	}
 
@@ -1292,9 +1058,8 @@ func (p *Parser) parseStatement() Statement {
 	}
 
 	// Loops start with 'for'; '@' only marks loop labels (ret @, break @1)
-	if p.current.Type == TOKEN_AT || p.current.Type == TOKEN_AT_LABEL ||
-		p.current.Type == TOKEN_AT_AT || p.current.Type == TOKEN_AT_PLUSPLUS {
-		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' is only for loop labels like ret @1")
+	if p.current.Type == TOKEN_AT || p.current.Type == TOKEN_AT_LABEL {
+		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' only marks loop labels, as in break @1")
 		return nil
 	}
 
@@ -1371,22 +1136,6 @@ func (p *Parser) parseStatement() Statement {
 		}
 	}
 
-	// Check for `.field` assignment (this.field = value)
-	if p.current.Type == TOKEN_DOT && p.peek.Type == TOKEN_IDENT {
-		p.nextToken() // skip '.'
-		fieldName := "this." + p.current.Value
-		p.current.Value = fieldName
-		p.current.Type = TOKEN_IDENT
-		// Now handle as regular assignment
-		if p.peek.Type == TOKEN_EQUALS || p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_LEFT_ARROW ||
-			p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-			p.peek.Type == TOKEN_SHL_ASSIGN || p.peek.Type == TOKEN_SHR_ASSIGN ||
-			p.peek.Type == TOKEN_ROTL_ASSIGN || p.peek.Type == TOKEN_ROTR_ASSIGN ||
-			p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS || p.peek.Type == TOKEN_MOD_EQUALS {
-			return p.parseAssignment()
-		}
-	}
-
 	// Check for shadow keyword (variable declaration)
 	if p.current.Type == TOKEN_SHADOW {
 		return p.parseAssignment()
@@ -1436,11 +1185,7 @@ func (p *Parser) parseStatement() Statement {
 			}
 		}
 
-		if p.peek.Type == TOKEN_EQUALS || p.peek.Type == TOKEN_COLON_EQUALS || p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_COLON ||
-			p.peek.Type == TOKEN_PLUS_EQUALS || p.peek.Type == TOKEN_MINUS_EQUALS ||
-			p.peek.Type == TOKEN_SHL_ASSIGN || p.peek.Type == TOKEN_SHR_ASSIGN ||
-			p.peek.Type == TOKEN_ROTL_ASSIGN || p.peek.Type == TOKEN_ROTR_ASSIGN ||
-			p.peek.Type == TOKEN_STAR_EQUALS || p.peek.Type == TOKEN_POWER_EQUALS || p.peek.Type == TOKEN_SLASH_EQUALS || p.peek.Type == TOKEN_MOD_EQUALS {
+		if p.peek.Type == TOKEN_COLON || isAssignToken(p.peek.Type) {
 			return p.parseAssignment()
 		}
 	}
@@ -1576,22 +1321,11 @@ func (p *Parser) parseFString() Expression {
 			parts = append(parts, &StringExpr{Value: text})
 		}
 
-		// Find matching }
-		braceDepth := 1
+		// Find matching }, skipping strings nested in the expression
 		exprStart := nextBrace + 1
-		exprEnd := exprStart
-		for exprEnd < len(raw) && braceDepth > 0 {
-			if raw[exprEnd] == '{' {
-				braceDepth++
-			} else if raw[exprEnd] == '}' {
-				braceDepth--
-			}
-			if braceDepth > 0 {
-				exprEnd++
-			}
-		}
+		exprEnd := interpolationEnd(raw, exprStart)
 
-		if braceDepth != 0 {
+		if exprEnd >= len(raw) {
 			p.error("unclosed { in f-string")
 			return &StringExpr{Value: raw}
 		}
@@ -1696,20 +1430,20 @@ func (p *Parser) parseFunDefinition(recvType string) Statement {
 	}
 	p.nextToken() // skip ')'
 
-	// Optional, ignored return-type annotation: `) as Type` or `) : Type`.
-	if p.current.Type == TOKEN_AS || p.current.Type == TOKEN_COLON {
+	// `fun f() { ... }`, `fun f() -> T { ... }`, `fun f() -> expr` or `fun f() = expr`.
+	var ret *TimType
+	switch p.current.Type {
+	case TOKEN_ARROW:
 		p.nextToken()
-		if p.current.Type == TOKEN_IDENT {
-			p.nextToken()
-		}
-	}
-	// Optional arrow/equals before an expression body: `fun f() -> expr` or
-	// `fun f() = expr` (both equivalent to a single-expression body).
-	if p.current.Type == TOKEN_ARROW || p.current.Type == TOKEN_EQUALS {
+		ret = p.parseReturnType()
+	case TOKEN_EQUALS:
 		p.nextToken()
 	}
 
 	p.lambdaParams = params
+	if variadic != "" {
+		p.lambdaParams = append(append([]string{}, params...), variadic)
+	}
 	body := p.parseLambdaBody()
 	p.lambdaParams = nil
 
@@ -1717,10 +1451,8 @@ func (p *Parser) parseFunDefinition(recvType string) Statement {
 		Params:            params,
 		ParamCStructTypes: paramTypes,
 		VariadicParam:     variadic,
+		ReturnType:        ret,
 		Body:              body,
-	}
-	if variadic != "" {
-		p.error("variadic functions are not yet supported")
 	}
 	return &AssignStmt{Name: name, Value: lambda}
 }
@@ -1856,36 +1588,6 @@ func (p *Parser) parseAssignment() *AssignStmt {
 		//
 		// Don't wrap MatchExpr in a lambda - let it execute immediately
 		// MapExpr is NOT wrapped - it's a literal value
-	}
-
-	// Check for multiple lambda dispatch: f = (x) -> x, (y) -> y + 1
-	if lambda, ok := value.(*LambdaExpr); ok && p.peek.Type == TOKEN_COMMA {
-		lambdas := []*LambdaExpr{lambda}
-
-		for p.peek.Type == TOKEN_COMMA {
-			p.nextToken() // move to comma
-			p.nextToken() // skip comma
-
-			// Try non-parenthesized lambda first
-			var nextExpr Expression
-			if p.current.Type == TOKEN_IDENT {
-				nextExpr = p.tryParseNonParenLambda()
-				if nextExpr == nil {
-					nextExpr = p.parseExpression()
-				}
-			} else {
-				nextExpr = p.parseExpression()
-			}
-
-			if nextLambda, ok := nextExpr.(*LambdaExpr); ok {
-				lambdas = append(lambdas, nextLambda)
-			} else {
-				p.error("expected lambda expression after comma in multiple lambda dispatch")
-			}
-		}
-
-		// Wrap in MultiLambdaExpr
-		value = &MultiLambdaExpr{Lambdas: lambdas}
 	}
 
 	// Transform compound assignment: x += 5  =>  x = x + 5
@@ -2089,9 +1791,6 @@ func (p *Parser) parseIndexedAssignment() Statement {
 	// Parse the value expression
 	valueExpr := p.parseExpression()
 
-	// Move to the last token of the expression
-	p.nextToken()
-
 	// Check if this is an unsafe memory write (with cast) or array update (without cast)
 	castExpr, hasCast := valueExpr.(*CastExpr)
 
@@ -2167,79 +1866,45 @@ const (
 // parseMapLiteralBody parses the body of a map literal (assumes '{' already consumed)
 // Supports both identifier keys (hashed) and expression keys
 // Format: key: value, key2: value2, ...
+// parseMapLiteralBody parses `key: value` entries after a map literal's '{',
+// separated by commas, allowing newlines and a trailing comma, and stops on
+// the closing '}'. A bare identifier key is a name: {a: 1} is {"a": 1}.
 func (p *Parser) parseMapLiteralBody() *MapExpr {
-	keys := []Expression{}
-	values := []Expression{}
-	keyNames := []string{}
-
-	if p.current.Type != TOKEN_RBRACE {
-		// Parse first key
+	m := &MapExpr{}
+	for {
+		p.skipNewlines()
+		if p.current.Type == TOKEN_RBRACE || p.current.Type == TOKEN_EOF {
+			break
+		}
 		var key Expression
-		keyName := ""
+		name := ""
 		if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_COLON {
-			// String key: hash identifier to uint64
-			keyName = p.current.Value
-			hashValue := hashStringKey(p.current.Value)
-			key = &NumberExpr{Value: float64(hashValue)}
-			p.nextToken() // move past identifier
+			name = p.current.Value
+			key = &NumberExpr{Value: float64(hashStringKey(name))}
 		} else {
-			// Numeric key or expression — suppress `:`-as-cast so the key's
-			// trailing ':' stays the map separator.
-			p.inMapKey = true
 			key = p.parseExpression()
-			p.inMapKey = false
-			p.nextToken() // move past key
 		}
-
-		// Must have ':'
+		p.nextToken()
 		if p.current.Type != TOKEN_COLON {
-			p.error("expected ':' in map literal")
+			p.error("expected ':' after map key")
+			break
 		}
-		p.nextToken() // skip ':'
-
-		// Parse value
-		value := p.parseExpression()
-		keys = append(keys, key)
-		values = append(values, value)
-		keyNames = append(keyNames, keyName)
-
-		// Parse additional key:value pairs
-		for p.peek.Type == TOKEN_COMMA {
-			p.nextToken() // skip current value
-			p.nextToken() // skip ','
-
-			// Parse key (string or numeric)
-			keyName = ""
-			if p.current.Type == TOKEN_IDENT && p.peek.Type == TOKEN_COLON {
-				// String key: hash identifier to uint64
-				keyName = p.current.Value
-				hashValue := hashStringKey(p.current.Value)
-				key = &NumberExpr{Value: float64(hashValue)}
-				p.nextToken() // move past identifier
-			} else {
-				// Numeric key or expression — suppress `:`-as-cast (see above).
-				p.inMapKey = true
-				key = p.parseExpression()
-				p.inMapKey = false
-				p.nextToken() // move past key
-			}
-
-			if p.current.Type != TOKEN_COLON {
-				p.error("expected ':' in map literal")
-			}
-			p.nextToken() // skip ':'
-
-			value := p.parseExpression()
-			keys = append(keys, key)
-			values = append(values, value)
-			keyNames = append(keyNames, keyName)
+		p.nextToken()
+		p.skipNewlines()
+		m.Keys = append(m.Keys, key)
+		m.Values = append(m.Values, p.requireOperand(p.parseExpression(), ":"))
+		m.KeyNames = append(m.KeyNames, name)
+		p.nextToken()
+		p.skipNewlines()
+		if p.current.Type != TOKEN_COMMA {
+			break
 		}
+		p.nextToken()
 	}
-
-	// current should be on last value or on '{'
-	// peek should be '}'
-	p.nextToken() // move to '}'
-	return &MapExpr{Keys: keys, Values: values, KeyNames: keyNames}
+	if p.current.Type != TOKEN_RBRACE {
+		p.error("expected ',' or '}' in map literal")
+	}
+	return m
 }
 
 // disambiguateBlock determines block type according to GRAMMAR.md rules:
@@ -2253,15 +1918,10 @@ func (p *Parser) disambiguateBlock() BlockType {
 	}
 
 	// Create temporary lexer for lookahead
-	tempLexer := &Lexer{
-		input:     p.lexer.input,
-		pos:       p.lexer.pos,
-		line:      p.lexer.line,
-		column:    p.lexer.column,
-		lineStart: p.lexer.lineStart,
-	}
+	tempLexer := p.lexer.clone()
 
 	braceDepth := 1 // Start at 1 because we're already inside the opening {
+	nestDepth := 0  // open ( and [ at any brace depth
 	foundColon := false
 	foundArrow := false
 	foundAssign := false // an assignment (= := <-) at depth 1 before the first arrow
@@ -2271,7 +1931,7 @@ func (p *Parser) disambiguateBlock() BlockType {
 	sawStmtAfterPipe := false
 
 	// Scan tokens within this block
-	for range maxBlockIterations {
+	for {
 		tok := tempLexer.NextToken()
 
 		if tok.Type == TOKEN_EOF {
@@ -2300,8 +1960,13 @@ func (p *Parser) disambiguateBlock() BlockType {
 				// Exited the block
 				break
 			}
-		} else if braceDepth == 1 {
-			// At top level of this block
+		} else if tok.Type == TOKEN_LBRACKET || tok.Type == TOKEN_LPAREN {
+			nestDepth++
+		} else if tok.Type == TOKEN_RBRACKET || tok.Type == TOKEN_RPAREN {
+			nestDepth--
+		} else if braceDepth == 1 && nestDepth == 0 {
+			// At top level of this block (colons inside [...] or (...) belong to
+			// slices and arguments, not to a map literal)
 			if tok.Type == TOKEN_QUESTION {
 				// A ternary `cond ? a : b`: remember it so its ':' isn't read as a
 				// map-key separator below.
@@ -2389,13 +2054,7 @@ func (p *Parser) disambiguateBlock() BlockType {
 func (p *Parser) blockContainsMatchArrows() bool {
 	// Create a new lexer from the same source at the current position
 	// to scan ahead without modifying the parser state
-	tempLexer := &Lexer{
-		input:     p.lexer.input,
-		pos:       p.lexer.pos,
-		line:      p.lexer.line,
-		column:    p.lexer.column,
-		lineStart: p.lexer.lineStart,
-	}
+	tempLexer := p.lexer.clone()
 
 	tempParser := &Parser{
 		lexer:    tempLexer,
@@ -2409,7 +2068,7 @@ func (p *Parser) blockContainsMatchArrows() bool {
 	foundArrow := false
 
 	// Scan through tokens until we exit the block
-	for range maxASTIterations {
+	for {
 		if tempParser.current.Type == TOKEN_EOF {
 			break
 		}
@@ -2455,7 +2114,43 @@ func (p *Parser) blockContainsMatchArrows() bool {
 //
 // The | is only a guard marker when at the start of a line.
 // Otherwise | is the pipe operator.
-func (p *Parser) parseMatchBlock(condition Expression) *MatchExpr {
+// parseMatchBlock parses the arms of `subject { ... }` after the '{'. A
+// subject that calls a function is evaluated once, into a temporary the arms
+// compare against; other subjects stay inline, keeping calls in the arms in
+// tail position.
+func (p *Parser) parseMatchBlock(subject Expression) *MatchExpr {
+	if !hasSideEffects(subject) {
+		return p.parseMatchArms(subject)
+	}
+	name := fmt.Sprintf("__match_%d", composeGensymCounter)
+	composeGensymCounter++
+	inner := p.parseMatchArms(&IdentExpr{Name: name})
+	if !matchUsesSubject(inner) {
+		inner.Condition = subject
+		return inner
+	}
+	return &MatchExpr{
+		Condition: &NumberExpr{Value: 1},
+		Clauses: []*MatchClause{{Result: &BlockExpr{Statements: []Statement{
+			&AssignStmt{Name: name, Value: subject},
+			&ExpressionStmt{Expr: inner},
+		}}}},
+		DefaultExpr: &NumberExpr{Value: 0},
+	}
+}
+
+// matchUsesSubject reports whether an arm compares against the subject,
+// as opposed to only testing its truth.
+func matchUsesSubject(m *MatchExpr) bool {
+	for _, c := range m.Clauses {
+		if c.Guard != nil {
+			return true
+		}
+	}
+	return false
+}
+
+func (p *Parser) parseMatchArms(condition Expression) *MatchExpr {
 	// Set flag to prevent nested match block parsing
 	oldInMatchBlock := p.inMatchBlock
 	p.inMatchBlock = true
@@ -2565,16 +2260,9 @@ func (p *Parser) parseMatchBlock(condition Expression) *MatchExpr {
 	}
 
 	// Pattern matching mode: parse clauses with guards/arrows
-	loopCount := 0
 	for {
-		loopCount++
-		if loopCount > 10 {
-			p.error(fmt.Sprintf("infinite loop in parseMatchBlock: stuck at token type=%v value='%v' line=%d", p.current.Type, p.current.Value, p.current.Line))
-		}
+		at := p.lexer.save()
 
-		if debugParser {
-			debugf("DEBUG parseMatchBlock loop %d: current=%v peek=%v\n", loopCount, p.current, p.peek)
-		}
 		p.skipNewlines()
 
 		if p.current.Type == TOKEN_RBRACE {
@@ -2602,7 +2290,20 @@ func (p *Parser) parseMatchBlock(condition Expression) *MatchExpr {
 			continue
 		}
 
+		if isComparisonToken(p.current.Type) || p.current.Type == TOKEN_IN {
+			clauses = append(clauses, p.parseComparisonArm(condition))
+			if p.lexer.save() == at {
+				p.error("unexpected token in match block")
+				break
+			}
+			continue
+		}
+
 		clause, _ := p.parseMatchClause()
+		if p.lexer.save() == at {
+			p.error("unexpected token in match block")
+			break
+		}
 
 		// Convert value matches to equality checks
 		if clause.IsValueMatch && clause.Guard != nil {
@@ -2661,9 +2362,10 @@ func (p *Parser) parseMatchClause() (*MatchClause, bool) {
 	// - identifier <- or identifier = (assignment statements)
 	isStatementToken := p.current.Type == TOKEN_RET ||
 		p.current.Type == TOKEN_ERR ||
+		p.current.Type == TOKEN_BREAK ||
+		p.current.Type == TOKEN_CONTINUE ||
 		p.current.Type == TOKEN_LBRACE ||
 		p.current.Type == TOKEN_FOR ||
-		p.current.Type == TOKEN_FOREACH ||
 		p.current.Type == TOKEN_WHILE ||
 		p.current.Type == TOKEN_IF ||
 		(p.current.Type == TOKEN_IDENT && (p.peek.Type == TOKEN_LEFT_ARROW || p.peek.Type == TOKEN_EQUALS))
@@ -2700,8 +2402,11 @@ func (p *Parser) parseMatchClause() (*MatchClause, bool) {
 	}
 	p.skipNewlines()
 
+	if p.current.Type == TOKEN_ARROW {
+		p.error("match arms use '=>'; '->' makes a lambda")
+	}
 	if p.current.Type == TOKEN_FAT_ARROW || p.current.Type == TOKEN_ARROW {
-		p.nextToken() // skip '=>' or '->'
+		p.nextToken()
 		p.skipNewlines()
 		result := p.parseMatchTarget()
 		p.skipNewlines()
@@ -2719,6 +2424,29 @@ func (p *Parser) parseMatchClause() (*MatchClause, bool) {
 	return &MatchClause{Result: expr}, true
 }
 
+// parseComparisonArm parses an arm that compares the subject with an
+// operator, `> 2 => r`, or tests membership, `in 1..5 => r`.
+func (p *Parser) parseComparisonArm(subject Expression) *MatchClause {
+	op := p.current
+	p.nextToken()
+	rhs := p.requireOperand(p.parseCons(), op.Value)
+	p.nextToken()
+	p.skipNewlines()
+	if p.current.Type != TOKEN_FAT_ARROW {
+		p.error("expected '=>' after match pattern")
+		return &MatchClause{Guard: rhs, Result: rhs}
+	}
+	p.nextToken()
+	p.skipNewlines()
+	result := p.parseMatchTarget()
+	p.skipNewlines()
+	var guard Expression = &BinaryExpr{Left: subject, Operator: op.Value, Right: rhs}
+	if op.Type == TOKEN_IN {
+		guard = &InExpr{Value: subject, Container: rhs}
+	}
+	return &MatchClause{Guard: guard, Result: result}
+}
+
 func (p *Parser) parseMatchTarget() Expression {
 	switch p.current.Type {
 	case TOKEN_LBRACE:
@@ -2731,12 +2459,7 @@ func (p *Parser) parseMatchTarget() Expression {
 		p.skipNewlines()
 
 		var statements []Statement
-		loopCount := 0
 		for p.current.Type != TOKEN_RBRACE && p.current.Type != TOKEN_EOF {
-			loopCount++
-			if loopCount > maxASTIterations {
-				p.error(fmt.Sprintf("infinite loop in parseMatchTarget block: stuck at token %v", p.current))
-			}
 
 			stmt := p.parseStatement()
 			if stmt != nil {
@@ -2765,6 +2488,15 @@ func (p *Parser) parseMatchTarget() Expression {
 
 		return &BlockExpr{Statements: statements}
 
+	case TOKEN_BREAK, TOKEN_CONTINUE:
+		var jump *JumpStmt
+		if p.current.Type == TOKEN_BREAK {
+			jump = p.parseBreakStatement().(*JumpStmt)
+		} else {
+			jump = p.parseContinueStatement().(*JumpStmt)
+		}
+		p.nextToken()
+		return &JumpExpr{Label: jump.Label, IsBreak: jump.IsBreak}
 	case TOKEN_RET, TOKEN_ERR:
 		// ret/err or ret @N or ret value or ret @N value
 		isErr := p.current.Type == TOKEN_ERR
@@ -2808,7 +2540,7 @@ func (p *Parser) parseMatchTarget() Expression {
 
 		// Return a JumpExpr with IsBreak semantics (ret exits loop)
 		return &JumpExpr{Label: label, Value: value, IsBreak: true}
-	case TOKEN_FOR, TOKEN_FOREACH, TOKEN_WHILE, TOKEN_IF:
+	case TOKEN_FOR, TOKEN_WHILE, TOKEN_IF:
 		// A loop or if statement as a match target: parse it as a statement
 		stmt := p.parseStatement()
 		// parseStatement leaves current on the last token; advance for the
@@ -2937,7 +2669,7 @@ func (p *Parser) parseLoopStatement() Statement {
 	} else if p.current.Type == TOKEN_FOR {
 		p.nextToken()
 	} else {
-		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' is only for loop labels like ret @1")
+		p.error("loops start with 'for' (e.g., for i in 0..<10 { ... }); '@' only marks loop labels, as in break @1")
 		return nil
 	}
 	for p.current.Type == TOKEN_NEWLINE {
@@ -3107,15 +2839,11 @@ func (p *Parser) parseLoopStatement() Statement {
 	} else if listExpr, ok := iterable.(*ListExpr); ok {
 		maxIterations = int64(len(listExpr.Elements))
 		needsRuntimeCheck = false
-	} else if _, ok := iterable.(*IdentExpr); ok {
-		maxIterations = math.MaxInt64
-		needsRuntimeCheck = true
-	} else if _, ok := iterable.(*IndexExpr); ok {
-		maxIterations = math.MaxInt64
-		needsRuntimeCheck = true
 	} else {
-		p.error("for-each loop over this expression requires a '!' bound (e.g., for x in expr ! 100 { ... })")
-		return nil
+		// Any other value is a finite container (or a single number): the loop
+		// walks a snapshot of its entries, so no bound is needed.
+		maxIterations = math.MaxInt64
+		needsRuntimeCheck = true
 	}
 
 	return &LoopStmt{
@@ -3165,24 +2893,11 @@ func (p *Parser) parseJumpStatement() Statement {
 	// sync — otherwise `if c { ret @ }` over-consumes the brace and corrupts the
 	// scope stack. Peek-based lookahead keeps the cursor in place.
 	isErr := p.current.Type == TOKEN_ERR
-	label := 0 // 0 means return from function
 	var value Expression
 
-	// Optional @ or @N label (loop exit).
-	if p.peek.Type == TOKEN_AT_LABEL {
-		p.nextToken() // move onto the label
-		labelNum, err := strconv.ParseFloat(p.current.Value[1:], 64)
-		if err != nil {
-			p.error("invalid loop label number")
-		}
-		label = int(labelNum)
-		if label < 1 {
-			p.error("loop label must be >= 1 (use @1, @2, @3, etc.)")
-		}
-	} else if p.peek.Type == TOKEN_AT {
-		// ret @ - exit current loop (label -1 means "current loop")
-		p.nextToken() // move onto '@'
-		label = -1
+	if p.peek.Type == TOKEN_AT_LABEL || p.peek.Type == TOKEN_AT {
+		p.nextToken()
+		p.error("loops are left with 'break' or 'break @N'; 'ret' returns from the function")
 	}
 
 	// Optional return/break value: present when the next token starts an
@@ -3203,11 +2918,7 @@ func (p *Parser) parseJumpStatement() Statement {
 		value = &CallExpr{Function: "error", Args: []Expression{value}}
 	}
 
-	// ret is always a break/return (IsBreak=true)
-	// label=0 means return from function
-	// label=-1 means exit current loop
-	// label>0 means exit loop N
-	return &JumpStmt{IsBreak: true, Label: label, Value: value}
+	return &JumpStmt{IsBreak: true, Label: 0, Value: value}
 }
 
 func (p *Parser) parseBreakStatement() Statement {
@@ -3250,111 +2961,15 @@ func (p *Parser) parseOptionalLoopLabel() int {
 	return label
 }
 
-func (p *Parser) parseForeachStatement() Statement {
-	p.nextToken() // skip 'foreach'
-
-	// foreach is just syntax sugar for @ ... in
-	// Parse as: for ident in expr block
-	if p.current.Type != TOKEN_IDENT {
-		p.error("expected identifier after 'foreach'")
-		return nil
-	}
-
-	iterator := p.current.Value
-	p.nextToken() // skip identifier
-
-	if p.current.Type != TOKEN_IN {
-		p.error("expected 'in' after foreach iterator")
-		return nil
-	}
-	p.nextToken() // skip 'in'
-
-	// Parse iterable expression. Set inConditionLoop so a trailing '!' bound
-	// is left unconsumed by parsePostfix.
-	oldILH := p.inConditionLoop
-	p.inConditionLoop = true
-	iterable := p.parseExpression()
-	p.inConditionLoop = oldILH
-
-	// Check for '!' bound clause (check peek not current!)
-	var maxIterations int64 = math.MaxInt64
-	needsMaxCheck := false
-	if p.peek.Type == TOKEN_BANG {
-		p.nextToken() // move to '!'
-		p.nextToken() // skip '!'
-		if p.current.Type == TOKEN_NUMBER {
-			maxInt, err := strconv.ParseInt(p.current.Value, 10, 64)
-			if err != nil || maxInt < 1 {
-				p.error("iteration bound must be a positive integer")
-			}
-			maxIterations = maxInt
-			needsMaxCheck = true
-			p.nextToken() // skip number
-		} else if p.current.Type == TOKEN_INF {
-			maxIterations = math.MaxInt64
-			needsMaxCheck = true
-			p.nextToken() // skip 'inf'
-		} else {
-			p.error("expected number or 'inf' after '!' bound")
-		}
-	}
-
-	// Skip newlines before '{'
-	for p.peek.Type == TOKEN_NEWLINE {
-		p.nextToken()
-	}
-
-	if p.peek.Type != TOKEN_LBRACE {
-		p.error("expected '{' after foreach expression")
-		return nil
-	}
-	p.nextToken() // move to '{'
-
-	// Track loop depth for nested loops
-	label := p.loopDepth + 1
-	oldDepth := p.loopDepth
-	p.loopDepth = label
-	defer func() { p.loopDepth = oldDepth }()
-
-	// Parse loop body
-	var body []Statement
-	for p.peek.Type != TOKEN_RBRACE && p.peek.Type != TOKEN_EOF {
-		p.nextToken()
-		if p.current.Type == TOKEN_NEWLINE {
-			continue
-		}
-		stmt := p.parseStatement()
-		if stmt != nil {
-			body = append(body, stmt)
-		}
-	}
-
-	// Consume closing brace
-	if p.peek.Type == TOKEN_RBRACE {
-		p.nextToken() // move to '}'
-	}
-
-	return &LoopStmt{
-		Iterator:      iterator,
-		Iterable:      iterable,
-		MaxIterations: maxIterations,
-		NeedsMaxCheck: needsMaxCheck,
-		Body:          body,
-	}
-}
-
 // parseWhileStatement parses `while cond { body }`: a condition loop with no
 // explicit iteration bound. It desugars to a WhileStmt with MaxIterations set
 // to "unbounded" (the loop terminates when the condition becomes false).
 func (p *Parser) parseWhileStatement() Statement {
 	p.nextToken() // skip 'while'
 
-	// Parse the condition with parseComparison (not parseExpression) so a match
-	// block's '{' isn't consumed as part of the condition. Set inConditionLoop
-	// so a stray '!' isn't read as a recursion bound.
 	oldInConditionLoop := p.inConditionLoop
 	p.inConditionLoop = true
-	condition := p.parseComparison()
+	condition := p.parseExpression()
 	p.inConditionLoop = oldInConditionLoop
 
 	// Skip newlines before '{'
@@ -3399,159 +3014,15 @@ func (p *Parser) parseWhileStatement() Statement {
 	}
 }
 
-// parsePattern parses a single pattern (literal, variable, or wildcard)
-func (p *Parser) parsePattern() Pattern {
-	switch p.current.Type {
-	case TOKEN_NUMBER:
-		value := p.current.Value
-		p.nextToken()
-		// Convert string to float64
-		numVal, err := strconv.ParseFloat(value, 64)
-		if err != nil {
-			p.error("invalid number in pattern: " + value)
-			return nil
-		}
-		return &LiteralPattern{Value: &NumberExpr{Value: numVal}}
-	case TOKEN_STRING:
-		value := p.current.Value
-		p.nextToken()
-		return &LiteralPattern{Value: &StringExpr{Value: value}}
-	case TOKEN_IDENT:
-		if p.current.Value == "_" {
-			p.nextToken()
-			return &WildcardPattern{}
-		}
-		name := p.current.Value
-		p.nextToken()
-		return &VarPattern{Name: name}
-	default:
-		p.error("expected pattern (literal, variable, or _)")
-		return nil
-	}
-}
-
-// tryParsePatternLambda attempts to parse a pattern lambda starting from current position
-// Returns nil if this is not a pattern lambda
-func (p *Parser) tryParsePatternLambda() *PatternLambdaExpr {
-	// Pattern lambda syntax: (pattern) => body, (pattern) => body, ...
-	// We're at TOKEN_LPAREN
-
-	// Enable speculative mode to suppress errors
-	p.speculative = true
-	defer func() {
-		p.speculative = false
-		// Recover from speculative errors (they indicate "not a pattern lambda")
-		if r := recover(); r != nil {
-			if _, ok := r.(speculativeError); !ok {
-				// Re-panic if it's not a speculative error
-				panic(r)
-			}
-			if VerboseMode {
-				debugf("DEBUG: Pattern lambda parse failed with speculative error\n")
-			}
-		}
-	}()
-
-	// Parse first clause
-	clause := p.parseOnePatternClause()
-	if clause == nil {
-		if VerboseMode {
-			debugf("DEBUG: parseOnePatternClause returned nil\n")
-		}
-		return nil
-	}
-
-	// Check if there's a comma for additional clauses
-	if VerboseMode {
-		debugf("DEBUG: After first clause, current token: %v\n", p.current.Type)
-	}
-	if p.current.Type != TOKEN_COMMA {
-		// Not a pattern lambda, just a single clause (which could be regular lambda)
-		if VerboseMode {
-			debugf("DEBUG: No comma after first clause, not a pattern lambda\n")
-		}
-		return nil
-	}
-
-	// It's a pattern lambda! Disable speculative mode now that we know
-	p.speculative = false
-
-	// Collect all clauses
-	clauses := []*PatternClause{clause}
-
-	for p.current.Type == TOKEN_COMMA {
-		p.nextToken() // skip ','
-		clause := p.parseOnePatternClause()
-		if clause == nil {
-			p.error("expected pattern clause after ','")
-			break
-		}
-		clauses = append(clauses, clause)
-	}
-
-	return &PatternLambdaExpr{Clauses: clauses}
-}
-
-// parseOnePatternClause parses one pattern clause: (pattern, ...) => body
-func (p *Parser) parseOnePatternClause() *PatternClause {
-	if p.current.Type != TOKEN_LPAREN {
-		return nil
-	}
-	p.nextToken() // skip '('
-
-	var patterns []Pattern
-	if p.current.Type == TOKEN_RPAREN {
-		// Empty pattern list
-	} else {
-		patterns = append(patterns, p.parsePattern())
-		for p.current.Type == TOKEN_COMMA {
-			p.nextToken() // skip ','
-			patterns = append(patterns, p.parsePattern())
-		}
-	}
-
-	if p.current.Type != TOKEN_RPAREN {
-		p.error("expected ')' after patterns")
-		return nil
-	}
-	p.nextToken() // skip ')'
-
-	if p.current.Type != TOKEN_ARROW {
-		// Not a pattern clause
-		return nil
-	}
-	p.nextToken() // skip '->'
-
-	body := p.parseLambdaBody()
-
-	// parseLambdaBody leaves current on the last token of the body
-	// We need to advance to get to the token after the body (likely '|' or EOF)
-	// For blocks, this advances past '}'; for expressions, past the expression
-	if VerboseMode {
-		debugf("DEBUG parseOnePatternClause: before advancing, current=%v ('%s') peek=%v ('%s')\n", p.current.Type, p.current.Value, p.peek.Type, p.peek.Value)
-	}
-	p.nextToken()
-	if VerboseMode {
-		debugf("DEBUG parseOnePatternClause: after advancing, current=%v ('%s')\n", p.current.Type, p.current.Value)
-	}
-
-	return &PatternClause{Patterns: patterns, Body: body}
-}
-
-// Confidence that this function is working: 100%
 func (p *Parser) parseExpression() Expression {
-	// Track nesting DEPTH (increment on entry, decrement on exit) so the guard
-	// catches genuinely runaway recursion without capping total program size — a
-	// cumulative counter falsely trips "infinite recursion" on large programs.
-	globalParseCallCount++
-	if globalParseCallCount > maxParseRecursion {
-		// Print stack trace
-		debug.PrintStack()
-		p.error(fmt.Sprintf("infinite recursion in parseExpression: depth=%d, token type=%v value='%v' line=%d", globalParseCallCount, p.current.Type, p.current.Value, p.current.Line))
+	p.depth++
+	defer func() { p.depth-- }()
+	if p.depth > maxParseDepth {
+		p.error("expression nested too deeply")
+		p.stopIfTooMany()
+		panic(newReportedError("expression nested too deeply"))
 	}
-	result := p.parseTernary()
-	globalParseCallCount--
-	return result
+	return p.parseTernary()
 }
 
 // parseTernary handles the C-style conditional `cond ? then : else` (lowest
@@ -3565,12 +3036,7 @@ func (p *Parser) parseTernary() Expression {
 	}
 	p.nextToken() // move onto '?'
 	p.nextToken() // move to first token of the then-branch
-	// Suppress the `:`-as-`as` cast shorthand inside the then-branch so the colon
-	// is recognized as the ternary separator (`a ? b : c`, not `a ? (b as c)`).
-	savedTernary := p.inTernaryThen
-	p.inTernaryThen = true
 	thenExpr := p.parsePipe()
-	p.inTernaryThen = savedTernary
 	if p.peek.Type != TOKEN_COLON {
 		p.error("expected ':' in ternary conditional (cond ? a : b)")
 		return cond
@@ -3585,10 +3051,9 @@ func (p *Parser) parseTernary() Expression {
 	}
 }
 
-// parsePipe handles | and || operators (lowest precedence)
-// Grammar: pipe_expr = reduce_expr { ("|" | "||") reduce_expr }
+// parsePipe parses `xs | f` and the parallel `xs || f`.
 func (p *Parser) parsePipe() Expression {
-	left := p.parseReduce()
+	left := p.parseOrBang()
 
 	for p.peek.Type == TOKEN_PIPE || p.peek.Type == TOKEN_PIPEPIPE {
 		// Inside a match-clause result, a top-level '|' is the next guard clause's
@@ -3599,7 +3064,7 @@ func (p *Parser) parsePipe() Expression {
 		op := p.peek.Type
 		p.nextToken() // skip current
 		p.nextToken() // skip '|' or '||'
-		right := p.parseReduce()
+		right := p.parseOrBang()
 
 		if op == TOKEN_PIPE {
 			left = &PipeExpr{Left: left, Right: right}
@@ -3612,47 +3077,52 @@ func (p *Parser) parsePipe() Expression {
 	return left
 }
 
-// parseReduce handles reduce expressions (passthrough for now)
-// Grammar: reduce_expr = receive_expr
-func (p *Parser) parseReduce() Expression {
-	return p.parseReceive()
-}
-
-// parseReceive handles the <= prefix operator for receiving from channels
-// Grammar: receive_expr = "<=" pipe_expr | or_bang_expr
-func (p *Parser) parseReceive() Expression {
-	// Check for <= prefix (receive operator)
-	// Only treat <= as receive if it appears at the beginning of an expression
-	// (i.e., current token is not something that could be part of a binary expression)
-	// This prevents "x <= y" from being parsed as "x" followed by "<= y"
-
-	isExpressionStart := p.current.Type == TOKEN_NEWLINE ||
-		p.current.Type == TOKEN_SEMICOLON ||
-		p.current.Type == TOKEN_LPAREN ||
-		p.current.Type == TOKEN_LBRACE ||
-		p.current.Type == TOKEN_COMMA ||
-		p.current.Type == TOKEN_EQUALS ||
-		p.current.Type == TOKEN_COLON_EQUALS ||
-		p.current.Type == TOKEN_LEFT_ARROW ||
-		p.current.Type == TOKEN_PIPE ||
-		p.current.Type == TOKEN_PIPEPIPE ||
-		p.current.Type == TOKEN_FAT_ARROW ||
-		p.current.Type == TOKEN_DEFAULT_ARROW
-
-	if isExpressionStart && p.peek.Type == TOKEN_LE {
-		p.nextToken()           // move to current (TOKEN_LE)
-		p.nextToken()           // skip '<=', move to next
-		source := p.parsePipe() // Note: recursive to allow nested receives
-		return &ReceiveExpr{Source: source}
+// parseCallArg parses one call argument: an expression, optionally followed
+// by a match block, or spread into a variadic parameter with a trailing `...`.
+// parseArgs appends the call arguments after a '(' to args and leaves current
+// on the closing ')'. Arguments may span lines and end with a comma.
+func (p *Parser) parseArgs(args []Expression) []Expression {
+	for {
+		p.skipNewlines()
+		if p.current.Type == TOKEN_RPAREN || p.current.Type == TOKEN_EOF {
+			break
+		}
+		args = append(args, p.parseCallArg())
+		p.nextToken()
+		p.skipNewlines()
+		if p.current.Type != TOKEN_COMMA {
+			break
+		}
+		p.nextToken()
 	}
-
-	return p.parseOrBang()
+	if p.current.Type != TOKEN_RPAREN {
+		p.error("expected ',' or ')' in argument list")
+	}
+	return args
 }
 
-// parseOrBang handles the or! operator
-// Grammar: or_bang_expr = send_expr { "or!" send_expr }
+func (p *Parser) parseCallArg() Expression {
+	// Inside the parentheses a trailing `{` can only start a match
+	savedInMatchBlock := p.inMatchBlock
+	p.inMatchBlock = false
+	defer func() { p.inMatchBlock = savedInMatchBlock }()
+	e := p.parseExpression()
+	if p.peek.Type == TOKEN_LBRACE {
+		p.nextToken() // move to '{'
+		p.nextToken() // skip '{'
+		p.skipNewlines()
+		return p.parseMatchBlock(e)
+	}
+	if p.peek.Type == TOKEN_ELLIPSIS {
+		p.nextToken()
+		return &SpreadExpr{Expr: e}
+	}
+	return e
+}
+
+// parseOrBang parses the right-associative `x or! fallback`.
 func (p *Parser) parseOrBang() Expression {
-	left := p.parseSend()
+	left := p.parseCompose()
 
 	// or! is right-associative
 	if p.peek.Type == TOKEN_OR_BANG {
@@ -3668,22 +3138,6 @@ func (p *Parser) parseOrBang() Expression {
 			right = p.parseOrBang() // right-associative recursion
 		}
 		return &BinaryExpr{Left: left, Operator: "or!", Right: right}
-	}
-
-	return left
-}
-
-// parseSend handles the <- infix operator for sending to channels
-// Grammar: send_expr = or_expr { "<-" or_expr }
-func (p *Parser) parseSend() Expression {
-	left := p.parseCompose()
-
-	// Check for send operator: expr <- expr
-	// Left side should be an address literal (e.g., &8080)
-	for p.peek.Type == TOKEN_LEFT_ARROW {
-		p.nextToken() // move to left
-		p.nextToken() // skip '<-'
-		p.error("the send operator was replaced by enet.send(\"addr:port\", message)")
 	}
 
 	return left
@@ -3760,18 +3214,28 @@ func (p *Parser) parseLogicalOr() Expression {
 }
 
 func (p *Parser) parseLogicalAnd() Expression {
-	left := p.parseComparison()
+	left := p.parseNot()
 
 	for p.peek.Type == TOKEN_AND {
 		p.nextToken() // skip current
 		op := p.current.Value
 		p.nextToken() // skip 'and'
 		p.skipExprNewlines()
-		right := p.parseComparison()
+		right := p.requireOperand(p.parseNot(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
 	return left
+}
+
+// parseNot parses `not`, which binds looser than comparisons, as in Python:
+// not x == y is not (x == y).
+func (p *Parser) parseNot() Expression {
+	if p.current.Type != TOKEN_NOT {
+		return p.parseComparison()
+	}
+	p.nextToken()
+	return &UnaryExpr{Operator: "not", Operand: p.requireOperand(p.parseNot(), "not")}
 }
 
 // requireOperand reports a clear error when an infix operator is missing its
@@ -3786,29 +3250,125 @@ func (p *Parser) requireOperand(right Expression, op string) Expression {
 	return right
 }
 
+// parseComparison parses `in` and the comparison operators. A chain
+// a < b <= c means a < b and b <= c, as in Python; its inner operands must be
+// side-effect free since they are evaluated twice.
 func (p *Parser) parseComparison() Expression {
-	left := p.parseCons()
+	left := p.parseCast()
 
-	// Check for 'in' operator (membership testing)
 	if p.peek.Type == TOKEN_IN {
-		p.nextToken() // move to left expr
-		p.nextToken() // skip 'in'
-		right := p.parseCons()
-		return &InExpr{Value: left, Container: right}
+		p.nextToken()
+		p.nextToken()
+		return &InExpr{Value: left, Container: p.requireOperand(p.parseCast(), "in")}
 	}
 
-	for p.peek.Type == TOKEN_LT || p.peek.Type == TOKEN_GT ||
-		p.peek.Type == TOKEN_LE || p.peek.Type == TOKEN_GE ||
-		p.peek.Type == TOKEN_EQ || p.peek.Type == TOKEN_NE {
+	var chain Expression
+	for isComparisonToken(p.peek.Type) {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.requireOperand(p.parseCons(), op)
-		left = &BinaryExpr{Left: left, Operator: op, Right: right}
+		right := p.requireOperand(p.parseCast(), op)
+		cmp := &BinaryExpr{Left: left, Operator: op, Right: right}
+		if chain == nil {
+			chain = cmp
+		} else {
+			if hasSideEffects(left) {
+				p.error("a chained comparison evaluates its middle operand twice; bind it to a name first")
+			}
+			chain = &BinaryExpr{Left: chain, Operator: "and", Right: cmp}
+		}
+		left = right
 	}
+	if chain == nil {
+		return left
+	}
+	return chain
+}
 
-	return left
+// checkCast rejects as! on types it cannot round to, and a literal that as
+// cannot convert exactly to a number type.
+func (p *Parser) checkCast(c *CastExpr) {
+	if bits := floatCastBits(c.Type); bits != 0 {
+		n, ok := c.Expr.(*NumberExpr)
+		if u, neg := c.Expr.(*UnaryExpr); neg && u.Operator == "-" {
+			n, ok = u.Operand.(*NumberExpr)
+		}
+		if ok && !c.Wrap && !floatCastExact(n, bits) {
+			p.error(fmt.Sprintf("%s is not exactly a %s; use as! to round it", literalText(n), c.Type))
+		}
+		return
+	}
+	kind, isInt := intCastKind(c.Type)
+	if !isInt {
+		if c.Wrap {
+			p.error("as! converts to integer and float types; use as for " + c.Type)
+		}
+		return
+	}
+	v, ok := literalValue(c.Expr)
+	if !ok || c.Wrap {
+		return
+	}
+	lit := strconv.FormatFloat(v, 'f', -1, 64)
+	switch {
+	case v != math.Trunc(v):
+		p.error(fmt.Sprintf("%s is not an integer; use as! to round it", lit))
+	case !intCastFits(v, kind):
+		p.error(fmt.Sprintf("%s does not fit in %s; use as! to keep its low bits", lit, c.Type))
+	}
+}
+
+// literalText shows a literal as written: as a decimal when it is one.
+func literalText(n *NumberExpr) string {
+	if n.Exact == nil {
+		return strconv.FormatFloat(n.Value, 'f', -1, 64)
+	}
+	if a := math.Abs(n.Value); a >= 1e21 || a < 1e-6 {
+		return strconv.FormatFloat(n.Value, 'g', -1, 64)
+	}
+	for prec := 0; prec <= 40; prec++ {
+		text := n.Exact.FloatString(prec)
+		if r, ok := new(big.Rat).SetString(text); ok && r.Cmp(n.Exact) == 0 {
+			return text
+		}
+	}
+	return n.Exact.RatString()
+}
+
+// literalValue is the value of a numeric literal, possibly negated, when it
+// is an integer small enough to be exact in a float64.
+func literalValue(e Expression) (float64, bool) {
+	neg := false
+	if u, ok := e.(*UnaryExpr); ok && u.Operator == "-" {
+		neg, e = true, u.Operand
+	}
+	n, ok := e.(*NumberExpr)
+	if !ok || math.Abs(n.Value) >= 1<<53 {
+		return 0, false
+	}
+	if neg {
+		return -n.Value, true
+	}
+	return n.Value, true
+}
+
+func isAssignToken(t TokenType) bool {
+	switch t {
+	case TOKEN_EQUALS, TOKEN_COLON_EQUALS, TOKEN_LEFT_ARROW, TOKEN_PLUS_EQUALS, TOKEN_MINUS_EQUALS,
+		TOKEN_STAR_EQUALS, TOKEN_SLASH_EQUALS, TOKEN_MOD_EQUALS, TOKEN_POWER_EQUALS,
+		TOKEN_SHL_ASSIGN, TOKEN_SHR_ASSIGN, TOKEN_ROTL_ASSIGN, TOKEN_ROTR_ASSIGN:
+		return true
+	}
+	return false
+}
+
+func isComparisonToken(t TokenType) bool {
+	switch t {
+	case TOKEN_LT, TOKEN_GT, TOKEN_LE, TOKEN_GE, TOKEN_EQ, TOKEN_NE:
+		return true
+	}
+	return false
 }
 
 // parseCons handles the right-associative list cons operator:
@@ -3821,7 +3381,7 @@ func (p *Parser) parseComparison() Expression {
 func (p *Parser) parseCons() Expression {
 	left := p.parseRange()
 
-	if p.peek.Type == TOKEN_COLONCOLON {
+	if p.peek.Type == TOKEN_COLONCOLON && !p.inIndex {
 		p.nextToken() // move onto '::'
 		p.nextToken() // move onto the right operand
 		p.skipExprNewlines()
@@ -3882,7 +3442,7 @@ func (p *Parser) parseLambdaBody() Expression {
 	p.skipNewlines()
 
 	// A loop (or `if`) statement body is wrapped in an implicit statement block
-	if p.current.Type == TOKEN_FOR || p.current.Type == TOKEN_FOREACH ||
+	if p.current.Type == TOKEN_FOR ||
 		p.current.Type == TOKEN_WHILE || p.current.Type == TOKEN_PIPEPIPE {
 		stmt := p.parseStatement()
 		return &BlockExpr{Statements: []Statement{stmt}}
@@ -4007,9 +3567,7 @@ func (p *Parser) parseBitwise() Expression {
 	left := p.parseMultiplicative()
 
 	for p.peek.Type == TOKEN_PIPE_B || p.peek.Type == TOKEN_AMP_B ||
-		p.peek.Type == TOKEN_CARET_B || p.peek.Type == TOKEN_LTLT_B ||
-		p.peek.Type == TOKEN_GTGT_B || p.peek.Type == TOKEN_LTLTLT_B ||
-		p.peek.Type == TOKEN_GTGTGT_B || p.peek.Type == TOKEN_QUESTION_B ||
+		p.peek.Type == TOKEN_CARET_B || p.peek.Type == TOKEN_QUESTION_B ||
 		p.peek.Type == TOKEN_LTLT || p.peek.Type == TOKEN_GTGT ||
 		p.peek.Type == TOKEN_LTLTLT || p.peek.Type == TOKEN_GTGTGT {
 		p.nextToken()
@@ -4024,74 +3582,118 @@ func (p *Parser) parseBitwise() Expression {
 }
 
 func (p *Parser) parseMultiplicative() Expression {
-	left := p.parsePower()
+	left := p.parseUnary()
 
-	for p.peek.Type == TOKEN_STAR || p.peek.Type == TOKEN_SLASH || p.peek.Type == TOKEN_MOD || p.peek.Type == TOKEN_FMA {
+	for p.peek.Type == TOKEN_STAR || p.peek.Type == TOKEN_SLASH || p.peek.Type == TOKEN_MOD {
 		p.nextToken()
 		op := p.current.Value
 		p.nextToken()
 		p.skipExprNewlines()
-		right := p.requireOperand(p.parsePower(), op)
+		right := p.requireOperand(p.parseUnary(), op)
 		left = &BinaryExpr{Left: left, Operator: op, Right: right}
 	}
 
 	return left
 }
 
-// parsePower handles the ** (power/exponentiation) operator
-// Power is right-associative: 2 ** 3 ** 2 = 2 ** (3 ** 2) = 512
-func (p *Parser) parsePower() Expression {
-	left := p.parseUnary()
-
-	if p.peek.Type == TOKEN_POWER || p.peek.Type == TOKEN_CARET {
-		p.nextToken() // move to ** or ^
-		op := p.current.Value
-		// Normalize ^ to ** for backend processing
-		if op == "^" {
-			op = "**"
-		}
-		p.nextToken() // move past ** or ^
-		// Right-associative: recursively parse the right side
-		right := p.requireOperand(p.parsePower(), op)
-		return &BinaryExpr{Left: left, Operator: op, Right: right}
+// parseCast parses `x as T` and `x as! T`, which bind looser than arithmetic
+// and tighter than comparisons: 1 / 3 as! float64 converts the quotient.
+func (p *Parser) parseCast() Expression {
+	expr := p.parseCons()
+	for p.peek.Type == TOKEN_AS || p.peek.Type == TOKEN_AS_BANG {
+		wrap := p.peek.Type == TOKEN_AS_BANG
+		p.nextToken()
+		p.nextToken()
+		castType := p.parseCastType()
+		cast := &CastExpr{Expr: expr, Type: castType, Wrap: wrap}
+		p.checkCast(cast)
+		expr = cast
 	}
-
-	return left
+	return expr
 }
 
+// parseCastType parses the type after as: a cstruct or a built-in type.
+func (p *Parser) parseCastType() string {
+	var castType string
+	if p.current.Type == TOKEN_BOOL {
+		castType = "bool"
+	} else if p.current.Type == TOKEN_IDENT {
+		typeName := p.current.Value
+		// Check if it's a cstruct name
+		if _, exists := p.cstructs[typeName]; exists {
+			// It's a cstruct type - store the full type name
+			castType = typeName
+		} else {
+			// Check if it's a built-in type
+			validTypes := map[string]bool{
+				// C integer types
+				"int8": true, "int16": true, "int32": true, "int64": true,
+				"uint8": true, "uint16": true, "uint32": true, "uint64": true,
+				"char": true, "short": true, "int": true, "long": true,
+				"uchar": true, "ushort": true, "uint": true, "ulong": true,
+				"size_t": true, "ssize_t": true, "ptrdiff_t": true,
+				// C floating point types
+				"float": true, "float32": true, "float64": true, "double": true,
+				// C string/pointer types
+				"cstr": true, "cptr": true, "cstring": true,
+				"ptr": true, "pointer": true,
+				// Tim types (canonical short names match `:` annotations)
+				"num": true, "str": true,
+				"number": true, "string": true,
+				"list": true, "map": true, "addr": true,
+				"bool": true, "boolean": true, "cbool": true,
+				// Type aliases
+				"void": true,
+			}
+			if validTypes[p.current.Value] {
+				castType = p.current.Value
+			} else {
+				p.error("expected valid type or cstruct name after 'as' (e.g., string, int, SDL_Event)")
+			}
+		}
+	} else {
+		p.error("expected type after 'as'")
+	}
+	return castType
+}
+
+// parseUnary parses the prefix operators, which bind looser than ** and
+// tighter than everything else: -x ** 2 is -(x ** 2).
 func (p *Parser) parseUnary() Expression {
-	// Handle unary operators (not, ++, --, ~b, ^, &)
-	if p.current.Type == TOKEN_NOT {
-		p.nextToken() // skip 'not'
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: "not", Operand: operand}
-	}
-
-	// Handle prefix increment/decrement: ++x, --x
-	if p.current.Type == TOKEN_INCREMENT || p.current.Type == TOKEN_DECREMENT {
+	switch p.current.Type {
+	case TOKEN_MINUS, TOKEN_TILDE_B:
 		op := p.current.Value
-		p.nextToken() // skip ++ or --
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: op, Operand: operand}
+		p.nextToken()
+		return &UnaryExpr{Operator: op, Operand: p.requireOperand(p.parseUnary(), op)}
+	case TOKEN_INCREMENT, TOKEN_DECREMENT:
+		p.error("'" + p.current.Value + "' is a statement suffix (x++); write x + 1 in expressions")
+		p.nextToken()
+		return p.parseUnary()
+	case TOKEN_HASH:
+		p.nextToken()
+		return &UnaryExpr{Operator: "#", Operand: p.requireOperand(p.parseUnary(), "#")}
+	case TOKEN_BANG:
+		p.error("'!' is not a prefix operator: use 'not' for logical negation and '~b' for bitwise")
+		p.nextToken()
+		return &UnaryExpr{Operator: "not", Operand: p.parseUnary()}
+	case TOKEN_NOT:
+		p.error("'not' binds looser than comparisons; parenthesize it here: (not x)")
+		p.nextToken()
+		return &UnaryExpr{Operator: "not", Operand: p.parseUnary()}
 	}
+	return p.parsePower()
+}
 
-	// Handle bitwise NOT: ~b or !
-	if p.current.Type == TOKEN_TILDE_B || p.current.Type == TOKEN_BANG {
-		p.nextToken() // skip '~b' or '!'
-		operand := p.parseUnary()
-		// Normalize both to "~b" internally
-		return &UnaryExpr{Operator: "~b", Operand: operand}
+// parsePower parses the right-associative **, whose exponent may carry a
+// sign: 2 ** -1.
+func (p *Parser) parsePower() Expression {
+	left := p.parsePostfix()
+	if p.peek.Type != TOKEN_POWER {
+		return left
 	}
-
-	// Handle prefix length operator: #xs
-	if p.current.Type == TOKEN_HASH {
-		p.nextToken() // skip '#'
-		operand := p.parseUnary()
-		return &UnaryExpr{Operator: "#", Operand: operand}
-	}
-
-	// Unary minus handled in parsePrimary for simplicity
-	return p.parsePostfix()
+	p.nextToken()
+	p.nextToken()
+	return &BinaryExpr{Left: left, Operator: "**", Right: p.requireOperand(p.parseUnary(), "**")}
 }
 
 func (p *Parser) parsePostfix() Expression {
@@ -4112,19 +3714,36 @@ func (p *Parser) parsePostfix() Expression {
 			// Parse the first expression (could be start or index)
 			var firstExpr Expression
 			var isSlice bool
-			if p.current.Type == TOKEN_COLON {
+			savedInIndex := p.inIndex
+			p.inIndex = true
+			if p.current.Type != TOKEN_COLON && p.current.Type != TOKEN_COLONCOLON {
+				firstExpr = p.parseExpression()
+				if p.peek.Type == TOKEN_COLONCOLON {
+					p.nextToken()
+				}
+			}
+			if p.current.Type == TOKEN_COLONCOLON {
+				p.nextToken()
+				var stepExpr Expression
+				if p.current.Type != TOKEN_RBRACKET {
+					stepExpr = p.parseExpression()
+					p.nextToken()
+				}
+				expr = &SliceExpr{List: expr, Start: firstExpr, Step: stepExpr}
+				p.inIndex = savedInIndex
+				continue
+			}
+			if firstExpr != nil {
+				isSlice = p.peek.Type == TOKEN_COLON
+				if isSlice {
+					p.nextToken()
+					p.nextToken()
+				}
+			} else if p.current.Type == TOKEN_COLON {
 				// Case: [:end] or [::step]
 				firstExpr = nil
 				isSlice = true
 				p.nextToken() // skip ':'
-			} else {
-				firstExpr = p.parseExpression()
-				// Check if this is a slice (has colon)
-				isSlice = p.peek.Type == TOKEN_COLON
-				if isSlice {
-					p.nextToken() // move to colon
-					p.nextToken() // skip ':'
-				}
 			}
 
 			if isSlice {
@@ -4166,27 +3785,13 @@ func (p *Parser) parsePostfix() Expression {
 				p.nextToken() // move to ']'
 				expr = &IndexExpr{List: expr, Index: firstExpr}
 			}
+			p.inIndex = savedInIndex
 		} else if p.peek.Type == TOKEN_LPAREN {
 			// Handle direct lambda calls: ((x) -> x * 2)(5)
 			// or chained calls: f(1)(2)
 			p.nextToken() // skip current expr
 			p.nextToken() // skip '('
-			p.skipNewlines()
-			args := []Expression{}
-
-			if p.current.Type != TOKEN_RPAREN {
-				args = append(args, p.parseExpression())
-				for p.peek.Type == TOKEN_COMMA {
-					p.nextToken() // skip current
-					p.nextToken() // skip ','
-					p.skipNewlines()
-					args = append(args, p.parseExpression())
-				}
-				// current should be on last arg, peek should be ')'
-				p.skipNewlines()
-				p.nextToken() // move to ')'
-			}
-			// current is now on ')', whether we had args or not
+			args := p.parseArgs([]Expression{})
 
 			// TODO: Blocks-as-arguments disabled (conflicts with match expressions)
 
@@ -4239,74 +3844,15 @@ func (p *Parser) parsePostfix() Expression {
 				// For other expressions, use move operator
 				expr = &MoveExpr{Expr: expr}
 			}
-		} else if p.peek.Type == TOKEN_HASH {
-			// Handle postfix length operator: xs#
-			p.nextToken() // skip to #
-			expr = &UnaryExpr{Operator: "#", Operand: expr}
-		} else if p.peek.Type == TOKEN_AS || (p.peek.Type == TOKEN_COLON && !p.inMapKey && !p.inTernaryThen) {
-			// Handle type cast: `expr as Type` or the `:` shorthand `expr : Type`.
-			// The `:` form is suppressed while parsing a map key (`{5: 10}`) so the
-			// colon there stays the key separator. (Block-level disambiguation
-			// recognizes `: <TypeName>` as an annotation, not a map, separately.)
-			isRawBitcast := false
-			p.nextToken() // skip current expr
-			p.nextToken() // skip 'as' / ':'
-
-			// Parse the cast type
-			var castType string
-			if p.current.Type == TOKEN_IDENT {
-				typeName := p.current.Value
-				// Check if it's a cstruct name
-				if _, exists := p.cstructs[typeName]; exists {
-					// It's a cstruct type - store the full type name
-					castType = typeName
-				} else {
-					// Check if it's a built-in type
-					validTypes := map[string]bool{
-						// C integer types
-						"int8": true, "int16": true, "int32": true, "int64": true,
-						"uint8": true, "uint16": true, "uint32": true, "uint64": true,
-						"char": true, "short": true, "int": true, "long": true,
-						"uchar": true, "ushort": true, "uint": true, "ulong": true,
-						"size_t": true, "ssize_t": true, "ptrdiff_t": true,
-						// C floating point types
-						"float": true, "float32": true, "float64": true, "double": true,
-						// C string/pointer types
-						"cstr": true, "cptr": true, "cstring": true,
-						"ptr": true, "pointer": true,
-						// Tim types (canonical short names match `:` annotations)
-						"num": true, "str": true,
-						"number": true, "string": true,
-						"list": true, "map": true, "addr": true,
-						"bool": true, "boolean": true, "cbool": true,
-						// Type aliases
-						"void": true,
-					}
-					if validTypes[p.current.Value] {
-						castType = p.current.Value
-					} else {
-						p.error("expected valid type or cstruct name after 'as' (e.g., string, int, SDL_Event)")
-					}
-				}
-			} else {
-				p.error("expected type after 'as'")
-			}
-
-			expr = &CastExpr{Expr: expr, Type: castType, RawBitcast: isRawBitcast}
 		} else if p.peek.Type == TOKEN_DOT {
 			// Handle dot notation: obj.field, namespace.func(), namespace.CONSTANT, Type.size, Type.field.offset
 			p.nextToken() // skip current expr
 			p.nextToken() // skip '.'
 
-			// Allow keywords like 'malloc' and 'free' as field names for C FFI (c.malloc, c.free)
 			var fieldName string
 			if p.current.Type == TOKEN_IDENT {
 				fieldName = p.current.Value
-			} else if p.current.Type == TOKEN_MALLOC {
-				fieldName = "malloc"
-			} else if p.current.Type == TOKEN_FREE {
-				fieldName = "free"
-			} else if p.current.Value != "" && ((p.current.Value[0] >= 'a' && p.current.Value[0] <= 'z') ||
+			} else if p.current.Type != TOKEN_ILLEGAL && p.current.Value != "" && ((p.current.Value[0] >= 'a' && p.current.Value[0] <= 'z') ||
 				(p.current.Value[0] >= 'A' && p.current.Value[0] <= 'Z')) {
 				fieldName = p.current.Value
 			} else {
@@ -4361,17 +3907,8 @@ func (p *Parser) parsePostfix() Expression {
 						namespacedName := ident.Name + "." + fieldName
 						p.nextToken() // skip second identifier
 						p.nextToken() // skip '('
-						args := []Expression{}
+						args := p.parseArgs([]Expression{})
 
-						if p.current.Type != TOKEN_RPAREN {
-							args = append(args, p.parseExpression())
-							for p.peek.Type == TOKEN_COMMA {
-								p.nextToken() // skip current
-								p.nextToken() // skip ','
-								args = append(args, p.parseExpression())
-							}
-							p.nextToken() // move to ')'
-						}
 						// Check if this is a C FFI call (c.malloc, C.printf, etc.)
 						isCFFI := ident.Name == "c" || ident.Name == "C"
 						if isCFFI {
@@ -4387,17 +3924,8 @@ func (p *Parser) parsePostfix() Expression {
 						namespacedName := ident.Name + "." + fieldName
 						p.nextToken() // skip second identifier
 						p.nextToken() // skip '('
-						args := []Expression{}
+						args := p.parseArgs([]Expression{})
 
-						if p.current.Type != TOKEN_RPAREN {
-							args = append(args, p.parseExpression())
-							for p.peek.Type == TOKEN_COMMA {
-								p.nextToken() // skip current
-								p.nextToken() // skip ','
-								args = append(args, p.parseExpression())
-							}
-							p.nextToken() // move to ')'
-						}
 						// Store as namespace.function, compiler will handle both cases
 						expr = &CallExpr{Function: namespacedName, Args: args}
 					}
@@ -4439,19 +3967,10 @@ func (p *Parser) parsePostfix() Expression {
 				// Check if this is a method call: obj.method(args)
 				if p.peek.Type == TOKEN_LPAREN {
 					// Method call syntax sugar: obj.method(args) -> method(obj, args)
-					p.nextToken()              // skip field name
-					p.nextToken()              // skip '('
-					args := []Expression{expr} // receiver becomes first argument
+					p.nextToken() // skip field name
+					p.nextToken() // skip '('
+					args := p.parseArgs([]Expression{expr})
 
-					if p.current.Type != TOKEN_RPAREN {
-						args = append(args, p.parseExpression())
-						for p.peek.Type == TOKEN_COMMA {
-							p.nextToken() // skip current
-							p.nextToken() // skip ','
-							args = append(args, p.parseExpression())
-						}
-						p.nextToken() // move to ')'
-					}
 					// Desugar to function call with receiver as first arg
 					expr = &CallExpr{Function: fieldName, Args: args}
 				} else if fieldName == "error" {
@@ -4524,56 +4043,6 @@ func (p *Parser) parsePrimary() Expression {
 	case TOKEN_STRING:
 		return &StringExpr{Value: p.current.Value}
 
-	case TOKEN_ADDRESS_LITERAL:
-		// ENet address literal like &8080 or &localhost:8080
-		return &AddressLiteralExpr{Value: p.current.Value}
-
-	case TOKEN_DOLLAR:
-		// Address value operator: $expr
-		p.nextToken() // skip '$'
-		expr := p.parsePrimary()
-		return &UnaryExpr{Operator: "$", Operand: expr}
-
-	case TOKEN_MALLOC:
-		// malloc(size) - C malloc built-in
-		name := "malloc"
-		p.nextToken() // skip 'malloc'
-		if p.current.Type != TOKEN_LPAREN {
-			p.error("expected '(' after malloc")
-		}
-		p.nextToken() // skip '('
-		args := []Expression{}
-		if p.current.Type != TOKEN_RPAREN {
-			args = append(args, p.parseExpression())
-			for p.peek.Type == TOKEN_COMMA {
-				p.nextToken() // skip current
-				p.nextToken() // skip ','
-				args = append(args, p.parseExpression())
-			}
-			p.nextToken() // move to ')'
-		}
-		return &CallExpr{Function: name, Args: args}
-
-	case TOKEN_FREE:
-		// free(ptr) - C free built-in
-		name := "free"
-		p.nextToken() // skip 'free'
-		if p.current.Type != TOKEN_LPAREN {
-			p.error("expected '(' after free")
-		}
-		p.nextToken() // skip '('
-		args := []Expression{}
-		if p.current.Type != TOKEN_RPAREN {
-			args = append(args, p.parseExpression())
-			for p.peek.Type == TOKEN_COMMA {
-				p.nextToken() // skip current
-				p.nextToken() // skip ','
-				args = append(args, p.parseExpression())
-			}
-			p.nextToken() // move to ')'
-		}
-		return &CallExpr{Function: name, Args: args}
-
 	case TOKEN_FSTRING:
 		return p.parseFString()
 
@@ -4631,22 +4100,7 @@ func (p *Parser) parsePrimary() Expression {
 		if p.peek.Type == TOKEN_LPAREN {
 			p.nextToken() // skip identifier
 			p.nextToken() // skip '('
-			p.skipNewlines()
-			args := []Expression{}
-
-			if p.current.Type != TOKEN_RPAREN {
-				args = append(args, p.parseExpression())
-				for p.peek.Type == TOKEN_COMMA {
-					p.nextToken()    // skip current
-					p.nextToken()    // skip ','
-					p.skipNewlines() // allow arguments to span lines
-					args = append(args, p.parseExpression())
-				}
-				// Advance past the last arg; allow newlines before ')'.
-				p.nextToken()
-				p.skipNewlines()
-			}
-			// current is now on ')', whether we had args or not
+			args := p.parseArgs([]Expression{})
 
 			// TODO: Blocks-as-arguments feature disabled for now
 			// It conflicts with match expressions like: func() { -> val }
@@ -4701,60 +4155,27 @@ func (p *Parser) parsePrimary() Expression {
 		}
 		return &IdentExpr{Name: name}
 
-	// TOKEN_ME and TOKEN_CME removed - recursive calls now use function name with mandatory max
-
-	case TOKEN_AT_FIRST:
-		// @first is true on the first iteration of a loop
-		return &LoopStateExpr{Type: "first"}
-
-	case TOKEN_AT_LAST:
-		// @last is true on the last iteration of a loop
-		return &LoopStateExpr{Type: "last"}
-
-	case TOKEN_AT_COUNTER:
-		// @counter is the loop iteration counter
-		return &LoopStateExpr{Type: "counter"}
-
-	case TOKEN_AT_I:
-		// @i is the current loop, @i1 is outermost loop, @i2 is second loop, etc.
-		value := p.current.Value
-		level := 0
-		if len(value) > 2 { // @iN where N is a number
-			// Parse the number after @i
-			numStr := value[2:] // Skip "@i"
-			if num, err := strconv.Atoi(numStr); err == nil {
-				level = num
-			}
-		}
-		return &LoopStateExpr{Type: "i", LoopLevel: level}
-
 	case TOKEN_LPAREN:
-		// Could be:
-		// 1. Pattern lambda: (0) => 1, (n) => n * fact(n-1)
-		// 2. Regular lambda: (x) => x * 2
-		// 3. Parenthesized expression: (x + y)
-
-		// Try pattern lambda first with backtracking
-		state := p.saveState()
-		patternLambda := p.tryParsePatternLambda()
-		if patternLambda != nil {
-			return patternLambda
-		}
-		p.restoreState(state)
-
+		// A lambda `(x) -> x * 2` or a parenthesized expression `(x + y)`.
 		p.nextToken() // skip '('
 
 		// Check for empty parameter list: () -> or () {
 		if p.current.Type == TOKEN_RPAREN {
+			if p.peek.Type == TOKEN_FAT_ARROW {
+				p.nextToken()
+				p.error("lambdas are written with '->' (e.g. () -> { ... }); '=>' is for match arms")
+			}
 			if p.peek.Type == TOKEN_ARROW || p.peek.Type == TOKEN_LBRACE {
 				p.nextToken() // skip ')'
+				var ret *TimType
 				if p.current.Type == TOKEN_ARROW {
 					p.nextToken() // skip '->'
+					ret = p.parseReturnType()
 				}
 				p.lambdaParams = []string{} // No parameters
 				body := p.parseLambdaBody()
 				p.lambdaParams = nil
-				return &LambdaExpr{Params: []string{}, VariadicParam: "", Body: body}
+				return &LambdaExpr{Params: []string{}, ReturnType: ret, Body: body}
 			}
 			// Empty parens without arrow or block is an error, but skip for now
 			p.nextToken()
@@ -4853,17 +4274,18 @@ func (p *Parser) parsePrimary() Expression {
 			if p.peek.Type == TOKEN_ARROW || p.peek.Type == TOKEN_LBRACE {
 				// It's a lambda!
 				p.nextToken() // skip ')'
+				var ret *TimType
 				if p.current.Type == TOKEN_ARROW {
 					p.nextToken() // skip '->'
+					ret = p.parseReturnType()
 				}
 				p.lambdaParams = params // Store params for parseLambdaBody
+				if variadicParam != "" {
+					p.lambdaParams = append(append([]string{}, params...), variadicParam)
+				}
 				body := p.parseLambdaBody()
 				p.lambdaParams = nil
-				lambdaExpr := &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, Body: body}
-				if variadicParam != "" {
-					p.error("variadic functions are not yet supported")
-				}
-				return lambdaExpr
+				return &LambdaExpr{Params: params, ParamCStructTypes: paramTypes, VariadicParam: variadicParam, ReturnType: ret, Body: body}
 			}
 
 			// Not a lambda after all, restore and parse as expression
@@ -5009,27 +4431,6 @@ func (p *Parser) parsePrimary() Expression {
 		// arena { ... }
 		return p.parseArenaExpr()
 
-	case TOKEN_DOT:
-		// Dot notation for "this":
-		// - `.field` means `this.field`
-		// - `. ` (dot followed by space/newline) means `this`
-		p.nextToken() // skip '.'
-
-		// Check if followed by identifier
-		if p.current.Type == TOKEN_IDENT {
-			fieldName := p.current.Value
-			// Return field access on "this"
-			return &BinaryExpr{
-				Operator: ".",
-				Left:     &IdentExpr{Name: "this"},
-				Right:    &IdentExpr{Name: fieldName},
-			}
-		}
-
-		// Otherwise, just return "this"
-		// Move back one token since we consumed the dot but there's no field
-		p.current = Token{Type: TOKEN_DOT, Value: ".", Line: p.current.Line, Column: p.current.Column}
-		return &IdentExpr{Name: "this"}
 	}
 
 	// Check if this is a structural/delimiter token that should just end the expression
@@ -5113,7 +4514,7 @@ func (p *Parser) parseUnsafeExpr() Expression {
 	riscv64Stmts := p.parseUnsafeBlock()
 
 	// Check for 'as type' suffix (new syntax)
-	if p.current.Type == TOKEN_IDENT && p.current.Value == "as" {
+	if p.current.Type == TOKEN_AS {
 		p.nextToken() // skip 'as'
 		if p.current.Type == TOKEN_IDENT {
 			possibleType := p.current.Value
@@ -5473,8 +4874,24 @@ func (p *Parser) parseUnsafeValue() any {
 	return &IdentExpr{Name: left}
 }
 
-// parseTypeAnnotation parses a type annotation (after :)
-// Returns nil if no valid type annotation found
+// parseReturnType parses the T of `(params) -> T { body }`: a type name
+// directly followed by the body's '{'.
+func (p *Parser) parseReturnType() *TimType {
+	if p.peek.Type != TOKEN_LBRACE {
+		return nil
+	}
+	t := p.parseTypeAnnotation()
+	if t == nil {
+		if _, ok := p.cstructs[p.current.Value]; !ok {
+			return nil
+		}
+		t = &TimType{Kind: TypeUnknown, CType: p.current.Value}
+	}
+	p.nextToken()
+	return t
+}
+
+// parseTypeAnnotation parses the type after ':', or returns nil.
 func (p *Parser) parseTypeAnnotation() *TimType {
 	// Handle TOKEN_BOOL keyword
 	if p.current.Type == TOKEN_BOOL {

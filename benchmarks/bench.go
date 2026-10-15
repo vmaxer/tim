@@ -8,7 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"sort"
+	"slices"
 	"time"
 )
 
@@ -106,7 +106,7 @@ func timeIt(bin string, err error) (time.Duration, error) {
 		}
 		times = append(times, time.Since(start))
 	}
-	sort.Slice(times, func(i, j int) bool { return times[i] < times[j] })
+	slices.Sort(times)
 	return times[len(times)/2], nil
 }
 

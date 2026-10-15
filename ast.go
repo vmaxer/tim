@@ -95,13 +95,6 @@ func (m *MapUpdateStmt) String() string {
 }
 func (m *MapUpdateStmt) statementNode() {}
 
-type UseStmt struct {
-	Path string // Import path: "./file.tim" or "package_name"
-}
-
-func (u *UseStmt) String() string { return "use " + u.Path }
-func (u *UseStmt) statementNode() {}
-
 type ExportStmt struct {
 	Mode      string   // "*" for export all, "" for export specific functions
 	Functions []string // Function names to export (only if Mode != "*")
@@ -166,6 +159,16 @@ func (c *CStructDecl) String() string {
 	return fmt.Sprintf("cstruct %s { ... }", c.Name)
 }
 func (c *CStructDecl) statementNode() {}
+
+// Field returns the named field, or nil.
+func (c *CStructDecl) Field(name string) *CStructField {
+	for i := range c.Fields {
+		if c.Fields[i].Name == name {
+			return &c.Fields[i]
+		}
+	}
+	return nil
+}
 
 // GetCTypeSize returns the size in bytes for a C type string
 func GetCTypeSize(ctype string) int {
@@ -242,19 +245,6 @@ func (c *CStructDecl) CalculateStructLayout() {
 
 	c.Size = currentOffset
 }
-
-// ClassDecl represents a class definition (to be desugared to maps and closures)
-type ClassDecl struct {
-	Name         string                 // Class name
-	ClassVars    map[string]Expression  // Class-level variables (ClassName.var)
-	Methods      map[string]*LambdaExpr // Methods (instance functions)
-	Compositions []string               // Names of behavior maps to compose with <>
-}
-
-func (c *ClassDecl) String() string {
-	return fmt.Sprintf("class %s { ... }", c.Name)
-}
-func (c *ClassDecl) statementNode() {}
 
 type ExpressionStmt struct {
 	Expr Expression
@@ -435,13 +425,6 @@ type FStringExpr struct {
 func (f *FStringExpr) String() string  { return "f\"...\"" }
 func (f *FStringExpr) expressionNode() {}
 
-type AddressLiteralExpr struct {
-	Value string // The full address like "&8080" or "&localhost:8080"
-}
-
-func (a *AddressLiteralExpr) String() string  { return a.Value }
-func (a *AddressLiteralExpr) expressionNode() {}
-
 type IdentExpr struct {
 	Name string
 }
@@ -457,17 +440,6 @@ type NamespacedIdentExpr struct {
 
 func (n *NamespacedIdentExpr) String() string  { return n.Namespace + "." + n.Name }
 func (n *NamespacedIdentExpr) expressionNode() {}
-
-// LoopStateExpr represents special loop variables: @first, @last, @counter, @i, @i1, @i2, etc.
-type LoopStateExpr struct {
-	Type      string // "first", "last", "counter", "i"
-	LoopLevel int    // 0 for @i (current loop), 1 for @i1 (outermost), 2 for @i2, etc.
-}
-
-func (l *LoopStateExpr) String() string {
-	return "@" + l.Type
-}
-func (l *LoopStateExpr) expressionNode() {}
 
 // JumpExpr represents a label jump used as an expression (e.g., in match blocks)
 type JumpExpr struct {
@@ -755,20 +727,6 @@ func (r *RangeExpr) String() string {
 }
 func (r *RangeExpr) expressionNode() {}
 
-type StructLiteralExpr struct {
-	StructName string
-	Fields     map[string]Expression
-}
-
-func (s *StructLiteralExpr) String() string {
-	var fields []string
-	for name, expr := range s.Fields {
-		fields = append(fields, name+": "+expr.String())
-	}
-	return s.StructName + " { " + strings.Join(fields, ", ") + " }"
-}
-func (s *StructLiteralExpr) expressionNode() {}
-
 type LambdaExpr struct {
 	Params            []string
 	ParamCStructTypes map[string]string   // param name -> cstruct type name from `(a as V)` annotations
@@ -786,81 +744,6 @@ func (l *LambdaExpr) String() string {
 	return "(" + strings.Join(l.Params, ", ") + ") -> " + l.Body.String()
 }
 func (l *LambdaExpr) expressionNode() {}
-
-// Pattern represents a pattern match clause parameter
-type Pattern interface {
-	Node
-	patternNode()
-}
-
-// LiteralPattern matches a specific literal value
-type LiteralPattern struct {
-	Value Expression // NumberExpr, StringExpr, or BoolExpr
-}
-
-func (lp *LiteralPattern) String() string { return lp.Value.String() }
-func (lp *LiteralPattern) patternNode()   {}
-
-// VarPattern binds the argument to a variable
-type VarPattern struct {
-	Name string // Variable name to bind
-}
-
-func (vp *VarPattern) String() string { return vp.Name }
-func (vp *VarPattern) patternNode()   {}
-
-// WildcardPattern matches any value without binding
-type WildcardPattern struct{}
-
-func (wp *WildcardPattern) String() string { return "_" }
-func (wp *WildcardPattern) patternNode()   {}
-
-// PatternClause represents one pattern case: (pattern1, pattern2, ...) -> body
-type PatternClause struct {
-	Patterns []Pattern
-	Body     Expression
-}
-
-func (pc *PatternClause) String() string {
-	pats := make([]string, len(pc.Patterns))
-	for i, p := range pc.Patterns {
-		pats[i] = p.String()
-	}
-	return "(" + strings.Join(pats, ", ") + ") -> " + pc.Body.String()
-}
-
-// PatternLambdaExpr: lambda with pattern matching on parameters
-// Example: factorial := (0) -> 1 | (n) -> n * factorial(n-1)
-type PatternLambdaExpr struct {
-	Clauses        []*PatternClause
-	IsPure         bool
-	CapturedVars   []string
-	IsNestedLambda bool
-}
-
-func (pl *PatternLambdaExpr) String() string {
-	clauses := make([]string, len(pl.Clauses))
-	for i, c := range pl.Clauses {
-		clauses[i] = c.String()
-	}
-	return strings.Join(clauses, " | ")
-}
-func (pl *PatternLambdaExpr) expressionNode() {}
-
-// MultiLambdaExpr: multiple lambda dispatch based on argument count
-// Example: f = (x) -> x, (x, y) -> x + y
-type MultiLambdaExpr struct {
-	Lambdas []*LambdaExpr
-}
-
-func (m *MultiLambdaExpr) String() string {
-	parts := make([]string, len(m.Lambdas))
-	for i, lambda := range m.Lambdas {
-		parts[i] = lambda.String()
-	}
-	return strings.Join(parts, ", ")
-}
-func (m *MultiLambdaExpr) expressionNode() {}
 
 type ParallelExpr struct {
 	List      Expression // The list/data to operate on
@@ -901,25 +784,6 @@ func (b *BackgroundExpr) String() string {
 }
 func (b *BackgroundExpr) expressionNode() {}
 
-type SendExpr struct {
-	Target  Expression // Port or address to send to (e.g., &8080)
-	Message Expression // Message to send (typically string)
-}
-
-func (s *SendExpr) String() string {
-	return s.Target.String() + " <- " + s.Message.String()
-}
-func (s *SendExpr) expressionNode() {}
-
-type ReceiveExpr struct {
-	Source Expression // Port or address to receive from (e.g., &8080)
-}
-
-func (r *ReceiveExpr) String() string {
-	return "<= " + r.Source.String()
-}
-func (r *ReceiveExpr) expressionNode() {}
-
 type LengthExpr struct {
 	Operand Expression
 }
@@ -930,14 +794,17 @@ func (l *LengthExpr) String() string {
 func (l *LengthExpr) expressionNode() {}
 
 type CastExpr struct {
-	Expr       Expression
-	Type       string // "i8", "i32", "u64", "f32", "f64", "cstr", "ptr", "number", "string", "list"
-	RawBitcast bool   // true for as!, false for as (numeric conversion)
+	Expr Expression
+	Type string // "i8", "i32", "u64", "f32", "f64", "cstr", "ptr", "number", "string", "list"
+	Wrap bool   // as!: keep the low bits of an integer that does not fit
 }
 
 func (c *CastExpr) String() string {
 	if c.Expr == nil {
 		return "<nil> as " + c.Type
+	}
+	if c.Wrap {
+		return c.Expr.String() + " as! " + c.Type
 	}
 	return c.Expr.String() + " as " + c.Type
 }
@@ -1194,13 +1061,11 @@ func (s *SpawnStmt) String() string {
 }
 func (s *SpawnStmt) statementNode() {}
 
-// AliasStmt represents a keyword alias: alias for=@
-// Creates alternative syntax for existing keywords (useful for language packs)
-type AliasStmt struct {
-	NewName    string    // New keyword name (e.g., "for")
-	TargetName string    // Target keyword/token (e.g., "@")
-	Target     TokenType // Resolved target token type
+// SpreadExpr is `xs...` in a call: the elements of xs become arguments of a
+// variadic parameter.
+type SpreadExpr struct {
+	Expr Expression
 }
 
-func (a *AliasStmt) String() string { return "alias " + a.NewName + "=" + a.TargetName }
-func (a *AliasStmt) statementNode() {}
+func (s *SpreadExpr) String() string  { return s.Expr.String() + "..." }
+func (s *SpreadExpr) expressionNode() {}

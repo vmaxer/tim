@@ -6,8 +6,8 @@ import (
 )
 
 // generatePrintSyscall generates a print function
-// Linux: uses write syscall, Windows: uses printf
-// Signature: _tim_print_syscall(str_ptr) -> void
+// Linux: prints any value with one write syscall, Windows: uses printf
+// Signature: _tim_print_syscall(value) -> void
 func (fc *TimCompiler) generatePrintSyscall() {
 	fc.eb.MarkLabel("_tim_print_syscall")
 
@@ -77,75 +77,15 @@ func (fc *TimCompiler) generatePrintSyscall() {
 		return
 	}
 
-	// Linux version: use write syscall
-
-	// Prologue
-	fc.out.PushReg("rbp")
-	fc.out.MovRegToReg("rbp", "rsp")
-	fc.out.PushReg("rbx")
-	fc.out.PushReg("r12")
-	fc.out.PushReg("r13")
-	fc.out.PushReg("r14")
-
-	// rdi = string pointer (map: [tag][count][0][char0]...)
-	fc.out.MovRegToReg("rbx", "rdi")
-
-	// Get string length
-	fc.out.MovMemToXmm("xmm0", "rbx", 8)
-	fc.out.Cvttsd2si("r12", "xmm0") // r12 = length
-
-	// Allocate 1-byte buffer on stack
-	fc.out.SubImmFromReg("rsp", 8)
-	fc.out.MovRegToReg("r13", "rsp") // r13 = buffer address
-
-	// Loop through characters (r14 = index, avoids rcx which syscall clobbers)
-	fc.out.XorRegWithReg("r14", "r14")
-
-	loopStart := fc.eb.text.Len()
-	fc.out.CmpRegToReg("r14", "r12")
-	loopEndJump := fc.eb.text.Len()
-	fc.out.JumpConditional(JumpGreaterOrEqual, 0)
-	loopEndPos := fc.eb.text.Len()
-
-	// Calculate character offset: 16 + index * 16
-	fc.out.MovRegToReg("rax", "r14")
-	fc.out.ShlImmReg("rax", 4)       // rax = index * 16
-	fc.out.AddImmToReg("rax", 24)    // rax = 24 + index * 16
-	fc.out.AddRegToReg("rax", "rbx") // rax = string_ptr + offset
-
-	// Load character code (value field for current map entry)
-	fc.out.MovMemToXmm("xmm0", "rax", 0)
-	fc.out.Cvttsd2si("rdi", "xmm0")
-	fc.out.MovRegToMem("rdi", "r13", 0)
-
-	// write(1, buffer, 1)
-	fc.out.MovImmToReg("rax", "1")   // syscall: write
-	fc.out.MovImmToReg("rdi", "1")   // fd: stdout
-	fc.out.MovRegToReg("rsi", "r13") // buffer
-	fc.out.MovImmToReg("rdx", "1")   // length: 1
-	fc.out.Syscall()
-
-	// Increment index and loop
-	fc.out.IncReg("r14")
-	backOffset := int32(loopStart - (fc.eb.text.Len() + 5))
-	fc.out.JumpUnconditional(backOffset)
-
-	// Patch loop end jump
-	donePos := fc.eb.text.Len()
-	fc.patchJumpImmediate(loopEndJump+2, int32(donePos-loopEndPos))
-
-	// Epilogue
-	fc.out.AddImmToReg("rsp", 8)
-	fc.out.PopReg("r14")
-	fc.out.PopReg("r13")
-	fc.out.PopReg("r12")
-	fc.out.PopReg("rbx")
-	fc.out.PopReg("rbp")
+	// Linux: render any value as UTF-8 with the runtime, then one write(2).
+	fc.trackFunctionCall("_tim_num")
+	fc.out.MovqRegToXmm("xmm0", "rdi")
+	fc.emitNumCall(valUTF8)
+	fc.out.MovqXmmToReg("rsi", "xmm0")
+	fc.out.MovMemToReg("rdx", "rsi", 0)
+	fc.out.AddImmToReg("rsi", 8)
+	fc.emitStdoutWrite()
 	fc.out.Ret()
-
-	if VerboseMode {
-		debugf("DEBUG: Generated _tim_print_syscall\n")
-	}
 }
 
 // generatePrintlnSyscall generates a println function
@@ -272,11 +212,9 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 	fc.out.MovRegToMem("rdi", "r13", 0)
 
 	// write(1, buffer, 1)
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "r13")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	// Increment and loop
 	fc.out.IncReg("r14")
@@ -290,11 +228,9 @@ func (fc *TimCompiler) generatePrintlnSyscall() {
 	// Write newline
 	fc.out.MovImmToReg("rax", "10") // '\n'
 	fc.out.MovRegToMem("rax", "r13", 0)
-	fc.out.MovImmToReg("rax", "1")
-	fc.out.MovImmToReg("rdi", "1")
 	fc.out.MovRegToReg("rsi", "r13")
 	fc.out.MovImmToReg("rdx", "1")
-	fc.out.Syscall()
+	fc.emitStdoutWrite()
 
 	// Epilogue
 	fc.out.AddImmToReg("rsp", 8)

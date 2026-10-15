@@ -655,12 +655,15 @@ func (fc *TimCompiler) writeELF(program *Program, outputPath string) error {
 	if VerboseMode {
 		debugf("DEBUG: Using syscall exit (no libc)\n")
 	}
+	if len(fc.cLibHandles) > 0 {
+		// C code may hold buffered stdio output: leave through libc's exit
+		fc.emitFlushStdout()
+		fc.callFunction("exit", "")
+	}
+	fc.emitFlushStdout()
 	fc.out.MovImmToReg("rax", "60") // syscall number for exit
 	// exit code is already in rdi (first syscall argument)
 	fc.eb.Emit("syscall") // invoke syscall directly
-
-	// Generate pattern lambda functions
-	fc.generatePatternLambdaFunctions()
 
 	// Generate runtime helper functions AFTER lambda generation
 	fc.generateRuntimeHelpers()

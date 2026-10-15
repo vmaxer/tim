@@ -87,6 +87,9 @@ func (loc SourceLocation) String() string {
 	if loc.File == "" {
 		return fmt.Sprintf("%d:%d", loc.Line, loc.Column)
 	}
+	if loc.Line == 0 {
+		return loc.File
+	}
 	return fmt.Sprintf("%s:%d:%d", loc.File, loc.Line, loc.Column)
 }
 

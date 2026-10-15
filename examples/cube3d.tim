@@ -91,62 +91,62 @@ arena {
         right = top * aspect
 
         bg = 0.08 + 0.04 * sin(ticks * 0.002)
-        gl.glClearColor(bg as float, 0 as float, 0 as float, 1 as float)
+        gl.glClearColor(bg as! float, 0 as! float, 0 as! float, 1 as! float)
         gl.glClear(GL_COLOR_BUFFER_BIT + GL_DEPTH_BUFFER_BIT)
 
         gl.glMatrixMode(GL_PROJECTION)
         gl.glLoadIdentity()
-        gl.glFrustum((-right) as float, right as float, (-top) as float, top as float, znear as float, zfar as float)
+        gl.glFrustum((-right) as! float, right as! float, (-top) as! float, top as! float, znear as! float, zfar as! float)
 
         gl.glMatrixMode(GL_MODELVIEW)
         gl.glLoadIdentity()
-        gl.glTranslatef(0 as float, 0 as float, -5 as float)
-        gl.glRotatef(angle as float, 1 as float, 1 as float, 0 as float)
+        gl.glTranslatef(0 as! float, 0 as! float, -5 as! float)
+        gl.glRotatef(angle as! float, 1 as! float, 1 as! float, 0 as! float)
 
         // Filled cube with per-face red intensity shading.
         gl.glBegin(GL_QUADS)
 
         // Front
-        gl.glColor3f(1 as float, 0 as float, 0 as float)
-        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
-        gl.glVertex3f(1 as float, -1 as float, 1 as float)
-        gl.glVertex3f(1 as float, 1 as float, 1 as float)
-        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
+        gl.glColor3f(1 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, 1 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, 1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, 1 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, 1 as! float)
 
         // Back
-        gl.glColor3f(0.35 as float, 0 as float, 0 as float)
-        gl.glVertex3f(1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
-        gl.glVertex3f(1 as float, 1 as float, -1 as float)
+        gl.glColor3f(0.35 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, -1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, -1 as! float)
 
         // Left
-        gl.glColor3f(0.65 as float, 0 as float, 0 as float)
-        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
-        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
-        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
+        gl.glColor3f(0.65 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, 1 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, 1 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, -1 as! float)
 
         // Right
-        gl.glColor3f(0.85 as float, 0 as float, 0 as float)
-        gl.glVertex3f(1 as float, -1 as float, 1 as float)
-        gl.glVertex3f(1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(1 as float, 1 as float, -1 as float)
-        gl.glVertex3f(1 as float, 1 as float, 1 as float)
+        gl.glColor3f(0.85 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, 1 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, -1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, 1 as! float)
 
         // Top
-        gl.glColor3f(0.75 as float, 0 as float, 0 as float)
-        gl.glVertex3f(-1 as float, 1 as float, 1 as float)
-        gl.glVertex3f(1 as float, 1 as float, 1 as float)
-        gl.glVertex3f(1 as float, 1 as float, -1 as float)
-        gl.glVertex3f(-1 as float, 1 as float, -1 as float)
+        gl.glColor3f(0.75 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, 1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, 1 as! float)
+        gl.glVertex3f(1 as! float, 1 as! float, -1 as! float)
+        gl.glVertex3f(-1 as! float, 1 as! float, -1 as! float)
 
         // Bottom
-        gl.glColor3f(0.5 as float, 0 as float, 0 as float)
-        gl.glVertex3f(-1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(1 as float, -1 as float, -1 as float)
-        gl.glVertex3f(1 as float, -1 as float, 1 as float)
-        gl.glVertex3f(-1 as float, -1 as float, 1 as float)
+        gl.glColor3f(0.5 as! float, 0 as! float, 0 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, -1 as! float)
+        gl.glVertex3f(1 as! float, -1 as! float, 1 as! float)
+        gl.glVertex3f(-1 as! float, -1 as! float, 1 as! float)
 
         gl.glEnd()
 

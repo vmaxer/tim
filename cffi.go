@@ -1132,3 +1132,66 @@ func resolveTypeName(offset dwarf.Offset, data *dwarf.Data) string {
 
 	return "unknown"
 }
+
+// commonCFunctions describes C library functions used without a parsed
+// header, so calls can marshal their arguments.
+var commonCFunctions = map[string]*CFunctionSignature{
+	// Math functions
+	"sin":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"cos":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"tan":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"sqrt":  {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"pow":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}, {Type: "double"}}},
+	"exp":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"log":   {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"floor": {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"ceil":  {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	"fabs":  {ReturnType: "double", Params: []CFunctionParam{{Type: "double"}}},
+	// Memory management functions
+	"malloc":  {ReturnType: "void*", Params: []CFunctionParam{{Type: "size_t"}}},
+	"free":    {ReturnType: "void", Params: []CFunctionParam{{Type: "void*"}}},
+	"realloc": {ReturnType: "void*", Params: []CFunctionParam{{Type: "void*"}, {Type: "size_t"}}},
+	"calloc":  {ReturnType: "void*", Params: []CFunctionParam{{Type: "size_t"}, {Type: "size_t"}}},
+	// Note: printf is variadic and can't be fully described here,
+	// but we can at least mark the format string as const char*
+	"printf":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+	"strerror": {ReturnType: "const char*", Params: []CFunctionParam{{Type: "int"}}},
+	"getenv":   {ReturnType: "const char*", Params: []CFunctionParam{{Type: "const char*"}}},
+	"memset":   {ReturnType: "void*", Params: []CFunctionParam{{Type: "void*"}, {Type: "int"}, {Type: "size_t"}}},
+	"memcpy":   {ReturnType: "void*", Params: []CFunctionParam{{Type: "void*"}, {Type: "void*"}, {Type: "size_t"}}},
+	"memcmp":   {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}, {Type: "void*"}, {Type: "size_t"}}},
+	"strlen":   {ReturnType: "size_t", Params: []CFunctionParam{{Type: "const char*"}}},
+	"strcmp":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+	"fopen":    {ReturnType: "void*", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+	"fclose":   {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}}},
+	"fread":    {ReturnType: "size_t", Params: []CFunctionParam{{Type: "void*"}, {Type: "size_t"}, {Type: "size_t"}, {Type: "void*"}}},
+	"fwrite":   {ReturnType: "size_t", Params: []CFunctionParam{{Type: "void*"}, {Type: "size_t"}, {Type: "size_t"}, {Type: "void*"}}},
+	"fseek":    {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}, {Type: "long"}, {Type: "int"}}},
+	"ftell":    {ReturnType: "long", Params: []CFunctionParam{{Type: "void*"}}},
+	"remove":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+	"rename":   {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}, {Type: "const char*"}}},
+	"time":     {ReturnType: "int64_t", Params: []CFunctionParam{{Type: "void*"}}},
+	"usleep":   {ReturnType: "int", Params: []CFunctionParam{{Type: "uint"}}},
+	"exit":     {ReturnType: "void", Params: []CFunctionParam{{Type: "int"}}},
+	"atoi":     {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+	"abs":      {ReturnType: "int", Params: []CFunctionParam{{Type: "int"}}},
+	"labs":     {ReturnType: "long", Params: []CFunctionParam{{Type: "long"}}},
+	"llabs":    {ReturnType: "long long", Params: []CFunctionParam{{Type: "long long"}}},
+	"puts":     {ReturnType: "int", Params: []CFunctionParam{{Type: "const char*"}}},
+	"putchar":  {ReturnType: "int", Params: []CFunctionParam{{Type: "int"}}},
+	"rand":     {ReturnType: "int"},
+	"srand":    {ReturnType: "void", Params: []CFunctionParam{{Type: "unsigned int"}}},
+	"sleep":    {ReturnType: "unsigned int", Params: []CFunctionParam{{Type: "unsigned int"}}},
+	"toupper":  {ReturnType: "int", Params: []CFunctionParam{{Type: "int"}}},
+	"tolower":  {ReturnType: "int", Params: []CFunctionParam{{Type: "int"}}},
+	"atol":     {ReturnType: "long", Params: []CFunctionParam{{Type: "const char*"}}},
+	"atof":     {ReturnType: "double", Params: []CFunctionParam{{Type: "const char*"}}},
+	"strtol":   {ReturnType: "long", Params: []CFunctionParam{{Type: "const char*"}, {Type: "char**"}, {Type: "int"}}},
+	"fflush":   {ReturnType: "int", Params: []CFunctionParam{{Type: "void*"}}},
+}
+
+// cStdioOutput lists C functions that write through stdio buffers.
+var cStdioOutput = map[string]bool{
+	"printf": true, "puts": true, "putchar": true, "fputs": true, "fprintf": true,
+	"fputc": true, "fwrite": true, "vprintf": true, "perror": true,
+}

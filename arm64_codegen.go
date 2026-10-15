@@ -175,7 +175,7 @@ func (acg *ARM64CodeGen) registerBlockLocalCStructTypes(stmts []Statement) []str
 // isLambdaValue reports whether expr is a lambda literal in any of its forms.
 func isLambdaValue(expr Expression) bool {
 	switch expr.(type) {
-	case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+	case *LambdaExpr:
 		return true
 	}
 	return false
@@ -215,8 +215,6 @@ func (acg *ARM64CodeGen) markIfClosure(name string, value Expression) {
 		if et := acg.lambdaReturnsListElemType(v.Body); et != "" {
 			acg.funcReturnsListElem[name] = et
 		}
-	case *PatternLambdaExpr, *MultiLambdaExpr:
-		acg.lambdaVars[name] = true
 	case *CallExpr:
 		if acg.returnsClosure[v.Function] {
 			acg.lambdaVars[name] = true
@@ -3126,11 +3124,6 @@ func (acg *ARM64CodeGen) compileExpression(expr Expression) error {
 			return fmt.Errorf("unsafe block has no ARM64 implementation")
 		}
 
-	case *PatternLambdaExpr:
-		// Pattern matching lambda with multiple clauses
-		// Full implementation would need pattern matching codegen
-		return fmt.Errorf("pattern lambdas not yet implemented in ARM64 (requires pattern matching)")
-
 	case *FieldAccessExpr:
 		// SROA fast path: `Struct(e0, e1, ...).field` folds straight to the
 		// matching argument expression — no allocation, no memory round-trip. After
@@ -4865,7 +4858,7 @@ func (acg *ARM64CodeGen) compileDirectCall(call *DirectCallExpr) error {
 		// Check if callee is a simple value (not a lambda)
 		isLambda := false
 		switch call.Callee.(type) {
-		case *LambdaExpr, *PatternLambdaExpr, *MultiLambdaExpr:
+		case *LambdaExpr:
 			isLambda = true
 		case *IdentExpr:
 			// Check if the identifier refers to a lambda/function
@@ -5227,7 +5220,7 @@ func (acg *ARM64CodeGen) compilePrintfNative(call *CallExpr, fd uint64) error {
 	if !ok {
 		return fmt.Errorf("printf first argument must be a string literal")
 	}
-	runes := []rune(processEscapeSequences(strExpr.Value))
+	runes := []rune(strExpr.Value)
 	argIndex := 0
 	i := 0
 	for i < len(runes) {
@@ -5360,7 +5353,7 @@ func (acg *ARM64CodeGen) compilePrintf(call *CallExpr) error {
 	}
 
 	// Process format string: %v -> %.15g (smart float), %b -> %s (boolean)
-	processedFormat := processEscapeSequences(strExpr.Value)
+	processedFormat := strExpr.Value
 	boolPositions := make(map[int]bool) // Track which args are %b (boolean)
 	isFloatArg := make(map[int]bool)    // Track which args are floats
 	isPtrArg := make(map[int]bool)      // Track which args are pointers

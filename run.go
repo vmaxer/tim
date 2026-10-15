@@ -51,7 +51,29 @@ func needsMainWrapper(code string) bool {
 func runWithTimeout(exePath string, seconds int) ([]byte, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(seconds)*time.Second)
 	defer cancel()
-	return exec.CommandContext(ctx, exePath).CombinedOutput()
+	return testCommand(ctx, exePath).CombinedOutput()
+}
+
+// testPlatform is the target the test helpers compile for: the host, or the
+// architecture named by TIM_TEST_ARCH (e.g. riscv64), whose binaries then run
+// under qemu-user. This lets the whole suite exercise another backend.
+func testPlatform() Platform {
+	if a := os.Getenv("TIM_TEST_ARCH"); a != "" {
+		if arch, err := ParseArch(a); err == nil {
+			return Platform{Arch: arch, OS: OSLinux}
+		}
+	}
+	return GetDefaultPlatform()
+}
+
+func testCommand(ctx context.Context, exePath string) *exec.Cmd {
+	if p := testPlatform(); p.Arch != GetDefaultPlatform().Arch {
+		triple := map[Arch]string{ArchRiscv64: "riscv64", ArchARM64: "aarch64"}[p.Arch]
+		cmd := exec.CommandContext(ctx, "sh", "-c", `ulimit -c 0; exec "$0" "$1"`, "qemu-"+triple, exePath)
+		cmd.Env = append(os.Environ(), "QEMU_LD_PREFIX=/usr/"+triple+"-linux-gnu")
+		return cmd
+	}
+	return exec.CommandContext(ctx, exePath)
 }
 
 // compileAndRun is a helper function that compiles and runs Tim code,
@@ -98,13 +120,18 @@ func compileAndRun(t *testing.T, code string) string {
 		OS:   osType,
 		Arch: archType,
 	}
+	if os.Getenv("TIM_TEST_ARCH") != "" {
+		platform = testPlatform()
+	}
 	if err := CompileTimWithOptions(srcFile, exePath, platform, 0, false, false); err != nil {
 		t.Fatalf("Compilation failed: %v", err)
 	}
 
 	// Run - inherit environment variables for SDL_VIDEODRIVER etc
-	cmd := exec.Command(exePath)
-	cmd.Env = os.Environ()
+	cmd := testCommand(context.Background(), exePath)
+	if cmd.Env == nil {
+		cmd.Env = os.Environ()
+	}
 	runOutput, err := cmd.CombinedOutput()
 	// Note: Tim programs may return non-zero exit codes as their result value
 	// We only fail if there's an actual execution error (not just non-zero exit)

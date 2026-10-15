@@ -89,7 +89,7 @@ func TestExistingListPrograms(t *testing.T) {
 			tmpDir := t.TempDir()
 			exePath := filepath.Join(tmpDir, name)
 
-			platform := GetDefaultPlatform()
+			platform := testPlatform()
 			if err := CompileTim(srcPath, exePath, platform); err != nil {
 				t.Fatalf("Compilation failed: %v", err)
 			}
