@@ -79,7 +79,7 @@ func (g *rvGen) cFunction(c *CallExpr) (sym string, sig *CFunctionSignature, ok 
 		sig = consts.Functions[sym]
 	}
 	if sig == nil {
-		sig = commonCFunctions[sym]
+		sig = libcSignature(sym)
 	}
 	return sym, sig, true
 }
@@ -299,7 +299,7 @@ func (g *rvGen) cArgument(e Expression, k rvCKind, slot int32) error {
 		g.fop(0x20, 7, rvFT0, rvFA0, 1)
 		g.memOp(func(b uint32, o int32) { g.w(rvS(o, rvFT0, b, 2, 0x27)) }, rvS0, slot)
 	case rvCString, rvCPointer:
-		g.cPointer(k == rvCString)
+		g.cPointer()
 		g.sdx(rvA0, rvS0, slot)
 	case rvCVariadicNumber:
 		integral, done := g.newLabel(), g.newLabel()
@@ -324,19 +324,20 @@ func (g *rvGen) cArgument(e Expression, k rvCKind, slot int32) error {
 
 // cPointer turns fa0 into a C pointer in a0: numbers are addresses, strings
 // become NUL-terminated UTF-8 when str is set, other containers are NULL.
-func (g *rvGen) cPointer(str bool) {
+// cPointer converts fa0 to a C pointer argument in a0: a string is its
+// NUL-terminated UTF-8 bytes, another container its address and a number an
+// address.
+func (g *rvGen) cPointer() {
 	number, done := g.newLabel(), g.newLabel()
 	g.fmvXD(rvT0, rvFA0)
 	g.boxTest(rvT0, rvT1, number)
-	g.li(rvA0, 0)
-	if str {
-		g.ld(rvT1, rvT0, 0)
-		g.li(rvT2, int64(math.Float64bits(tagString)))
-		g.br(1, rvT1, rvT2, done)
-		g.numCall(valUTF8)
-		g.fmvXD(rvA0, rvFA0)
-		g.addi(rvA0, rvA0, 8)
-	}
+	g.mv(rvA0, rvT0)
+	g.ld(rvT1, rvT0, 0)
+	g.li(rvT2, int64(math.Float64bits(tagString)))
+	g.br(1, rvT1, rvT2, done)
+	g.numCall(valUTF8)
+	g.fmvXD(rvA0, rvFA0)
+	g.addi(rvA0, rvA0, 8)
 	g.j(done)
 	g.bind(number)
 	g.toI64()

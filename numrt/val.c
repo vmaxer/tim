@@ -15,7 +15,7 @@ enum {
 	V_SET, V_IN, V_KEYAT, V_ERROR, V_ERRSTR, V_KIND, V_TRUTHY, V_KEYS,
 	V_VALUES, V_FROM_UTF8, V_RANGE, V_POPCOUNT, V_CLZ, V_CTZ,
 	V_SIN, V_COS, V_TAN, V_ASIN, V_ACOS, V_ATAN, V_ATAN2, V_EXP, V_LOG, V_LOG10,
-	V_CMP,
+	V_CMP, V_CSTR,
 };
 
 #define T_STR 1
@@ -298,8 +298,20 @@ static u64 v_utf8(Ctx *c, u64 v) {
 	u64 k = 0;
 	for (u64 i = 0; i < n; i++)
 		k += utf8_put(p + k, rune_at(s, i));
+	p[k] = 0;
 	out[0] = k;
 	return (u64)out;
+}
+
+// v_cstr is `v as cstr`: a number is the address of a NUL-terminated C string
+// (numbers below 4096, such as 0, are no address and stay as they are);
+// anything else is already a Tim value.
+static u64 from_utf8(Ctx *c, const unsigned char *p);
+static u64 v_cstr(Ctx *c, u64 v) {
+	if (ctag(v) || is_box(v))
+		return v;
+	u64 p = to_i64(c, v);
+	return p >= 4096 ? from_utf8(c, (const unsigned char *)p) : v;
 }
 
 // from_utf8 decodes a NUL-terminated UTF-8 string.
@@ -800,6 +812,8 @@ static u64 tim_val(Ctx *c, u64 op, u64 a, u64 b) {
 		return v_utf8(c, a);
 	case V_FROM_UTF8:
 		return from_utf8(c, (const unsigned char *)a);
+	case V_CSTR:
+		return v_cstr(c, a);
 	case V_SET:
 		return v_set(c, a, (const u64 *)b);
 	case V_IN:

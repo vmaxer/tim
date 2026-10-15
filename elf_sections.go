@@ -354,38 +354,10 @@ func (ds *DynamicSections) updatePLTGOT(gotAddr uint64) {
 	}
 }
 
-// updateRelocationAddress updates a relocation's r_offset field
-func (ds *DynamicSections) updateRelocationAddress(oldAddr, newAddr uint64) {
-	// Each relocation entry is 24 bytes:
-	// - 8 bytes r_offset (address to relocate)
-	// - 8 bytes r_info (symbol index and relocation type)
-	// - 8 bytes r_addend
+// setRelocationOffsets points relocation i at the GOT slot first + 8*i.
+func (ds *DynamicSections) setRelocationOffsets(first uint64) {
 	buf := ds.rela.Bytes()
-
-	for i := 0; i < len(buf); i += 24 {
-		if i+24 > len(buf) {
-			break
-		}
-
-		// Read r_offset (little-endian 64-bit)
-		offset := uint64(buf[i]) | uint64(buf[i+1])<<8 | uint64(buf[i+2])<<16 | uint64(buf[i+3])<<24 |
-			uint64(buf[i+4])<<32 | uint64(buf[i+5])<<40 | uint64(buf[i+6])<<48 | uint64(buf[i+7])<<56
-
-		if offset == oldAddr {
-			// Update r_offset
-			buf[i] = byte(newAddr)
-			buf[i+1] = byte(newAddr >> 8)
-			buf[i+2] = byte(newAddr >> 16)
-			buf[i+3] = byte(newAddr >> 24)
-			buf[i+4] = byte(newAddr >> 32)
-			buf[i+5] = byte(newAddr >> 40)
-			buf[i+6] = byte(newAddr >> 48)
-			buf[i+7] = byte(newAddr >> 56)
-
-			// Rebuild the buffer
-			ds.rela.Reset()
-			ds.rela.Write(buf)
-			return
-		}
+	for i := 0; i+24 <= len(buf); i += 24 {
+		binary.LittleEndian.PutUint64(buf[i:], first+uint64(i/3))
 	}
 }

@@ -28,12 +28,9 @@ func (fc *TimCompiler) compileExitfSyscall(call *CallExpr, formatStr *StringExpr
 				if argIndex+1 < len(call.Args) {
 					arg := call.Args[argIndex+1]
 					fc.compileExpression(arg)
-					if fc.isCFFIStringCall(arg) || fc.getExprType(arg) == "cstring" {
-						fc.out.Cvttsd2si("rax", "xmm0")
-					} else {
-						fc.trackFunctionCall("_tim_string_to_cstr")
-						fc.out.CallSymbol("_tim_string_to_cstr")
-					}
+					fc.emitNumCall(valStr)
+					fc.trackFunctionCall("_tim_string_to_cstr")
+					fc.out.CallSymbol("_tim_string_to_cstr")
 					fc.emitCStrWrite(2)
 				}
 				argIndex++

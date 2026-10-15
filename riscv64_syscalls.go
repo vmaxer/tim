@@ -10,7 +10,11 @@ import (
 // Process, memory and ENet (UDP) builtins as raw Linux system calls.
 
 const (
+	rvSysOpenat   = 56
 	rvSysClose    = 57
+	rvSysLseek    = 62
+	rvSysRead     = 63
+	rvSysWrite    = 64
 	rvSysExitGrp  = 94
 	rvSysGetpid   = 172
 	rvSysSocket   = 198
@@ -95,6 +99,16 @@ func (g *rvGen) syscallBuiltin(c *CallExpr) (bool, error) {
 			g.call(g.l["flush"])
 			err = g.syscallArgs(rvSysExitGrp, args, nil)
 		}
+	case "read_file":
+		if err = need(1); err == nil {
+			err = g.readFile(args[0])
+		}
+		return true, err
+	case "write_file":
+		if err = need(2); err == nil {
+			err = g.writeFile(args[0], args[1])
+		}
+		return true, err
 	case "enet.send":
 		if err = need(2); err == nil {
 			err = g.enetSend(args[0], args[1])
@@ -107,6 +121,153 @@ func (g *rvGen) syscallBuiltin(c *CallExpr) (bool, error) {
 	}
 	g.fromI64()
 	return true, nil
+}
+
+// utf8Slot evaluates e into a frame slot holding its UTF-8 bytes: a length
+// word followed by the NUL-terminated bytes.
+func (g *rvGen) utf8Slot(e Expression) (int32, error) {
+	slot := g.tmp()
+	if err := g.expr(e); err != nil {
+		return 0, err
+	}
+	g.numCall(valUTF8)
+	g.fsdx(rvFA0, rvS0, slot)
+	return slot, nil
+}
+
+func (g *rvGen) ioError() {
+	g.li(rvT0, int64(errorValueBits("io")))
+	g.fmvDX(rvFA0, rvT0)
+}
+
+// readFile reads the whole file at path into a string, or gives the "io"
+// error.
+func (g *rvGen) readFile(path Expression) error {
+	mark := g.sc.ntmp
+	defer func() { g.sc.ntmp = mark }()
+	p, err := g.utf8Slot(path)
+	if err != nil {
+		return err
+	}
+	fd, size, buf, got := g.tmp(), g.tmp(), g.tmp(), g.tmp()
+	fail, failClose, loop, eof, done := g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel()
+	g.li(rvA0, -100)
+	g.ldx(rvA1, rvS0, p)
+	g.addi(rvA1, rvA1, 8)
+	g.li(rvA2, 0)
+	g.li(rvA3, 0)
+	g.li(rvA7, rvSysOpenat)
+	g.ecall()
+	g.br(4, rvA0, 0, fail)
+	g.sdx(rvA0, rvS0, fd)
+	g.li(rvA1, 0)
+	g.li(rvA2, 2)
+	g.li(rvA7, rvSysLseek)
+	g.ecall()
+	g.br(4, rvA0, 0, failClose)
+	g.sdx(rvA0, rvS0, size)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA1, 0)
+	g.li(rvA2, 0)
+	g.li(rvA7, rvSysLseek)
+	g.ecall()
+	g.ldx(rvA1, rvS0, size)
+	g.addi(rvA1, rvA1, 1)
+	g.call(g.l["alloc"])
+	g.sdx(rvA0, rvS0, buf)
+	g.sdx(0, rvS0, got)
+	g.bind(loop)
+	g.ldx(rvA2, rvS0, size)
+	g.ldx(rvT0, rvS0, got)
+	g.op(0x20, 0, rvA2, rvA2, rvT0)
+	g.beqz(rvA2, eof)
+	g.ldx(rvA1, rvS0, buf)
+	g.add(rvA1, rvA1, rvT0)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysRead)
+	g.ecall()
+	g.br(5, 0, rvA0, eof)
+	g.ldx(rvT0, rvS0, got)
+	g.add(rvT0, rvT0, rvA0)
+	g.sdx(rvT0, rvS0, got)
+	g.j(loop)
+	g.bind(eof)
+	g.ldx(rvT0, rvS0, buf)
+	g.ldx(rvT1, rvS0, got)
+	g.add(rvT0, rvT0, rvT1)
+	g.sb(0, rvT0, 0)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysClose)
+	g.ecall()
+	g.fldx(rvFA0, rvS0, buf)
+	g.numCall(valFromUTF8)
+	g.j(done)
+	g.bind(failClose)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysClose)
+	g.ecall()
+	g.bind(fail)
+	g.ioError()
+	g.bind(done)
+	return nil
+}
+
+// writeFile writes the UTF-8 bytes of content to the file at path,
+// replacing it; the result is the number of bytes written or the "io" error.
+func (g *rvGen) writeFile(path, content Expression) error {
+	mark := g.sc.ntmp
+	defer func() { g.sc.ntmp = mark }()
+	c, err := g.utf8Slot(content)
+	if err != nil {
+		return err
+	}
+	p, err := g.utf8Slot(path)
+	if err != nil {
+		return err
+	}
+	fd, put := g.tmp(), g.tmp()
+	fail, failClose, loop, finished, done := g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel(), g.newLabel()
+	g.li(rvA0, -100)
+	g.ldx(rvA1, rvS0, p)
+	g.addi(rvA1, rvA1, 8)
+	g.li(rvA2, linuxOpenWrite)
+	g.li(rvA3, linuxFileMode)
+	g.li(rvA7, rvSysOpenat)
+	g.ecall()
+	g.br(4, rvA0, 0, fail)
+	g.sdx(rvA0, rvS0, fd)
+	g.sdx(0, rvS0, put)
+	g.bind(loop)
+	g.ldx(rvA1, rvS0, c)
+	g.ld(rvA2, rvA1, 0)
+	g.ldx(rvT0, rvS0, put)
+	g.op(0x20, 0, rvA2, rvA2, rvT0)
+	g.beqz(rvA2, finished)
+	g.addi(rvA1, rvA1, 8)
+	g.add(rvA1, rvA1, rvT0)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysWrite)
+	g.ecall()
+	g.br(5, 0, rvA0, failClose)
+	g.ldx(rvT0, rvS0, put)
+	g.add(rvT0, rvT0, rvA0)
+	g.sdx(rvT0, rvS0, put)
+	g.j(loop)
+	g.bind(finished)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysClose)
+	g.ecall()
+	g.ldx(rvA0, rvS0, put)
+	g.fromI64()
+	g.j(done)
+	g.bind(failClose)
+	g.ldx(rvA0, rvS0, fd)
+	g.li(rvA7, rvSysClose)
+	g.ecall()
+	g.bind(fail)
+	g.ioError()
+	g.bind(done)
+	return nil
 }
 
 // sockaddr writes a sockaddr_in for 127.0.0.1 (or INADDR_ANY when any) and

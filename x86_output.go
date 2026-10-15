@@ -3,7 +3,8 @@ package main
 // Buffered standard output for Linux x86-64. Writes collect in a 64 KiB
 // buffer (mapped on first use) and reach fd 1 when it fills, at every exit,
 // before anything else writes (stderr, C code, a forked child) and, when
-// stdout is a terminal, at the end of each line.
+// stdout is a terminal, at the end of each line. While the stderr switch is
+// on, writes go straight to fd 2 instead.
 
 import "slices"
 
@@ -31,10 +32,21 @@ func (fc *TimCompiler) emitFlushStdout() {
 	fc.out.CallSymbol("_tim_flush")
 }
 
+// emitToStderr compiles print, println or printf with their output going to
+// stderr, after anything buffered for stdout.
+func (fc *TimCompiler) emitToStderr(call *CallExpr) {
+	fc.emitFlushStdout()
+	fc.out.LeaSymbolToReg("rax", "_tim_out_state")
+	fc.out.MovImmToMem(1, "rax", 24)
+	fc.compileCall(call)
+	fc.out.LeaSymbolToReg("rax", "_tim_out_state")
+	fc.out.MovImmToMem(0, "rax", 24)
+}
+
 func (fc *TimCompiler) generateOutputBuffer() {
 	// state: [0] bytes buffered, [8] mode (0 unset, 1 buffered, 2 terminal),
-	// [16] buffer address
-	fc.eb.DefineWritable("_tim_out_state", string(make([]byte, 24)))
+	// [16] buffer address, [24] nonzero to write to stderr
+	fc.eb.DefineWritable("_tim_out_state", string(make([]byte, 32)))
 
 	fc.eb.MarkLabel("_tim_flush")
 	done := fc.newNumLabel()
@@ -63,8 +75,16 @@ func (fc *TimCompiler) generateOutputBuffer() {
 	for _, r := range saved {
 		fc.out.PushReg(r)
 	}
-	ready, fits, out, buffered := fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel()
+	ready, fits, out, buffered, stdout := fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel(), fc.newNumLabel()
 	fc.out.LeaSymbolToReg("r8", "_tim_out_state")
+	fc.out.MovMemToReg("rax", "r8", 24)
+	fc.out.TestRegReg("rax", "rax")
+	stdout.jcc(JumpEqual)
+	fc.out.MovImmToReg("rdi", "2")
+	fc.out.MovImmToReg("rax", "1")
+	fc.out.Syscall()
+	out.jmp()
+	stdout.bind()
 	fc.out.MovMemToReg("rax", "r8", 8)
 	fc.out.TestRegReg("rax", "rax")
 	ready.jcc(JumpNotEqual)

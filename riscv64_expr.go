@@ -752,6 +752,8 @@ func (g *rvGen) cast(e *CastExpr) error {
 	case "bool", "boolean", "cbool":
 		g.truthyFA0()
 		g.fcvtDL(rvFA0, rvA0)
+	case "cstr", "cstring":
+		g.numCall(valCStr)
 	}
 	return nil
 }
@@ -1228,7 +1230,8 @@ func (g *rvGen) callValue(callee Expression, args []Expression, _ Expression) er
 	return nil
 }
 
-// emitClosureCall calls the closure in a0 with arguments already in fa0...
+// emitClosureCall calls the closure in a0 with its arguments in fa0 and up.
+// Calling a value that is not a function gives the value.
 func (g *rvGen) emitClosureCall() {
 	bad, done := g.newLabel(), g.newLabel()
 	g.boxTest(rvA0, rvT0, bad)
@@ -1239,7 +1242,7 @@ func (g *rvGen) emitClosureCall() {
 	g.jalr(rvRA, rvT0, 0)
 	g.j(done)
 	g.bind(bad)
-	g.number(0)
+	g.fmvDX(rvFA0, rvA0)
 	g.bind(done)
 }
 

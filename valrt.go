@@ -45,6 +45,7 @@ const (
 	valLog
 	valLog10
 	valCmp
+	valCStr
 )
 
 const valAbsent = 0x7FFC0000DEAD0001

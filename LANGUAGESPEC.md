@@ -465,7 +465,7 @@ Use `as` for explicit type casts at FFI boundaries:
 
 ```tim
 x as int32      // Cast to C int32
-ptr as cstr     // Cast to C string pointer
+ptr as cstr     // The NUL-terminated string at a C address
 val as float64  // Cast to C double
 ```
 
@@ -570,10 +570,6 @@ not no          // yes
 
 **Type conversions:**
 ```tim
-// To C strings
-yes as cstr     // "true"
-no as cstr      // "false"
-
 // To C bool
 yes as cbool    // true
 no as cbool     // false
@@ -1319,6 +1315,20 @@ flags := sdl.SDL_INIT_VIDEO
 window := sdl.SDL_CreateWindow("Title", 640, 480, flags)
 ```
 
+Arguments and results convert at the boundary:
+
+- A string passed to a pointer parameter (`char*`, `void*`, …) is passed as
+  its NUL-terminated UTF-8 bytes; a number passed to one is an address.
+- A `char*` result is a Tim string, and NULL is 0, so `c.getenv("HOME") or! ""`
+  and `for c.fgets(buf, 256, f) != 0 ! 1000 { … }` read naturally.
+- `p as cstr` reads the NUL-terminated string at the address `p`, such as a
+  buffer filled by C: `str(buf as cstr)`.
+- Narrow integer results (`int`, `char`, `bool`, …) are sign- or
+  zero-extended as their type says.
+- Functions called as `c.f` are described by the C library's own headers
+  (`stdio.h`, `stdlib.h`, `string.h`, `math.h`, `ctype.h`, `unistd.h`,
+  `time.h`).
+
 ## Import and Export System
 
 Tim provides a unified import system for libraries, git repositories, and local files. The export system controls function visibility and namespace requirements.
@@ -1937,9 +1947,13 @@ printa(x)           // Atomic print (thread-safe)
 printf(fmt, ...)    // Formatted print to stdout
 
 // Standard error (stderr) - Returns Result with error code "out"
-eprintln(x)         // Print with newline to stderr, returns Result
-eprint(x)           // Print without newline to stderr, returns Result
-eprintf(fmt, ...)   // Formatted print to stderr, returns Result
+eprintln(x, ...)    // println to stderr, returns Result
+eprint(x, ...)      // print to stderr, returns Result
+eprintf(fmt, ...)   // printf to stderr, returns Result
+
+// Files - a file that cannot be read or written gives the error "io"
+read_file(path)          // The whole file as a string
+write_file(path, text)   // Replaces the file; the number of bytes written
 
 // Quick exit error printing - Print to stderr and exit(1)
 exitln(x)           // Print with newline to stderr and exit(1)

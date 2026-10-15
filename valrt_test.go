@@ -33,7 +33,7 @@ func TestValrtOpcodesMatchC(t *testing.T) {
 		"V_POPCOUNT": valPopcount, "V_CLZ": valClz, "V_CTZ": valCtz, "V_SIN": valSin,
 		"V_COS": valCos, "V_TAN": valTan, "V_ASIN": valAsin, "V_ACOS": valAcos,
 		"V_ATAN": valAtan, "V_ATAN2": valAtan2, "V_EXP": valExp, "V_LOG": valLog,
-		"V_LOG10": valLog10, "V_CMP": valCmp,
+		"V_LOG10": valLog10, "V_CMP": valCmp, "V_CSTR": valCStr,
 	}
 	if len(names) != len(want) {
 		t.Fatalf("C has %d ops, Go has %d", len(names), len(want))

@@ -53,6 +53,16 @@ func floatCastBits(t string) uint64 {
 	return 0
 }
 
+// errorValueBits is the error value with a code of up to three characters,
+// laid out as the runtime's error() does.
+func errorValueBits(code string) uint64 {
+	bits := uint64(0x7FF8000000000000)
+	for i := 0; i < 3 && i < len(code); i++ {
+		bits |= uint64(code[i]) << (24 - 8*i)
+	}
+	return bits
+}
+
 // intCastKind encodes an integer type for numOpIntCast and numOpIntWrap: its
 // width in bits, plus 256 when it is signed.
 func intCastKind(t string) (uint64, bool) {

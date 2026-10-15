@@ -113,14 +113,16 @@ func (eb *ExecutableBuilder) WriteCompleteDynamicELF(ds *DynamicSections, functi
 	currentOffset += uint64((ds.hash.Len() + 7) & ^7)
 	currentAddr += uint64((ds.hash.Len() + 7) & ^7)
 
-	// .rela.plt
+	// .rela.plt: the relocations are added below, one Elf64_Rela (24 bytes)
+	// per imported function, so reserve their space now.
+	relaSize := max(ds.rela.Len(), 24*len(functions))
 	layout["rela"] = struct {
 		offset uint64
 		addr   uint64
 		size   int
-	}{currentOffset, currentAddr, ds.rela.Len()}
-	currentOffset += uint64((ds.rela.Len() + 7) & ^7)
-	currentAddr += uint64((ds.rela.Len() + 7) & ^7)
+	}{currentOffset, currentAddr, relaSize}
+	currentOffset += uint64((relaSize + 7) & ^7)
+	currentAddr += uint64((relaSize + 7) & ^7)
 
 	// Keep page alignment for compatibility with dynamic linker
 	// (tried 16-byte alignment but causes segfault in mprotect)
@@ -321,14 +323,7 @@ func (eb *ExecutableBuilder) WriteCompleteDynamicELF(ds *DynamicSections, functi
 	if VerboseMode {
 		fmt.Fprintf(os.Stderr, "Updating relocations with final GOT base 0x%x\n", gotAddr)
 	}
-	for i := range functions {
-		oldGotEntryAddr := gotBase + uint64(24+i*8)
-		newGotEntryAddr := gotAddr + uint64(24+i*8)
-		if VerboseMode {
-			fmt.Fprintf(os.Stderr, "  %s: reloction 0x%x -> 0x%x\n", functions[i], oldGotEntryAddr, newGotEntryAddr)
-		}
-		ds.updateRelocationAddress(oldGotEntryAddr, newGotEntryAddr)
-	}
+	ds.setRelocationOffsets(gotAddr + 24)
 
 	rodataOffset := gotOffset + uint64((ds.got.Len()+7) & ^7)
 	rodataAddr = gotAddr + uint64((ds.got.Len()+7) & ^7)

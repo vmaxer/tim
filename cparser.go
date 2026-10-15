@@ -4,6 +4,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"regexp"
 	"strconv"
 	"strings"
 	"unicode"
@@ -410,119 +411,172 @@ func (p *CParser) parseDefine(content string) {
 	}
 }
 
-// evalConstant evaluates a constant expression
+// evalConstant evaluates a C integer constant expression: literals, other
+// constants, casts, wrapper macros like SDL_UINT64_C(x) and the arithmetic,
+// shift, bitwise, comparison and logical operators.
 func (p *CParser) evalConstant(expr string) (int64, bool) {
-	expr = strings.TrimSpace(expr)
+	e := &cConstExpr{toks: cConstTokens.FindAllString(expr, -1), consts: p.results.Constants}
+	v, ok := e.binary(0)
+	return int64(v), ok && e.pos == len(e.toks)
+}
 
-	// Remove type suffixes
-	expr = strings.TrimSuffix(expr, "u")
-	expr = strings.TrimSuffix(expr, "U")
-	expr = strings.TrimSuffix(expr, "l")
-	expr = strings.TrimSuffix(expr, "L")
-	expr = strings.TrimSuffix(expr, "ul")
-	expr = strings.TrimSuffix(expr, "UL")
-	expr = strings.TrimSuffix(expr, "ll")
-	expr = strings.TrimSuffix(expr, "LL")
-	expr = strings.TrimSuffix(expr, "ull")
-	expr = strings.TrimSuffix(expr, "ULL")
+var cConstTokens = regexp.MustCompile(`0[xX][0-9a-fA-F]+[uUlL]*|0[bB][01]+[uUlL]*|[0-9]+[uUlL]*|[A-Za-z_][A-Za-z0-9_]*|<<|>>|<=|>=|==|!=|&&|\|\||[-+*/%&|^~!<>()?:,]`)
 
-	// Try hex number
-	if strings.HasPrefix(expr, "0x") || strings.HasPrefix(expr, "0X") {
-		if val, err := strconv.ParseInt(expr[2:], 16, 64); err == nil {
-			return val, true
+type cConstExpr struct {
+	toks   []string
+	pos    int
+	consts map[string]int64
+}
+
+func (e *cConstExpr) peek() string {
+	if e.pos < len(e.toks) {
+		return e.toks[e.pos]
+	}
+	return ""
+}
+
+var cConstPrec = map[string]int{
+	"||": 1, "&&": 2, "|": 3, "^": 4, "&": 5, "==": 6, "!=": 6,
+	"<": 7, ">": 7, "<=": 7, ">=": 7, "<<": 8, ">>": 8, "+": 9, "-": 9, "*": 10, "/": 10, "%": 10,
+}
+
+func (e *cConstExpr) binary(min int) (uint64, bool) {
+	l, ok := e.unary()
+	for ok {
+		op := e.peek()
+		prec := cConstPrec[op]
+		if prec == 0 || prec <= min {
+			break
 		}
-	}
-
-	// Try binary number
-	if strings.HasPrefix(expr, "0b") || strings.HasPrefix(expr, "0B") {
-		if val, err := strconv.ParseInt(expr[2:], 2, 64); err == nil {
-			return val, true
+		e.pos++
+		var r uint64
+		if r, ok = e.binary(prec); !ok {
+			break
 		}
+		l, ok = cConstApply(op, l, r)
 	}
+	return l, ok
+}
 
-	// Try decimal number
-	if val, err := strconv.ParseInt(expr, 10, 64); err == nil {
-		return val, true
-	}
-
-	// Try to resolve reference to another constant
-	if val, ok := p.results.Constants[expr]; ok {
-		return val, true
-	}
-
-	// Try to handle function-like macro calls (e.g., SDL_UINT64_C(0x20))
-	if idx := strings.Index(expr, "("); idx != -1 && strings.HasSuffix(expr, ")") {
-		macroName := strings.TrimSpace(expr[:idx])
-		argsStr := expr[idx+1 : len(expr)-1]
-
-		// Common SDL/library macros that just wrap their arguments
-		wrapperMacros := map[string]bool{
-			"SDL_UINT64_C": true,
-			"SDL_SINT64_C": true,
-			"UINT64_C":     true,
-			"INT64_C":      true,
-			"SDL_FOURCC":   true, // SDL_FOURCC(A,B,C,D) - would need special handling
+func cConstApply(op string, l, r uint64) (uint64, bool) {
+	b := func(x bool) uint64 {
+		if x {
+			return 1
 		}
-
-		if wrapperMacros[macroName] {
-			// For wrapper macros, just evaluate the argument
-			return p.evalConstant(argsStr)
+		return 0
+	}
+	switch op {
+	case "+":
+		return l + r, true
+	case "-":
+		return l - r, true
+	case "*":
+		return l * r, true
+	case "/", "%":
+		if r == 0 {
+			return 0, false
 		}
-
-		// If it's not a known wrapper, treat it as a simple parenthesized expression
-		return p.evalConstant(argsStr)
-	}
-
-	// Try simple expressions (parentheses)
-	if strings.HasPrefix(expr, "(") && strings.HasSuffix(expr, ")") {
-		return p.evalConstant(expr[1 : len(expr)-1])
-	}
-
-	// Try bitwise shift: value << shift
-	if before, after, ok := strings.Cut(expr, "<<"); ok {
-		left := strings.TrimSpace(before)
-		right := strings.TrimSpace(after)
-		leftVal, leftOk := p.evalConstant(left)
-		rightVal, rightOk := p.evalConstant(right)
-		if leftOk && rightOk {
-			return leftVal << uint(rightVal), true
+		if op == "/" {
+			return uint64(int64(l) / int64(r)), true
 		}
+		return uint64(int64(l) % int64(r)), true
+	case "<<":
+		return l << r, true
+	case ">>":
+		return l >> r, true
+	case "&":
+		return l & r, true
+	case "|":
+		return l | r, true
+	case "^":
+		return l ^ r, true
+	case "==":
+		return b(l == r), true
+	case "!=":
+		return b(l != r), true
+	case "<":
+		return b(int64(l) < int64(r)), true
+	case ">":
+		return b(int64(l) > int64(r)), true
+	case "<=":
+		return b(int64(l) <= int64(r)), true
+	case ">=":
+		return b(int64(l) >= int64(r)), true
+	case "&&":
+		return b(l != 0 && r != 0), true
+	case "||":
+		return b(l != 0 || r != 0), true
 	}
-
-	// Try bitwise shift: value >> shift
-	if before, after, ok := strings.Cut(expr, ">>"); ok {
-		left := strings.TrimSpace(before)
-		right := strings.TrimSpace(after)
-		leftVal, leftOk := p.evalConstant(left)
-		rightVal, rightOk := p.evalConstant(right)
-		if leftOk && rightOk {
-			return leftVal >> uint(rightVal), true
-		}
-	}
-
-	// Try bitwise OR: value | value
-	if before, after, ok := strings.Cut(expr, "|"); ok {
-		left := strings.TrimSpace(before)
-		right := strings.TrimSpace(after)
-		leftVal, leftOk := p.evalConstant(left)
-		rightVal, rightOk := p.evalConstant(right)
-		if leftOk && rightOk {
-			return leftVal | rightVal, true
-		}
-	}
-
-	// Try bitwise AND: value & value
-	if before, after, ok := strings.Cut(expr, "&"); ok {
-		left := strings.TrimSpace(before)
-		right := strings.TrimSpace(after)
-		leftVal, leftOk := p.evalConstant(left)
-		rightVal, rightOk := p.evalConstant(right)
-		if leftOk && rightOk {
-			return leftVal & rightVal, true
-		}
-	}
-
 	return 0, false
+}
+
+func (e *cConstExpr) unary() (uint64, bool) {
+	tok := e.peek()
+	e.pos++
+	switch {
+	case tok == "-" || tok == "+" || tok == "~" || tok == "!":
+		v, ok := e.unary()
+		switch tok {
+		case "-":
+			v = -v
+		case "~":
+			v = ^v
+		case "!":
+			v = map[bool]uint64{true: 1, false: 0}[v == 0]
+		}
+		return v, ok
+	case tok == "(":
+		if e.isCast() {
+			for e.peek() != ")" {
+				e.pos++
+			}
+			e.pos++
+			return e.unary()
+		}
+		v, ok := e.binary(0)
+		if e.peek() != ")" {
+			return 0, false
+		}
+		e.pos++
+		return v, ok
+	case tok != "" && tok[0] >= '0' && tok[0] <= '9':
+		digits := strings.TrimRight(tok, "uUlL")
+		v, err := strconv.ParseUint(digits, 0, 64)
+		if strings.HasPrefix(digits, "0b") || strings.HasPrefix(digits, "0B") {
+			v, err = strconv.ParseUint(digits[2:], 2, 64)
+		}
+		return v, err == nil
+	case tok != "" && (tok[0] == '_' || unicode.IsLetter(rune(tok[0]))):
+		if e.peek() == "(" {
+			e.pos++
+			v, ok := e.binary(0)
+			if e.peek() != ")" {
+				return 0, false
+			}
+			e.pos++
+			return v, ok
+		}
+		v, ok := e.consts[tok]
+		return uint64(v), ok
+	}
+	return 0, false
+}
+
+// isCast reports whether the tokens after a '(' are a type name, identifiers
+// and '*' that are not constants, closed by ')' and followed by an operand.
+func (e *cConstExpr) isCast() bool {
+	i := e.pos
+	for ; i < len(e.toks) && e.toks[i] != ")"; i++ {
+		t := e.toks[i]
+		if _, isConst := e.consts[t]; isConst || t != "*" && t[0] != '_' && !unicode.IsLetter(rune(t[0])) {
+			return false
+		}
+	}
+	if i == e.pos || i+1 >= len(e.toks) {
+		return false
+	}
+	next := e.toks[i+1]
+	return strings.Contains("(-+~!", next) || next[0] == '_' || unicode.IsLetter(rune(next[0])) || next[0] >= '0' && next[0] <= '9'
 }
 
 // tryParseFunctionDecl attempts to parse a function declaration

@@ -1783,7 +1783,9 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 		// Check if it's a global variable
 		if _, isGlobal := fc.globalVars[s.Name]; isGlobal {
 			// Compile the value
-			fc.currentAssignName = s.Name
+			if _, isLambda := s.Value.(*LambdaExpr); isLambda {
+				fc.currentAssignName = s.Name
+			}
 			fc.compileExpression(s.Value)
 			fc.currentAssignName = ""
 			// Store to .data section
@@ -1806,7 +1808,9 @@ func (fc *TimCompiler) compileStatement(stmt Statement) {
 				fc.runtimeStack += 16
 			}
 
-			fc.currentAssignName = s.Name
+			if _, isLambda := s.Value.(*LambdaExpr); isLambda {
+				fc.currentAssignName = s.Name
+			}
 			fc.compileExpression(s.Value)
 			fc.currentAssignName = ""
 
@@ -3889,55 +3893,6 @@ func (fc *TimCompiler) patchJumpImmediate(pos int, offset int32) {
 	}
 }
 
-// isCFFIStringCall returns true if the expression is a C FFI call that returns char*
-func (fc *TimCompiler) isCFFIStringCall(expr Expression) bool {
-	callExpr, ok := expr.(*CallExpr)
-	if !ok {
-		return false
-	}
-
-	funcName := callExpr.Function
-
-	// Check if this is a namespaced C FFI function call (contains dot)
-	if strings.Contains(funcName, ".") {
-		parts := strings.Split(funcName, ".")
-		if len(parts) != 2 {
-			return false
-		}
-		alias := parts[0]
-		funcName = parts[1]
-
-		// Look up in parsed headers
-		// NOTE: cConstants is keyed by alias, not library name
-		// e.g., for "import sdl3 as sdl", the key is "sdl"
-		if nsHeader, exists := fc.cConstants[alias]; exists {
-			if funcSig, exists := nsHeader.Functions[funcName]; exists {
-				// Check if return type is char*
-				returnType := strings.ReplaceAll(strings.TrimSpace(funcSig.ReturnType), " ", "")
-				if VerboseMode {
-					fmt.Fprintf(os.Stderr, "isCFFIStringCall: %s.%s -> %s\n", alias, funcName, returnType)
-				}
-				return returnType == "char*" || returnType == "constchar*"
-			}
-		}
-	} else if !callExpr.IsCFFI {
-		return false
-	}
-
-	// Fallback: use naming heuristics for common patterns
-	// This is a reasonable approximation when headers can't be parsed
-	// Functions returning strings typically follow naming conventions
-	if strings.Contains(funcName, "GetError") ||
-		strings.Contains(funcName, "GetString") ||
-		strings.HasSuffix(funcName, "Error") ||
-		strings.HasPrefix(funcName, "strerror") {
-		return true
-	}
-
-	// No signature found, and doesn't match naming pattern
-	return false
-}
-
 // getExprType returns the type of an expression at compile time
 // Returns: "string", "number", "list", "map", "cstring", or "unknown"
 func (fc *TimCompiler) getExprType(expr Expression) string {
@@ -4012,9 +3967,6 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		if e.Function == "str" {
 			return "string"
 		}
-		if fc.isCFFIStringCall(e) {
-			return "cstring"
-		}
 		if rt := fc.inferCallReturnType(e.Function); rt != "" && rt != "unknown" {
 			return rt
 		}
@@ -4023,7 +3975,7 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 			case "malloc", "realloc", "calloc", "fopen":
 				return "cpointer"
 			case "getenv", "strerror":
-				return "cstring"
+				return "unknown"
 			}
 			return "number"
 		}
@@ -4043,7 +3995,7 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 
 							// Map C return types to Tim types
 							if returnType == "char*" || returnType == "constchar*" {
-								return "cstring"
+								return "unknown"
 							} else if isPointerType(returnType) {
 								return "cpointer"
 							} else if returnType == "void" {
@@ -4135,7 +4087,7 @@ func (fc *TimCompiler) getExprType(expr Expression) string {
 		case "string", "str":
 			return "string"
 		case "cstr", "cstring":
-			return "cstring"
+			return "unknown"
 		case "list":
 			return "list"
 		case "map":
@@ -5105,6 +5057,24 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		fc.inTailPosition = false
 		defer func() { fc.inTailPosition = savedTailPosition }()
 
+		// and/or evaluate the right side only when the left does not decide
+		if e.Operator == "and" || e.Operator == "or" {
+			done := fc.newNumLabel()
+			fc.compileExpression(e.Left)
+			fc.emitTruthy("xmm0", "xmm2", "rax")
+			fc.out.TestRegReg("rax", "rax")
+			if e.Operator == "and" {
+				done.jcc(JumpEqual)
+			} else {
+				done.jcc(JumpNotEqual)
+			}
+			fc.compileExpression(e.Right)
+			fc.emitTruthy("xmm0", "xmm2", "rax")
+			done.bind()
+			fc.out.Cvtsi2sd("xmm0", "rax")
+			break
+		}
+
 		// Special handling for or! operator (railway-oriented programming)
 		// or! requires conditional execution: only evaluate right side if left is error/null
 		if e.Operator == "or!" {
@@ -5963,6 +5933,7 @@ func (fc *TimCompiler) compileExpression(expr Expression) {
 		var funcName string
 		if fc.currentAssignName != "" {
 			funcName = fc.currentAssignName
+			fc.currentAssignName = ""
 		} else {
 			fc.lambdaCounter++
 			funcName = fmt.Sprintf("lambda_%d", fc.lambdaCounter)
@@ -6539,55 +6510,8 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 		// Convert C return value to Tim number (identity, already float64)
 		// This is a no-op but explicit for FFI clarity
 
-	case "cstr":
-		// Check if this is a boolean
-		exprType := fc.getExprType(expr.Expr)
-		if exprType == "cstring" || exprType == "cstr" || exprType == "cpointer" {
-			return
-		}
-		if exprType == "bool" {
-			// Convert boolean to C string ("true" or "false")
-			fc.out.Cvttsd2si("rcx", "xmm0") // 1 for yes, 0 for no
-
-			// Create "true" or "false" C string
-			trueLabel := fmt.Sprintf("bool_true_cstr_%d", fc.stringCounter)
-			falseLabel := fmt.Sprintf("bool_false_cstr_%d", fc.stringCounter)
-			fc.stringCounter++
-			fc.eb.Define(trueLabel, "true\x00")
-			fc.eb.Define(falseLabel, "false\x00")
-
-			// Load appropriate string based on value
-			fc.out.CmpRegToImm("rcx", 0)
-			fc.out.Write(0x74) // JE (jump if zero/no)
-			fc.out.Write(0x00) // Placeholder
-			falseJump := fc.eb.text.Len() - 1
-
-			// yes: load "true"
-			fc.out.LeaSymbolToReg("rax", trueLabel)
-			fc.out.Write(0xEB) // JMP
-			fc.out.Write(0x00) // Placeholder
-			doneJump := fc.eb.text.Len() - 1
-
-			// no: load "false"
-			falsePos := fc.eb.text.Len()
-			fc.eb.text.Bytes()[falseJump] = byte(falsePos - (falseJump + 1))
-			fc.out.LeaSymbolToReg("rax", falseLabel)
-
-			// Done
-			donePos := fc.eb.text.Len()
-			fc.eb.text.Bytes()[doneJump] = byte(donePos - (doneJump + 1))
-
-			fc.out.Cvtsi2sd("xmm0", "rax")
-			return
-		}
-
-		// Convert Tim string to C null-terminated string
-		// xmm0 contains pointer to Tim string map
-		// Call runtime function: _tim_string_to_cstr(xmm0) -> rax
-		fc.trackFunctionCall("_tim_string_to_cstr")
-		fc.trackFunctionCall("_tim_string_to_cstr")
-		fc.out.CallSymbol("_tim_string_to_cstr")
-		fc.out.Cvtsi2sd("xmm0", "rax")
+	case "cstr", "cstring":
+		fc.emitNumCall(valCStr)
 
 	case "string", "str":
 		// Convert value to Tim string
@@ -6599,10 +6523,8 @@ func (fc *TimCompiler) compileCastExpr(expr *CastExpr) {
 			return
 		}
 
-		if exprType == "cstring" || exprType == "cstr" || exprType == "cpointer" {
-			fc.out.Cvttsd2si("rdi", "xmm0")
-			fc.trackFunctionCall("_tim_cstr_to_string")
-			fc.out.CallSymbol("_tim_cstr_to_string")
+		if exprType == "cpointer" {
+			fc.emitNumCall(valCStr)
 			return
 		}
 
@@ -10363,6 +10285,56 @@ func (fc *TimCompiler) generateArenaEnsureCapacity() {
 	fc.callFunction("exit", "")
 }
 
+// emitUnlessFunction jumps to notFn, leaving xmm0 alone, unless xmm0 holds a
+// closure: a [code][environment] pair whose environment is NULL or follows
+// it. Clobbers rax, rcx and rdx.
+func (fc *TimCompiler) emitUnlessFunction(notFn *numLabel) {
+	isFn := fc.newNumLabel()
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.MovRegToReg("rcx", "rax")
+	fc.out.ShrRegByImm("rcx", 48)
+	fc.out.TestRegReg("rcx", "rcx")
+	notFn.jcc(JumpNotEqual)
+	fc.out.TestRegReg("rax", "rax")
+	notFn.jcc(JumpEqual)
+	fc.out.MovMemToReg("rcx", "rax", 0)
+	fc.out.TestRegReg("rcx", "rcx")
+	notFn.jcc(JumpEqual)
+	fc.out.ShrRegByImm("rcx", 52)
+	notFn.jcc(JumpNotEqual)
+	fc.out.MovMemToReg("rdx", "rax", 8)
+	fc.out.TestRegReg("rdx", "rdx")
+	isFn.jcc(JumpEqual)
+	fc.out.LeaMemToReg("rcx", "rax", 16)
+	fc.out.CmpRegToReg("rdx", "rcx")
+	notFn.jcc(JumpNotEqual)
+	isFn.bind()
+}
+
+// emitCPointer converts xmm0 to a C pointer argument in rax: a string is its
+// NUL-terminated UTF-8 bytes, another container its address and a number an
+// address.
+func (fc *TimCompiler) emitCPointer() {
+	number, done := fc.newNumLabel(), fc.newNumLabel()
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.MovRegToReg("rcx", "rax")
+	fc.out.ShrRegByImm("rcx", 52)
+	number.jcc(JumpNotEqual)
+	fc.out.TestRegReg("rax", "rax")
+	done.jcc(JumpEqual)
+	fc.out.MovMemToReg("rdx", "rax", 0)
+	fc.out.MovImmToReg("rcx", fmt.Sprint(int64(math.Float64bits(tagString))))
+	fc.out.CmpRegToReg("rdx", "rcx")
+	done.jcc(JumpNotEqual)
+	fc.emitNumCall(valUTF8)
+	fc.out.MovqXmmToReg("rax", "xmm0")
+	fc.out.AddImmToReg("rax", 8)
+	done.jmp()
+	number.bind()
+	fc.emitNumToI64()
+	done.bind()
+}
+
 func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
 	// Callable if it has a known function signature, or it holds a closure
 	// returned from a closure-returning function (`counter = make_counter(0)`);
@@ -10373,14 +10345,13 @@ func (fc *TimCompiler) compileStoredFunctionCall(call *CallExpr) {
 		debugf("DEBUG compileStoredFunctionCall: function='%s', isCallable=%v, args=%d\n", call.Function, isCallable, len(call.Args))
 	}
 
-	// If calling a non-function value with no args, just return the value
-	if !isCallable && len(call.Args) == 0 {
-		fc.compileExpression(&IdentExpr{Name: call.Function})
-		return
-	}
-
-	// Load closure object pointer from variable
+	// Calling a value that is not a function with no arguments gives the value
 	fc.compileExpression(&IdentExpr{Name: call.Function})
+	if !isCallable && len(call.Args) == 0 {
+		notFn := fc.newNumLabel()
+		fc.emitUnlessFunction(notFn)
+		defer notFn.bind()
+	}
 
 	// Convert function pointer from float64 to integer in rax
 	fc.out.SubImmFromReg("rsp", 16)
@@ -10880,19 +10851,16 @@ func (fc *TimCompiler) compileDirectCall(call *DirectCallExpr) {
 		}
 
 		if !isCallable {
-			if VerboseMode {
-				debugf("DEBUG: Calling a plain value - just returning the value\n")
-			}
 			fc.compileExpression(call.Callee)
-			return
+			notFn := fc.newNumLabel()
+			fc.emitUnlessFunction(notFn)
+			defer notFn.bind()
+		} else {
+			fc.compileExpression(call.Callee)
 		}
-		if VerboseMode {
-			debugf("DEBUG: Calling a lambda with 0 args - will dereference and call\n")
-		}
+	} else {
+		fc.compileExpression(call.Callee)
 	}
-
-	// Compile the callee expression (e.g., a lambda) to get function pointer
-	fc.compileExpression(call.Callee) // Result in xmm0 (function pointer as float64)
 
 	// Convert function pointer from float64 to integer in rax
 	fc.out.SubImmFromReg("rsp", StackSlotSize)
@@ -11398,8 +11366,7 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 
 		// If still not found, use hardcoded signatures for common C functions
 		if funcSig == nil {
-			commonFunctions := commonCFunctions
-			if sig, ok := commonFunctions[funcName]; ok {
+			if sig := libcSignature(funcName); sig != nil {
 				funcSig = sig
 				if VerboseMode {
 					fmt.Fprintf(os.Stderr, "Using hardcoded signature for %s: %d params, return=%s\n",
@@ -11498,10 +11465,10 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 						info.castType = "double"
 					}
 				} else if paramType != "" {
-					if isPointerType(paramType) {
-						info.castType = "pointer"
-					} else if strings.Contains(paramType, "char") && strings.Contains(paramType, "*") {
+					if strings.Contains(paramType, "char") && strings.Contains(paramType, "*") {
 						info.castType = "cstr"
+					} else if isPointerType(paramType) {
+						info.castType = "pointer"
 					} else {
 						info.castType = "int"
 					}
@@ -11599,36 +11566,9 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 			} else {
 				// Convert to integer or pointer
 				switch castType {
-				case "cstr", "cstring":
-					if isNullPointer {
-						// Already set rax to 0 above
-					} else if isStringLiteral {
-						// String literal was compiled as C string - rax already contains the pointer
-						// No conversion needed, just store it
-					} else {
-						// Runtime string (Tim map format) - need to convert to C string
-						fc.out.SubImmFromReg("rsp", StackSlotSize)
-						fc.out.MovXmmToMem("xmm0", "rsp", 0)
-						fc.out.MovMemToReg("rax", "rsp", 0)
-						fc.out.AddImmToReg("rsp", StackSlotSize)
-
-						// Call _tim_string_to_cstr(map_ptr) -> char*
-						fc.out.SubImmFromReg("rsp", StackSlotSize)
-						fc.out.MovRegToMem("rax", "rsp", 0)
-						fc.out.MovMemToReg("rdi", "rsp", 0)
-						fc.out.AddImmToReg("rsp", StackSlotSize)
-						fc.trackFunctionCall("_tim_string_to_cstr")
-						fc.trackFunctionCall("_tim_string_to_cstr")
-						fc.out.CallSymbol("_tim_string_to_cstr")
-						// Result in rax (C string pointer)
-					}
-
-				case "ptr", "pointer":
-					if isNullPointer {
-						// Already set rax to 0 above
-					} else {
-						// Pointer type - convert float64 to integer pointer
-						fc.emitNumToI64()
+				case "cstr", "cstring", "ptr", "pointer":
+					if !isNullPointer && !isStringLiteral {
+						fc.emitCPointer()
 					}
 
 				case "int", "i32", "int32":
@@ -11790,44 +11730,7 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 			fmt.Fprintf(os.Stderr, "C function %s return type: %q (funcSig=%v)\n", funcName, returnType, funcSig != nil)
 		}
 
-		if returnType == "double" {
-			// Result is already in xmm0 as double.
-		} else if returnType == "float" {
-			// C float return uses low 32 bits of xmm0; widen to Tim float64.
-			if fc.eb.target.Arch() == ArchX86_64 {
-				// cvtss2sd xmm0, xmm0
-				fc.out.Write(0xF3)
-				fc.out.Write(0x0F)
-				fc.out.Write(0x5A)
-				fc.out.Write(0xC0)
-			}
-		} else if returnType == "void" {
-			// Void return - set xmm0 to 0
-			fc.out.XorpdXmm("xmm0", "xmm0")
-		} else if isPointerType(returnType) || returnType == "" {
-			// Pointer type - keep raw integer value but convert to float64 for Tim
-			// (Tim internally represents everything as float64)
-			// On Windows and Linux, pointers are 64-bit and returned in RAX correctly
-			// NOTE: When signature is unknown (returnType == ""), assume pointer/64-bit return
-			// This is safer than assuming 32-bit, and works for SDL functions
-			fc.out.Cvtsi2sd("xmm0", "rax")
-		} else {
-			// Integer result in rax - convert to float64 for Tim
-			// On Windows: bool returns are 1 byte (AL), int returns are 4 bytes (EAX)
-			// Zero-extend to 64-bit RAX to avoid garbage in upper bits
-			if fc.eb.target.OS() == OSWindows {
-				// Check if this is a bool return (1 byte in AL)
-				if returnType == "bool" || returnType == "_Bool" {
-					// movzx eax, al (zero-extend 8-bit AL to 32-bit EAX, then to RAX)
-					fc.out.MovzxRegReg("eax", "al")
-				} else {
-					// For int/int32/etc returns: use EAX directly (upper 32 bits of RAX auto-zeroed)
-					// mov eax, eax (zero-extends EAX to 64-bit RAX)
-					fc.out.MovRegToReg("eax", "eax")
-				}
-			}
-			fc.out.Cvtsi2sd("xmm0", "rax")
-		}
+		fc.emitCReturn(returnType)
 	} else {
 		// No arguments - just call the function
 		// Allocate shadow space for Windows x64 calling convention
@@ -11844,44 +11747,88 @@ func (fc *TimCompiler) compileCFunctionCall(libName string, funcName string, arg
 			returnType = funcSig.ReturnType
 		}
 
-		if returnType == "double" {
-			// Result is already in xmm0 as double.
-		} else if returnType == "float" {
-			// C float return uses low 32 bits of xmm0; widen to Tim float64.
-			if fc.eb.target.Arch() == ArchX86_64 {
-				// cvtss2sd xmm0, xmm0
-				fc.out.Write(0xF3)
-				fc.out.Write(0x0F)
-				fc.out.Write(0x5A)
-				fc.out.Write(0xC0)
-			}
-		} else if returnType == "void" {
-			// Void return - set xmm0 to 0
-			fc.out.XorpdXmm("xmm0", "xmm0")
-		} else if isPointerType(returnType) || returnType == "" {
-			// Pointer type - keep raw integer value but convert to float64 for Tim
-			// (Tim internally represents everything as float64)
-			// On Windows and Linux, pointers are 64-bit and returned in RAX correctly
-			// NOTE: When signature is unknown (returnType == ""), assume pointer/64-bit return
-			// This is safer than assuming 32-bit, and works for SDL functions
-			fc.out.Cvtsi2sd("xmm0", "rax")
-		} else {
-			// Integer result in rax - convert to float64 for Tim
-			// On Windows: bool returns are 1 byte (AL), int returns are 4 bytes (EAX)
-			// Zero-extend to 64-bit RAX to avoid garbage in upper bits
-			if fc.eb.target.OS() == OSWindows {
-				// Check if this is a bool return (1 byte in AL)
-				if returnType == "bool" || returnType == "_Bool" {
-					// movzx eax, al (zero-extend 8-bit AL to 32-bit EAX, then to RAX)
-					fc.out.MovzxRegReg("eax", "al")
-				} else {
-					// For int/int32/etc returns: use EAX directly (upper 32 bits of RAX auto-zeroed)
-					// mov eax, eax (zero-extends EAX to 64-bit RAX)
-					fc.out.MovRegToReg("eax", "eax")
-				}
-			}
-			fc.out.Cvtsi2sd("xmm0", "rax")
+		fc.emitCReturn(returnType)
+	}
+}
+
+// cIntegerWidth gives the width and signedness of a C integer type narrower
+// than 64 bits, whose result the x86-64 ABI leaves with undefined upper bits.
+func cIntegerWidth(t string) (bits int, signed, ok bool) {
+	switch strings.Join(strings.Fields(strings.TrimPrefix(t, "const ")), " ") {
+	case "bool", "_Bool", "unsigned char", "uint8_t", "Uint8":
+		return 8, false, true
+	case "char", "signed char", "int8_t", "Sint8":
+		return 8, true, true
+	case "short", "short int", "signed short", "int16_t", "Sint16":
+		return 16, true, true
+	case "unsigned short", "unsigned short int", "uint16_t", "Uint16":
+		return 16, false, true
+	case "int", "signed", "signed int", "int32_t", "Sint32":
+		return 32, true, true
+	case "unsigned", "unsigned int", "uint32_t", "Uint32":
+		return 32, false, true
+	}
+	return 0, false, false
+}
+
+// narrowRAX extends the low bits of rax to all 64.
+func narrowRAX(bits int, signed bool) []byte {
+	switch {
+	case bits == 8 && signed:
+		return []byte{0x48, 0x0F, 0xBE, 0xC0} // movsx rax, al
+	case bits == 8:
+		return []byte{0x0F, 0xB6, 0xC0} // movzx eax, al
+	case bits == 16 && signed:
+		return []byte{0x48, 0x0F, 0xBF, 0xC0} // movsx rax, ax
+	case bits == 16:
+		return []byte{0x0F, 0xB7, 0xC0} // movzx eax, ax
+	case signed:
+		return []byte{0x48, 0x63, 0xC0} // movsxd rax, eax
+	}
+	return []byte{0x89, 0xC0} // mov eax, eax
+}
+
+// emitCReturn converts a C function's result to a Tim value in xmm0. A
+// string (char*) becomes a Tim string and NULL becomes 0.
+func (fc *TimCompiler) emitCReturn(returnType string) {
+	if t := strings.ReplaceAll(returnType, " ", ""); t == "char*" || t == "constchar*" {
+		null := fc.newNumLabel()
+		fc.out.MovqRegToXmm("xmm0", "rax")
+		fc.out.TestRegReg("rax", "rax")
+		null.jcc(JumpEqual)
+		fc.emitNumCall(valFromUTF8)
+		null.bind()
+		return
+	}
+	if returnType == "double" {
+		// Result is already in xmm0 as double.
+	} else if returnType == "float" {
+		// C float return uses low 32 bits of xmm0; widen to Tim float64.
+		if fc.eb.target.Arch() == ArchX86_64 {
+			// cvtss2sd xmm0, xmm0
+			fc.out.Write(0xF3)
+			fc.out.Write(0x0F)
+			fc.out.Write(0x5A)
+			fc.out.Write(0xC0)
 		}
+	} else if returnType == "void" {
+		// Void return - set xmm0 to 0
+		fc.out.XorpdXmm("xmm0", "xmm0")
+	} else if isPointerType(returnType) || returnType == "" {
+		// Pointer type - keep raw integer value but convert to float64 for Tim
+		// (Tim internally represents everything as float64)
+		// On Windows and Linux, pointers are 64-bit and returned in RAX correctly
+		// NOTE: When signature is unknown (returnType == ""), assume pointer/64-bit return
+		// This is safer than assuming 32-bit, and works for SDL functions
+		fc.out.Cvtsi2sd("xmm0", "rax")
+	} else {
+		// A narrow integer leaves the upper bits of rax undefined
+		if bits, signed, ok := cIntegerWidth(returnType); ok {
+			fc.out.Emit(narrowRAX(bits, signed))
+		} else if fc.eb.target.OS() == OSWindows {
+			fc.out.MovRegToReg("eax", "eax")
+		}
+		fc.out.Cvtsi2sd("xmm0", "rax")
 	}
 }
 
@@ -12107,113 +12054,11 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		return
 
 	case "_error_code_extract":
-		// Confidence that this function is working: 95%
-		// .error property - extract 4-letter error code from NaN-encoded Result
 		if len(call.Args) != 1 {
 			compilerError("_error_code_extract requires exactly 1 argument")
 		}
-		// Evaluate the argument to get the value in xmm0
 		fc.compileExpression(call.Args[0])
-
-		// Error values are quiet NaNs 0x7FF8_0000_cccc_cc00; boxed exact
-		// numbers are NaNs too, with other high bits, and have no error.
-		fc.out.MovqXmmToReg("rax", "xmm0")
-		fc.out.ShrRegByImm("rax", 48)
-		fc.out.CmpRegToImm("rax", 0x7FF8)
-		notNaNPos := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpNotEqual, 0)
-
-		// NaN path: extract error code from mantissa (low 32 bits)
-		fc.out.MovqXmmToReg("rax", "xmm0")          // Move float bits to GPR
-		fc.out.Emit([]byte{0x48, 0x25})             // and rax, immediate32
-		fc.out.Emit([]byte{0xff, 0xff, 0xff, 0xff}) // mask = 0xFFFFFFFF
-
-		// Convert 4-byte code to Tim string
-		// We need to create a string with up to 3 characters (strip null bytes)
-		// For simplicity, always create 3-char string (most error codes are 3 chars)
-
-		// Save error code in rbx (protected across the arena allocation)
-		fc.out.MovRegToReg("rbx", "rax")
-		fc.out.PushReg("rbx")
-
-		// Allocate string memory (tag + count + 3*16 bytes entries = 64 bytes)
-		// Use malloc for simplicity
-		fc.out.Emit([]byte{0x48, 0xc7, 0xc7, 0x40, 0x00, 0x00, 0x00}) // mov rdi, 64
-		// Allocate from arena
-		fc.callArenaAlloc()
-		fc.out.PopReg("rbx")
-		// rax now points to allocated memory
-		fc.out.MovRegToReg("rsi", "rax")
-
-		// rsi now points to our string
-		// Write tag = 1.0 (string), count = 3.0
-		fc.out.Emit([]byte{0x48, 0xb8})                                     // mov rax, immediate64
-		fc.out.Emit([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xf0, 0x3f}) // 1.0
-		fc.out.MovRegToMem("rax", "rsi", 0)
-		fc.out.Emit([]byte{0x48, 0xb8})                                     // mov rax, immediate64
-		fc.out.Emit([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x40}) // 3.0
-		fc.out.MovRegToMem("rax", "rsi", 8)
-
-		// Extract and write each character as map entry
-		// Entry 0: key=0, value=char0 (bits 31:24 of codeInt = first char)
-		fc.out.XorRegWithReg("rax", "rax") // key = 0
-		fc.out.MovRegToMem("rax", "rsi", 16)
-		fc.out.MovRegToReg("rax", "rbx")
-		fc.out.Emit([]byte{0x48, 0xc1, 0xe8, 0x18}) // shr rax, 24
-		fc.out.Emit([]byte{0x48, 0x25})             // and rax, 0xFF
-		fc.out.Emit([]byte{0xff, 0x00, 0x00, 0x00})
-		fc.out.Cvtsi2sd("xmm1", "rax")
-		fc.out.MovXmmToMem("xmm1", "rsi", 24)
-
-		// Entry 1: key=1, value=char1 (bits 23:16 of codeInt)
-		fc.out.Emit([]byte{0x48, 0xc7, 0xc0, 0x01, 0x00, 0x00, 0x00}) // mov rax, 1
-		fc.out.MovRegToMem("rax", "rsi", 32)
-		fc.out.MovRegToReg("rax", "rbx")
-		fc.out.Emit([]byte{0x48, 0xc1, 0xe8, 0x10}) // shr rax, 16
-		fc.out.Emit([]byte{0x48, 0x25})             // and rax, 0xFF
-		fc.out.Emit([]byte{0xff, 0x00, 0x00, 0x00})
-		fc.out.Cvtsi2sd("xmm1", "rax")
-		fc.out.MovXmmToMem("xmm1", "rsi", 40)
-
-		// Entry 2: key=2, value=char2 (bits 15:8 of codeInt)
-		fc.out.Emit([]byte{0x48, 0xc7, 0xc0, 0x02, 0x00, 0x00, 0x00}) // mov rax, 2
-		fc.out.MovRegToMem("rax", "rsi", 48)
-		fc.out.MovRegToReg("rax", "rbx")
-		fc.out.Emit([]byte{0x48, 0xc1, 0xe8, 0x08}) // shr rax, 8
-		fc.out.Emit([]byte{0x48, 0x25})             // and rax, 0xFF
-		fc.out.Emit([]byte{0xff, 0x00, 0x00, 0x00})
-		fc.out.Cvtsi2sd("xmm1", "rax")
-		fc.out.MovXmmToMem("xmm1", "rsi", 56)
-
-		// Return pointer to string in xmm0
-		fc.out.MovqRegToXmm("xmm0", "rsi")
-
-		// Jump over non-NaN path
-		donePos := fc.eb.text.Len()
-		fc.out.JumpUnconditional(0)
-
-		// Not NaN path: return empty string
-		notNaNTarget := fc.eb.text.Len()
-		fc.patchJumpImmediate(notNaNPos+2, int32(notNaNTarget-(notNaNPos+6)))
-
-		// Create empty string
-		labelName := fmt.Sprintf("empty_str_%d", fc.stringCounter)
-		fc.stringCounter++
-		var mapData []byte
-		mapData = append(mapData, f64le(tagString)...)
-		countBits := uint64(0) // count = 0
-		for i := range 8 {
-			mapData = append(mapData, byte((countBits>>(i*8))&ByteMask))
-		}
-		fc.eb.Define(labelName, string(mapData))
-		fc.out.LeaSymbolToReg("rax", labelName)
-		fc.out.MovqRegToXmm("xmm0", "rax")
-
-		// Done
-		doneTarget := fc.eb.text.Len()
-		fc.patchJumpImmediate(donePos+1, int32(doneTarget-(donePos+5)))
-		return
-
+		fc.emitNumCall(valErrStr)
 	case "head":
 		if len(call.Args) != 1 {
 			compilerError("head() requires exactly 1 argument, got %d", len(call.Args))
@@ -12333,7 +12178,6 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 	case "println", printMultiBuiltin:
 		// println uses syscalls on Linux, printf on Windows
 		// Supports multiple arguments, separated by spaces
-		fc.trackFunctionCall("println")
 
 		if len(call.Args) == 0 {
 			// Just print a newline
@@ -12427,10 +12271,6 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 					fc.callFunction("_tim_string_print", "")
 				}
 				fc.deallocateShadowSpace(shadowSpace)
-			} else if argType == "cstring" {
-				fc.compileExpression(arg)
-				fc.out.Cvttsd2si("rax", "xmm0")
-				fc.emitCStrWrite(1)
 			} else if fstrExpr, ok := arg.(*FStringExpr); ok {
 				// F-string - compile it and print without newline
 				fc.compileExpression(fstrExpr)
@@ -12911,6 +12751,13 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		}
 
 	case "eprint", "eprintln", "eprintf":
+		if fc.eb.target.OS() == OSLinux {
+			out := *call
+			out.Function = call.Function[1:]
+			fc.emitToStderr(&out)
+			fc.createErrorResult("out")
+			return
+		}
 		isNewline := call.Function == "eprintln"
 		isFormatted := call.Function == "eprintf"
 		isWindows := fc.eb.target.OS() == OSWindows
@@ -13103,21 +12950,12 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 							fc.out.Write(0x05)
 							fc.out.LeaSymbolToReg(targetReg, yesLabel)
 						} else if stringPositions[argIdx-1] {
-							needsConversion := !fc.isCFFIStringCall(arg)
 							fc.compileExpression(arg)
-							if needsConversion {
-								fc.callFunction("_tim_string_to_cstr", "")
-								if targetReg != "" && strings.HasPrefix(targetReg, "xmm") {
-									fc.out.MovqRegToXmm(targetReg, "rax")
-								} else if targetReg != "" {
-									fc.out.MovRegToReg(targetReg, "rax")
-								}
-							} else {
-								if targetReg != "" && strings.HasPrefix(targetReg, "xmm") {
-									// already in xmm
-								} else if targetReg != "" {
-									fc.out.MovqXmmToReg(targetReg, "xmm0")
-								}
+							fc.callFunction("_tim_string_to_cstr", "")
+							if targetReg != "" && strings.HasPrefix(targetReg, "xmm") {
+								fc.out.MovqRegToXmm(targetReg, "rax")
+							} else if targetReg != "" {
+								fc.out.MovRegToReg(targetReg, "rax")
 							}
 						} else if integerPositions[argIdx-1] {
 							fc.compileExpression(arg)
@@ -13170,18 +13008,8 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 						targetReg := targetRegs[argIdx-1]
 
 						if stringPositions[argIdx-1] {
-							// Check if this arg is a C FFI call that returns char* (cstring)
-							needsConversion := !fc.isCFFIStringCall(arg)
-
 							fc.compileExpression(arg)
-
-							if needsConversion {
-								// Convert Tim string to C string
-								fc.callFunction("_tim_string_to_cstr", "")
-							} else {
-								// Already a char* from C FFI - just convert from float64 representation to pointer
-								fc.out.MovqXmmToReg("rax", "xmm0")
-							}
+							fc.callFunction("_tim_string_to_cstr", "")
 							fc.out.MovRegToReg(targetReg, "rax")
 						} else {
 							fc.compileExpression(arg)
@@ -15620,219 +15448,16 @@ func (fc *TimCompiler) compileCall(call *CallExpr) {
 		fc.patchJumpImmediate(endJumpPos+1, int32(endPos-(endJumpPos+5)))
 
 	case "read_file":
-		// read_file(path) - Read entire file, return as Tim string
-		// Uses Linux syscalls (open/lseek/read/close) instead of libc for simplicity
 		if len(call.Args) != 1 {
 			compilerError("read_file() requires 1 argument (path)")
 		}
-
-		// Evaluate path argument (Tim string)
-		fc.compileExpression(call.Args[0])
-
-		// Convert Tim string to C string (null-terminated)
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-		fc.out.MovMemToReg("rdi", "rsp", 0)
-		fc.out.AddImmToReg("rsp", StackSlotSize)
-		fc.trackFunctionCall("_tim_string_to_cstr")
-		fc.out.CallSymbol("_tim_string_to_cstr")
-
-		// Allocate stack frame: 32 bytes (fd, size, buffer, result)
-		fc.out.SubImmFromReg("rsp", 32)
-
-		// syscall open(path, O_RDONLY=0, mode=0)
-		// rax=2 (sys_open), rdi=path, rsi=flags, rdx=mode
-		fc.out.MovRegToReg("rdi", "rax")   // path from _tim_string_to_cstr
-		fc.out.XorRegWithReg("rsi", "rsi") // O_RDONLY = 0
-		fc.out.XorRegWithReg("rdx", "rdx") // mode = 0
-		fc.out.MovImmToReg("rax", "2")     // sys_open = 2
-		fc.out.Emit([]byte{0x0f, 0x05})    // syscall
-
-		// Check if open failed (fd < 0)
-		fc.out.TestRegReg("rax", "rax")
-		errorJumpPos := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpLess, 0) // Jump if negative
-
-		// Save fd at [rsp+0]
-		fc.out.MovRegToMem("rax", "rsp", 0)
-
-		// syscall lseek(fd, 0, SEEK_END=2) to get file size
-		// rax=8 (sys_lseek), rdi=fd, rsi=offset, rdx=whence
-		fc.out.MovRegToReg("rdi", "rax")   // fd
-		fc.out.XorRegWithReg("rsi", "rsi") // offset = 0
-		fc.out.MovImmToReg("rdx", "2")     // SEEK_END = 2
-		fc.out.MovImmToReg("rax", "8")     // sys_lseek = 8
-		fc.out.Emit([]byte{0x0f, 0x05})    // syscall
-
-		// Save size at [rsp+8]
-		fc.out.MovRegToMem("rax", "rsp", 8)
-
-		// syscall lseek(fd, 0, SEEK_SET=0) to rewind
-		fc.out.MovMemToReg("rdi", "rsp", 0) // fd from [rsp+0]
-		fc.out.XorRegWithReg("rsi", "rsi")  // offset = 0
-		fc.out.XorRegWithReg("rdx", "rdx")  // SEEK_SET = 0
-		fc.out.MovImmToReg("rax", "8")      // sys_lseek = 8
-		fc.out.Emit([]byte{0x0f, 0x05})     // syscall
-
-		// Allocate buffer: malloc(size + 1) for null terminator
-		fc.out.MovMemToReg("rdi", "rsp", 8) // size from [rsp+8]
-		fc.out.AddImmToReg("rdi", 1)        // +1 for null terminator
-		// Allocate from arena
-		fc.callArenaAlloc()
-
-		// Save buffer at [rsp+16]
-		fc.out.MovRegToMem("rax", "rsp", 16)
-
-		// syscall read(fd, buffer, size)
-		// rax=0 (sys_read), rdi=fd, rsi=buffer, rdx=count
-		fc.out.MovMemToReg("rdi", "rsp", 0)  // fd from [rsp+0]
-		fc.out.MovMemToReg("rsi", "rsp", 16) // buffer from [rsp+16]
-		fc.out.MovMemToReg("rdx", "rsp", 8)  // size from [rsp+8]
-		fc.out.XorRegWithReg("rax", "rax")   // sys_read = 0
-		fc.out.Emit([]byte{0x0f, 0x05})      // syscall
-
-		// Add null terminator: buffer[size] = 0
-		fc.out.MovMemToReg("rdi", "rsp", 16)        // buffer from [rsp+16]
-		fc.out.MovMemToReg("rdx", "rsp", 8)         // size from [rsp+8]
-		fc.out.Emit([]byte{0xc6, 0x04, 0x17, 0x00}) // mov byte [rdi + rdx], 0
-
-		// syscall close(fd)
-		// rax=3 (sys_close), rdi=fd
-		fc.out.MovMemToReg("rdi", "rsp", 0) // fd from [rsp+0]
-		fc.out.MovImmToReg("rax", "3")      // sys_close = 3
-		fc.out.Emit([]byte{0x0f, 0x05})     // syscall
-
-		// Convert buffer to Tim string
-		fc.out.MovMemToReg("rdi", "rsp", 16) // buffer from [rsp+16]
-		fc.out.CallSymbol("_tim_cstr_to_string")
-		// Result in xmm0
-
-		// Save result at [rsp+24]
-		fc.out.MovXmmToMem("xmm0", "rsp", 24)
-
-		// Buffer is arena-allocated, no need to free (arena cleanup handles it)
-
-		// Restore result
-		fc.out.MovMemToXmm("xmm0", "rsp", 24)
-
-		// Clean up stack frame
-		fc.out.AddImmToReg("rsp", 32)
-
-		// Jump to end
-		endJumpPos := fc.eb.text.Len()
-		fc.out.JumpUnconditional(0)
-
-		// Error case: return empty string
-		errorPos := fc.eb.text.Len()
-		fc.patchJumpImmediate(errorJumpPos+2, int32(errorPos-(errorJumpPos+6)))
-
-		// Clean up stack
-		fc.out.AddImmToReg("rsp", 32)
-
-		// Create empty Tim string (count = 0)
-		fc.out.MovImmToReg("rdi", "16")
-		// Allocate from arena
-		fc.callArenaAlloc()
-		fc.out.XorRegWithReg("rdx", "rdx")
-		fc.out.Cvtsi2sd("xmm0", "rdx")
-		fc.out.MovXmmToMem("xmm0", "rax", 0)
-		fc.out.MovRegToXmm("xmm0", "rax")
-
-		// Patch end jump
-		endPos := fc.eb.text.Len()
-		fc.patchJumpImmediate(endJumpPos+1, int32(endPos-(endJumpPos+5)))
+		fc.emitReadFile(call.Args[0])
 
 	case "write_file":
-		// write_file(path, content) - Write string to file
 		if len(call.Args) != 2 {
 			compilerError("write_file() requires 2 arguments (path, content)")
 		}
-
-		// Evaluate and convert content first
-		fc.compileExpression(call.Args[1])
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-		fc.out.MovMemToReg("rdi", "rsp", 0)
-		fc.out.AddImmToReg("rsp", StackSlotSize)
-		fc.trackFunctionCall("_tim_string_to_cstr")
-		fc.out.CallSymbol("_tim_string_to_cstr")
-		fc.out.PushReg("rax") // Save content C string
-
-		// Evaluate and convert path
-		fc.compileExpression(call.Args[0])
-		fc.out.SubImmFromReg("rsp", StackSlotSize)
-		fc.out.MovXmmToMem("xmm0", "rsp", 0)
-		fc.out.MovMemToReg("rdi", "rsp", 0)
-		fc.out.AddImmToReg("rsp", StackSlotSize)
-		fc.trackFunctionCall("_tim_string_to_cstr")
-		fc.out.CallSymbol("_tim_string_to_cstr")
-
-		// Open file: fopen(path, "w")
-		fc.out.MovRegToReg("rdi", "rax") // path
-		labelName := fmt.Sprintf("write_mode_%d", fc.stringCounter)
-		fc.stringCounter++
-		fc.eb.Define(labelName, "w\x00")
-		fc.out.LeaSymbolToReg("rsi", labelName) // mode = "w"
-		fc.callFunction("fopen", "")
-
-		// Check if fopen succeeded
-		fc.out.TestRegReg("rax", "rax")
-		errorJumpPos := fc.eb.text.Len()
-		fc.out.JumpConditional(JumpEqual, 0) // Jump if NULL
-
-		// Save FILE* pointer
-		fc.out.PushReg("rax")
-
-		fc.out.MovMemToReg("rdi", "rsp", StackSlotSize) // content
-		fc.out.XorRegWithReg("rdx", "rdx")
-		wlenStart := fc.eb.text.Len()
-		fc.out.Emit([]byte{0x80, 0x3c, 0x17, 0x00})
-		wlenDoneJump := fc.eb.text.Len()
-		fc.out.Emit([]byte{0x74, 0x00})
-		fc.out.IncReg("rdx")
-		wlenBackJump := fc.eb.text.Len()
-		fc.out.Emit([]byte{0xeb, 0x00})
-		fc.patchShortJump(wlenBackJump+1, wlenStart)
-		fc.patchShortJump(wlenDoneJump+1, fc.eb.text.Len())
-		fc.out.MovRegToReg("rax", "rdx")
-		fc.out.PushReg("rax") // Save length
-
-		// Write file: fwrite(content, 1, length, file)
-		fc.out.MovMemToReg("rdi", "rsp", StackSlotSize*2) // content
-		fc.out.MovImmToReg("rsi", "1")                    // element size = 1
-		fc.out.MovMemToReg("rdx", "rsp", 0)               // length
-		fc.out.MovMemToReg("rcx", "rsp", StackSlotSize)   // FILE*
-		fc.callFunction("fwrite", "")
-
-		// Close file: fclose(file)
-		fc.out.MovMemToReg("rdi", "rsp", StackSlotSize) // FILE*
-		fc.callFunction("fclose", "")
-
-		// Clean up stack (length + FILE* + content)
-		fc.out.AddImmToReg("rsp", StackSlotSize*3)
-
-		// Return 0 (success)
-		fc.out.XorRegWithReg("rax", "rax")
-		fc.out.Cvtsi2sd("xmm0", "rax")
-
-		// Jump to end
-		endJumpPos := fc.eb.text.Len()
-		fc.out.JumpUnconditional(0)
-
-		// Error case: clean up and return -1
-		errorPos := fc.eb.text.Len()
-		fc.patchJumpImmediate(errorJumpPos+2, int32(errorPos-(errorJumpPos+6)))
-
-		// Clean up content from stack
-		fc.out.AddImmToReg("rsp", StackSlotSize)
-
-		// Return -1 (error)
-		fc.out.MovImmToReg("rax", "-1")
-		fc.out.Cvtsi2sd("xmm0", "rax")
-
-		// Patch end jump
-		endPos := fc.eb.text.Len()
-		fc.patchJumpImmediate(endJumpPos+1, int32(endPos-(endJumpPos+5)))
+		fc.emitWriteFile(call.Args[0], call.Args[1])
 
 	case "sizeof_i8", "sizeof_u8":
 		// sizeof_i8() / sizeof_u8() - Return size of 8-bit integer (1 byte)
@@ -16716,36 +16341,8 @@ func (fc *TimCompiler) compileReceiveLoopStmt(stmt *ReceiveLoopStmt) {
 // createErrorResult creates an error Result with the given error code in xmm0
 // The error code should be a 3-4 character string like "out", "arg", "dv0", etc.
 func (fc *TimCompiler) createErrorResult(errorCode string) {
-	// Pad error code to 4 bytes with null terminator if needed
-	code := errorCode
-	for len(code) < 4 {
-		code += "\x00"
-	}
-	if len(code) > 4 {
-		code = code[:4]
-	}
-
-	// Convert error code string to 32-bit integer (little-endian byte order)
-	var codeInt uint32
-	for i := range 4 {
-		codeInt |= uint32(code[i]) << (uint(i) * 8)
-	}
-
-	// Create error NaN: 0x7FF8_0000_0000_0000 | error_code
-	// The error code goes in the lower 32 bits of the mantissa
-	errorNaN := uint64(0x7FF8000000000000) | uint64(codeInt)
-
-	// Load the error NaN value into xmm0
-	fc.out.Emit([]byte{0x48, 0xb8}) // mov rax, immediate64
-	for i := range 8 {
-		fc.out.Emit([]byte{byte(errorNaN >> (uint(i) * 8))})
-	}
-
-	// Move rax to xmm0
-	fc.out.SubImmFromReg("rsp", 8)
-	fc.out.MovRegToMem("rax", "rsp", 0)
-	fc.out.MovMemToXmm("xmm0", "rsp", 0)
-	fc.out.AddImmToReg("rsp", 8)
+	fc.out.MovImmToReg("rax", fmt.Sprint(int64(errorValueBits(errorCode))))
+	fc.out.MovqRegToXmm("xmm0", "rax")
 }
 
 func (fc *TimCompiler) trackFunctionCall(funcName string) {

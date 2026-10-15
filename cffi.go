@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // CFunctionParam represents a parameter in a C function signature
@@ -826,7 +827,7 @@ func tryParseHeaders(libraryName string, additionalPaths []string) map[string]*C
 
 	// Map library names to common header files
 	headerMap := map[string][]string{
-		"c":       {"math.h", "stdlib.h", "string.h", "stdio.h"},
+		"c":       {"math.h", "stdlib.h", "string.h", "stdio.h", "ctype.h", "unistd.h", "time.h"},
 		"m":       {"math.h"},
 		"sdl3":    {"SDL3/SDL.h"},
 		"sdl2":    {"SDL2/SDL.h"},
@@ -942,35 +943,57 @@ func extractFunctionDeclarations(preprocessed string) map[string]*CFunctionSigna
 					continue
 				}
 
-				// Extract type (everything before parameter name)
-				// Handle cases: "double x", "const char *str", "int", "void*"
-				parts := strings.Fields(paramStr)
-				if len(parts) == 0 {
+				paramType := normalizeCType(paramStr)
+				if paramType == "" {
 					continue
 				}
-
-				var paramType string
-				// Check if last part looks like a parameter name (starts with __ or lowercase)
-				lastPart := parts[len(parts)-1]
-				if len(parts) > 1 && (strings.HasPrefix(lastPart, "__") || (len(lastPart) > 0 && lastPart[0] >= 'a' && lastPart[0] <= 'z' && !strings.Contains(lastPart, "*"))) {
-					// Has parameter name - take all but last as type
-					paramType = strings.Join(parts[:len(parts)-1], " ")
-				} else {
-					// No parameter name or last part is the type
-					paramType = strings.Join(parts, " ")
-				}
-
 				params = append(params, CFunctionParam{Type: paramType})
 			}
 		}
 
 		signatures[funcName] = &CFunctionSignature{
-			ReturnType: returnType,
+			ReturnType: normalizeCType(returnType),
 			Params:     params,
 		}
 	}
 
 	return signatures
+}
+
+var cTypeWords = map[string]bool{
+	"void": true, "char": true, "short": true, "int": true, "long": true, "float": true,
+	"double": true, "signed": true, "unsigned": true, "_Bool": true, "bool": true,
+}
+
+var cQualifiers = map[string]bool{"restrict": true, "volatile": true, "extern": true, "static": true, "inline": true}
+
+// normalizeCType reduces a C declaration to its type: qualifiers such as
+// restrict, glibc's __-prefixed names and a trailing parameter name go, and
+// pointer stars attach to the type: "const char *__restrict s" is
+// "const char*".
+func normalizeCType(decl string) string {
+	words := strings.Fields(strings.ReplaceAll(decl, "*", " * "))
+	var kept []string
+	for _, w := range words {
+		if !cQualifiers[w] && !strings.HasPrefix(w, "__") {
+			kept = append(kept, w)
+		}
+	}
+	if n := len(kept); n > 1 {
+		last, prev := kept[n-1], kept[n-2]
+		if last != "*" && !cTypeWords[last] && prev != "struct" && prev != "enum" && prev != "union" &&
+			(prev == "*" || prev != "const") {
+			kept = kept[:n-1]
+		}
+	}
+	var b strings.Builder
+	for i, w := range kept {
+		if i > 0 && w != "*" {
+			b.WriteByte(' ')
+		}
+		b.WriteString(w)
+	}
+	return b.String()
 }
 
 // ExtractFunctionSignatures extracts function signatures from DWARF debug info in a .so file
@@ -1131,6 +1154,19 @@ func resolveTypeName(offset dwarf.Offset, data *dwarf.Data) string {
 	}
 
 	return "unknown"
+}
+
+var libcHeaderSignatures = sync.OnceValue(func() map[string]*CFunctionSignature {
+	return tryParseHeaders("c", nil)
+})
+
+// libcSignature describes a C library function called as c.name: from the
+// table below, or else from the C library's own headers.
+func libcSignature(name string) *CFunctionSignature {
+	if sig := commonCFunctions[name]; sig != nil {
+		return sig
+	}
+	return libcHeaderSignatures()[name]
 }
 
 // commonCFunctions describes C library functions used without a parsed

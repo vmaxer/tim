@@ -295,7 +295,7 @@ func (g *rvGen) unsafeCast(rd uint32, c *CastExpr) error {
 			return err
 		}
 		if c.Type == "cstr" || c.Type == "cstring" {
-			g.cPointer(true)
+			g.cPointer()
 			g.mv(rd, rvA0)
 		} else {
 			g.fmvXD(rd, rvFA0)
